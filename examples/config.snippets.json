@@ -1,0 +1,107 @@
+{
+  "_comment": "可替换片段。与 config.example.json 中对应小节互换即可。一条 tunnel = (proto, io)，省略 io 时按 proto 取默认。",
+
+  "_left_backends": "==== 左手 I/O：左手只有 I/O 维度，没有 proto ====",
+
+  "left_tun": {
+    "kind": "tun",
+    "name": "left0",
+    "tun":  { "ifname": "pproxy0", "cidr": "10.20.0.1/24", "mtu": 1500, "no_pi": true }
+  },
+
+  "left_raw_socket": {
+    "kind": "raw_socket",
+    "name": "left0",
+    "raw":  { "ifname": "eth0", "snaplen": 2048, "promisc": false }
+  },
+
+  "left_af_xdp": {
+    "kind": "af_xdp",
+    "name": "left0",
+    "xdp":  { "ifname": "eth0", "queue_id": 0, "nframes": 4096, "zero_copy": true, "need_wakeup": true }
+  },
+
+  "left_pcap": {
+    "kind": "pcap",
+    "name": "left0",
+    "pcap": { "ifname": "eth0", "snaplen": 2048, "buffer_size": 4194304 }
+  },
+
+  "left_netmap": {
+    "kind": "netmap",
+    "name": "left0",
+    "netmap": { "ifname": "netmap:eth0", "nrings": 1 }
+  },
+
+  "_right_proto_io": "==== 右手隧道：(proto, io) 组合 ====",
+
+  "tunnel_tcp_kernel": {
+    "name":   "primary",
+    "proto":  "tcp",
+    "io":     "kernel_socket",
+    "server": "203.0.113.10:9000",
+    "max_sessions": 4096,
+    "tcp":    { "nodelay": true, "reconnect_ms": 2000 }
+  },
+
+  "tunnel_udp_kernel": {
+    "name":   "udp0",
+    "proto":  "udp",
+    "io":     "kernel_socket",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 }
+  },
+
+  "tunnel_udp_xdp": {
+    "name":   "udp-fast",
+    "proto":  "udp",
+    "io":     "af_xdp",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 },
+    "io_cfg": {
+      "ifname": "eth0", "queue_id": 0, "nframes": 4096,
+      "zero_copy": true, "need_wakeup": true
+    }
+  },
+
+  "tunnel_udp_netmap": {
+    "name":   "udp-nm",
+    "proto":  "udp",
+    "io":     "netmap",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 },
+    "io_cfg": { "ifname": "netmap:eth0", "nrings": 1 }
+  },
+
+  "tunnel_icmp_raw": {
+    "name":   "icmp0",
+    "proto":  "icmp",
+    "io":     "raw_socket",
+    "server": "203.0.113.10:0",
+    "max_sessions": 1024,
+    "icmp":   { "identifier_base": 4096, "reply_only": false }
+  },
+
+  "tunnel_icmp_xdp": {
+    "name":   "icmp-fast",
+    "proto":  "icmp",
+    "io":     "af_xdp",
+    "server": "203.0.113.10:0",
+    "max_sessions": 1024,
+    "icmp":   { "identifier_base": 4096 },
+    "io_cfg": { "ifname": "eth0", "queue_id": 0, "nframes": 2048, "zero_copy": true }
+  },
+
+  "tunnels_multi_with_fallback": [
+    { "name": "primary",  "proto": "udp", "io": "af_xdp",
+      "server": "203.0.113.10:9001", "max_sessions": 4096,
+      "udp": { "mtu": 1400 },
+      "io_cfg": { "ifname": "eth0", "queue_id": 0, "nframes": 4096, "zero_copy": true } },
+    { "name": "fallback", "proto": "tcp", "io": "kernel_socket",
+      "server": "203.0.113.10:9000", "max_sessions": 4096,
+      "tcp": { "nodelay": true, "reconnect_ms": 2000 } }
+  ]
+}

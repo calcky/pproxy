@@ -1,0 +1,84 @@
+%% pproxy 源码模块依赖
+%% 视角：编译/调用依赖；A --> B 表示 A 依赖 B
+%% 颜色：线程=橙  I/O=蓝  tunnel=浅蓝  DPI=黄  core=绿  控制面=紫
+flowchart TD
+    classDef th fill:#FFF3E0,stroke:#F57C00,color:#E65100;
+    classDef io fill:#E3F2FD,stroke:#1976D2,color:#0D47A1;
+    classDef tn fill:#E1F5FE,stroke:#0288D1,color:#01579B;
+    classDef dp fill:#FFF8E1,stroke:#F9A825,color:#795548;
+    classDef co fill:#E8F5E9,stroke:#388E3C,color:#1B5E20;
+    classDef ct fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C;
+
+    MAIN["src/main.c<br/>argv + 模块注册 + 主循环"]:::ct
+
+    subgraph MODS["src/modules/ 每目录一个线程模块"]
+        direction LR
+        LRX[left_rx]:::th
+        WK[worker]:::th
+        LTX[left_tx]:::th
+        RTX[right_tx]:::th
+        RRX[right_rx]:::th
+        TM[timer]:::ct
+        MG[mgmt]:::ct
+    end
+
+    subgraph IO["src/io/ pp_pkt_io_ops_t 实现"]
+        direction LR
+        TUN[tun.c]:::io
+        RAW[raw_sock.c]:::io
+        XDP[xsk.c]:::io
+        NM[netmap.c]:::io
+        PC[pcap.c]:::io
+    end
+
+    subgraph TUNNEL["src/tunnel/ pp_tunnel_ops_t 实现"]
+        direction LR
+        TCP[tcp.c]:::tn
+        UDP[udp.c]:::tn
+        ICMP[icmp.c]:::tn
+    end
+
+    subgraph DPI["src/dpi/ DPI 插件"]
+        direction LR
+        TLS[tls.c]:::dp
+        HTTP[http.c]:::dp
+        DNS[dns.c]:::dp
+    end
+
+    subgraph CORE["src/core/ + include/pproxy/"]
+        direction LR
+        PKT["packet / mempool"]:::co
+        RING[ring]:::co
+        FLOW["flow / hash"]:::co
+        SESS[session_table]:::co
+        TWHL[timer_wheel]:::co
+        LOG[log]:::co
+    end
+
+    subgraph CFG["src/config/"]
+        direction LR
+        CFGC["config.c<br/>yyjson 解析 + 热重载"]:::co
+    end
+
+    MAIN --> MODS
+    MAIN --> CFG
+    MAIN --> CORE
+
+    LRX --> IO
+    LTX --> IO
+    RTX --> TUNNEL
+    RRX --> TUNNEL
+
+    WK --> DPI
+    WK --> SESS
+
+    TM --> TWHL
+    TM --> SESS
+    MG --> SESS
+    MG --> CFG
+
+    MODS --> CORE
+    IO --> CORE
+    TUNNEL --> CORE
+    DPI --> CORE
+    CFG --> CORE

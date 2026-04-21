@@ -1,0 +1,16 @@
+# 不上下文里塞构建产物，加快 docker build context
+build/
+*.o
+*.d
+*.a
+*.so
+
+.git/
+.vscode/
+.idea/
+tags
+TAGS
+
+doc/*.png
+*.swp
+*.swo

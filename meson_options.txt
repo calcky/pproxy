@@ -1,0 +1,3 @@
+option('xdp',    type: 'boolean', value: false, description: '启用 AF_XDP I/O 后端 (需 libbpf + libxdp)')
+option('pcap',   type: 'boolean', value: false, description: '启用 pcap I/O 后端 (需 libpcap)')
+option('netmap', type: 'boolean', value: false, description: '启用 netmap I/O 后端')

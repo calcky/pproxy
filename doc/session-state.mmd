@@ -1,0 +1,36 @@
+%% pproxy 会话状态机
+%% 适用 TCP；UDP/ICMP 仅用 NEW / EST / TIMEOUT 简化路径
+stateDiagram-v2
+    direction LR
+
+    [*] --> NEW: 首包到达<br/>分配 sid + tunnel
+
+    NEW --> SYN_SENT: 客户端 SYN 转发
+    SYN_SENT --> EST: 收到 SYN+ACK + ACK
+    NEW --> EST: 非 TCP（UDP / ICMP）
+
+    EST --> EST: 数据传输<br/>更新 stats + DPI
+
+    EST --> CLOSE_WAIT: 收到 FIN（任一向）
+    CLOSE_WAIT --> CLOSED: 双向 FIN+ACK 完成
+
+    EST --> RST: 收到 RST
+    SYN_SENT --> RST: 连接拒绝
+    RST --> CLOSED: 立即清理
+
+    EST --> TIMEOUT: 超过 idle_ttl
+    SYN_SENT --> TIMEOUT: 超过 syn_ttl
+    CLOSE_WAIT --> TIMEOUT: 超过 fin_ttl
+    TIMEOUT --> CLOSED: timer 线程清理
+
+    CLOSED --> [*]: 释放 dpi_ctx / 归还 sid<br/>从 SessionTable 摘除
+
+    note right of EST
+      DPI 在前 N 个包内识别完
+      之后只更新统计，不再 deep parse
+    end note
+
+    note right of TIMEOUT
+      timer 线程通过 ctrl_ring
+      下发清理指令到对应 worker
+    end note

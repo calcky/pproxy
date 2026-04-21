@@ -1,0 +1,53 @@
+%% pproxy 线程与队列拓扑
+%% 设计原则：
+%%   · 不把 N 个 worker × M 个 tunnel 全展开；用「一个代表节点 + × N / × M」
+%%   · ring 作为"边上的标签"，不再作为独立节点，避免 N×M 扇出的星座图
+%%   · 右手 I/O 和左手对称：proto 编解码层 + 真正发字节的 io 层是两层
+%%   · 数据面 = 粗边（==>），控制面 = 虚线（-.->）
+flowchart LR
+    classDef th fill:#FFF3E0,stroke:#F57C00,color:#E65100,stroke-width:1.5px;
+    classDef io fill:#E3F2FD,stroke:#1976D2,color:#0D47A1;
+    classDef pr fill:#E1F5FE,stroke:#0288D1,color:#01579B;
+    classDef ct fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C;
+
+    LIO[("left io<br/>tun / xdp / ...")]:::io
+
+    LRX(["left_rx"]):::th
+    WK(["worker[k] × N<br/>rx_ring[k] SPSC<br/>back_ring[k] MPSC<br/>session shard[k]<br/>ctrl_ring SPSC"]):::th
+    RTX(["right_tx[t] × M<br/>tx_ring[t] MPSC"]):::th
+    RRX(["right_rx[t] × M"]):::th
+    LTX(["left_tx<br/>left_tx.ring MPSC"]):::th
+
+    subgraph RT["right tunnel = (proto, io) per-tunnel"]
+        direction TB
+        RPROTO["proto: tcp / udp / icmp<br/>encode = 装 sid + 框架"]:::pr
+        RIOX["io: kernel_sock / raw_sock<br/>tun / xdp / netmap / pcap"]:::io
+        RPROTO ---|"按 cfg.io 派发"| RIOX
+    end
+
+    MAIN(["main"]):::ct
+    TM(["timer"]):::ct
+    MG(["mgmt"]):::ct
+
+    LIO ==>|rx burst| LRX
+    LRX ==>|"rx_ring[k] SPSC<br/>hash flow mod N"| WK
+    WK ==>|"tx_ring[t] MPSC<br/>by tunnel_idx"| RTX
+    RTX ==>|"encode + send"| RT
+    RT ==>|"wire"| WIRE((wire))
+
+    WIRE ==>|"wire"| RT
+    RT ==>|"recv + decode"| RRX
+    RRX ==>|"back_ring[k] MPSC<br/>sid to shard k"| WK
+    WK ==>|left_tx.ring MPSC| LTX
+    LTX ==>|tx burst| LIO
+
+    TM -.->|"ctrl_ring<br/>aging / ttl"| WK
+    MG -.->|"RCU read snapshot<br/>stats / sessions"| WK
+    MG -.->|reload / quit| MAIN
+    MAIN -.->|start / stop| LRX
+    MAIN -.->|start / stop| WK
+    MAIN -.->|start / stop| RTX
+    MAIN -.->|start / stop| RRX
+    MAIN -.->|start / stop| LTX
+    MAIN -.->|start / stop| TM
+    MAIN -.->|start / stop| MG

@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "pproxy.h": "c",
+        "cstdint": "c"
+    }
+}

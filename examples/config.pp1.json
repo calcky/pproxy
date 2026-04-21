@@ -1,0 +1,62 @@
+{
+  "_role": "pp1 = tunnel client (主动连 pp2)；左手 tun 截流，右手 tcp dial pp2",
+
+  "log":    { "level": "info", "file": null, "color": true },
+
+  "runtime": {
+    "workers": 2,
+    "mempool": { "elements": 4096, "buf_size": 2048, "headroom": 64, "cpu": -1 },
+    "rings":   {
+      "worker_rx_capacity": 1024, "worker_back_capacity": 1024,
+      "worker_ctrl_capacity": 256,
+      "right_tx_capacity": 1024,  "left_tx_capacity": 1024
+    }
+  },
+
+  "left": {
+    "kind": "tun",
+    "name": "pp1-left",
+    "tun":  {
+      "ifname": "pproxy0",
+      "cidr":   "10.20.0.1/24",
+      "mtu":    1400,
+      "no_pi":  true
+    }
+  },
+
+  "tunnels": [
+    {
+      "name":         "to-pp2",
+      "proto":        "tcp",
+      "io":           "kernel_socket",
+      "mode":         "client",
+      "server":       "127.0.0.1:9000",
+      "bind":         "0.0.0.0:0",
+      "max_sessions": 4096,
+      "keepalive_ms": 30000,
+      "tcp": { "nodelay": true, "reconnect_ms": 2000 }
+    }
+  ],
+
+  "session": {
+    "max_per_shard": 4096,
+    "idle_ttl_ms":   300000,
+    "syn_ttl_ms":    30000,
+    "fin_ttl_ms":    30000,
+    "gc_interval_ms": 1000
+  },
+
+  "dpi": {
+    "max_pkts_per_session": 8,
+    "plugins": [
+      { "name": "dns",  "enable": true, "priority": 5  },
+      { "name": "tls",  "enable": true, "priority": 10 },
+      { "name": "http", "enable": true, "priority": 20 }
+    ]
+  },
+
+  "mgmt": {
+    "unix_socket": "/tmp/pproxy-pp1.sock",
+    "metrics": { "enable": true, "listen": "127.0.0.1:9091" }
+  }
+}

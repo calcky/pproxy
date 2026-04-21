@@ -1,0 +1,80 @@
+%% pproxy 总体架构
+%% 设计原则：
+%%   · 数据平面一条主干（粗箭头），从左到右读
+%%   · 公共设施 / 控制面放两侧，用聚合虚线表示"使用 / 调度"
+%%   · 右手 = proto（编码）+ io（怎么发字节），分两层但只画聚合边
+%%     具体 (proto × io) 组合见 README 表格，避免在图里塞一堆交叉线
+%%   · 配色：外部=灰 io=蓝 proto=浅蓝 线程=橙 core=绿 control=紫
+flowchart LR
+    classDef ext    fill:#ECEFF1,stroke:#455A64,color:#263238;
+    classDef io     fill:#E3F2FD,stroke:#1976D2,color:#0D47A1;
+    classDef proto  fill:#E1F5FE,stroke:#0288D1,color:#01579B;
+    classDef thread fill:#FFF3E0,stroke:#F57C00,color:#E65100,stroke-width:1.5px;
+    classDef core   fill:#E8F5E9,stroke:#388E3C,color:#1B5E20;
+    classDef mgmt   fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C;
+
+    subgraph HOST["① 本机 Apps + Kernel Stack"]
+        direction TB
+        APP(["apps"]):::ext
+        KS(["kernel stack"]):::ext
+        APP --- KS
+    end
+
+    subgraph LIO["② 左手 io pp_pkt_io_ops_t"]
+        direction TB
+        TUN_L["tun / raw_socket<br/>af_xdp / netmap / pcap"]:::io
+    end
+
+    subgraph DP["③ 数据平面线程"]
+        direction TB
+        LRX(["left_rx"]):::thread
+        WK(["worker[0..N-1]<br/>per-shard session + DPI"]):::thread
+        LTX(["left_tx"]):::thread
+        RTX(["right_tx[0..M-1]<br/>per-tunnel"]):::thread
+        RRX(["right_rx[0..M-1]<br/>per-tunnel"]):::thread
+    end
+
+    subgraph RTUN["④ 右手 tunnel = (proto, io) per-tunnel"]
+        direction TB
+        RPROTO["proto: tcp / udp / icmp<br/>encode + decode (sid + 框架)"]:::proto
+        RIOX["io: kernel_socket / raw_socket<br/>tun / af_xdp / netmap / pcap"]:::io
+        RPROTO ===|"按 cfg.io 派发<br/>tcp 仅 kernel_socket<br/>udp/icmp 任选"| RIOX
+    end
+
+    SRV(["⑤ Remote Server"]):::ext
+
+    subgraph CORE["core / 公共设施"]
+        direction TB
+        MP[("mempool / mbuf")]:::core
+        RG[("SPSC/MPSC ring")]:::core
+        ST[("SessionTable + DPI")]:::core
+        TW[("timer wheel")]:::core
+    end
+
+    subgraph CP["控制面"]
+        direction TB
+        MAIN["main"]:::mgmt
+        TM["timer"]:::mgmt
+        MG["mgmt<br/>unix + /metrics"]:::mgmt
+    end
+
+    KS ==>|hijack| TUN_L
+    TUN_L ==> LRX
+    LRX ==>|hash flow| WK
+    WK ==>|encap + sid| RTX
+    RTX ==>|enqueue| RPROTO
+    RIOX ==>|wire| SRV
+
+    SRV ==>|wire| RIOX
+    RPROTO ==>|"decode + dispatch"| RRX
+    RRX ==>|by sid| WK
+    WK ==>|restore 5-tuple| LTX
+    LTX ==> TUN_L
+    TUN_L ==>|reinject| KS
+
+    WK -.->|"alloc / lookup<br/>classify"| CORE
+    LRX -.->|alloc| MP
+    LTX -.->|free| MP
+    MAIN -.->|start / stop| DP
+    TM -.->|tick / GC| ST
+    MG -.->|"read snapshot<br/>reload"| DP

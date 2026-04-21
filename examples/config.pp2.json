@@ -1,0 +1,62 @@
+{
+  "_role": "pp2 = tunnel server (被动 accept pp1)；左手另一张 tun 重注入到 10.30 段",
+
+  "log":    { "level": "info", "file": null, "color": true },
+
+  "runtime": {
+    "workers": 2,
+    "mempool": { "elements": 4096, "buf_size": 2048, "headroom": 64, "cpu": -1 },
+    "rings":   {
+      "worker_rx_capacity": 1024, "worker_back_capacity": 1024,
+      "worker_ctrl_capacity": 256,
+      "right_tx_capacity": 1024,  "left_tx_capacity": 1024
+    }
+  },
+
+  "left": {
+    "kind": "tun",
+    "name": "pp2-left",
+    "tun":  {
+      "ifname": "pproxy0",
+      "cidr":   "10.30.0.1/24",
+      "mtu":    1400,
+      "no_pi":  true
+    }
+  },
+
+  "tunnels": [
+    {
+      "name":         "from-pp1",
+      "proto":        "tcp",
+      "io":           "kernel_socket",
+      "mode":         "server",
+      "listen":       "0.0.0.0:9000",
+      "max_sessions": 4096,
+      "max_clients":  4,
+      "keepalive_ms": 30000,
+      "tcp": { "nodelay": true }
+    }
+  ],
+
+  "session": {
+    "max_per_shard": 4096,
+    "idle_ttl_ms":   300000,
+    "syn_ttl_ms":    30000,
+    "fin_ttl_ms":    30000,
+    "gc_interval_ms": 1000
+  },
+
+  "dpi": {
+    "max_pkts_per_session": 8,
+    "plugins": [
+      { "name": "dns",  "enable": true, "priority": 5  },
+      { "name": "tls",  "enable": true, "priority": 10 },
+      { "name": "http", "enable": true, "priority": 20 }
+    ]
+  },
+
+  "mgmt": {
+    "unix_socket": "/tmp/pproxy-pp2.sock",
+    "metrics": { "enable": true, "listen": "127.0.0.1:9092" }
+  }
+}

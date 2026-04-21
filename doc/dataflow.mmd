@@ -1,0 +1,41 @@
+sequenceDiagram
+    autonumber
+    participant APP as 本机应用
+    participant K as Linux Kernel
+    participant TUN as tun0
+    participant LRX as left_rx
+    participant WK as worker_k
+    participant ST as SessionTable_k
+    participant DPI as DPI 插件
+    participant RTX as right_tx_j
+    participant RIO as tunnel socket
+    participant SRV as Remote Server
+    participant RRX as right_rx_j
+    participant LTX as left_tx
+
+    APP->>K: connect / send
+    K->>TUN: 路由命中，写 IP 包
+    LRX->>TUN: rx_burst 读包
+    LRX->>LRX: 计算 hash(flow_key) mod N = k
+    LRX->>WK: enqueue rx_ring (SPSC)
+    WK->>WK: 解析 IP/TCP 头
+    WK->>ST: lookup_or_create(flow_key)
+    Note over ST: 新 session：分配 sid<br/>state=NEW, tunnel_idx=j
+    WK->>DPI: feed(payload) 前 N 个包
+    DPI-->>WK: app_proto = TLS / HTTP / ...
+    WK->>WK: 封装隧道头 sid + meta + payload
+    WK->>RTX: enqueue tx_ring (MPSC)
+    RTX->>RIO: sendmmsg 批量
+    RIO->>SRV: TCP/UDP/ICMP 报文
+
+    SRV->>RIO: 响应报文
+    RRX->>RIO: 读包并解隧道头
+    RRX->>RRX: sid 算出 worker shard k
+    RRX->>WK: enqueue back_ring (MPSC)
+    WK->>ST: lookup(sid)
+    WK->>WK: 重建 IP/TCP 头 NAT 回原五元组
+    WK->>WK: 更新 stats / state
+    WK->>LTX: enqueue left_tx.ring (MPSC)
+    LTX->>TUN: tx_burst 写回
+    TUN->>K: 内核协议栈处理
+    K->>APP: recv 返回数据
