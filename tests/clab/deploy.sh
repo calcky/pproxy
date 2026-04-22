@@ -182,7 +182,7 @@ s() { printf '%s\n' "\$SUDO_PASS" | sudo -S -p '' "\$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
 # 与 build.sh 链接的 libbpf/libxdp/libpcap 匹配；24.04 上部分包名为 *t64
-s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1
+s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb
 s apt-get install -y -qq libelf1t64 2>/dev/null || s apt-get install -y -qq libelf1
 s apt-get install -y -qq libpcap0.8t64 2>/dev/null || s apt-get install -y -qq libpcap0.8
 EOA

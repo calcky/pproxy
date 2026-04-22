@@ -25,9 +25,13 @@ topology:
       kind: generic_vm
       # 使用 srl-labs/vrnetlab/ubuntu 构建产物；勿在 VM 内使用 10.0.0.0/24 作数据地址（与 vrnetlab 管理网冲突）
       image: vrnetlab/canonical_ubuntu:noble
+      env:
+        QEMU_SMP: 4
     leaf2:
       kind: generic_vm
       image: vrnetlab/canonical_ubuntu:noble
+      env:
+        QEMU_SMP: 4
     router:
       kind: linux
       exec:

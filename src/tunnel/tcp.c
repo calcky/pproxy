@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -123,6 +124,14 @@ static void drop_conn_e(struct tcp_ctx *c, const char *why, int err)
 }
 static void drop_conn(struct tcp_ctx *c, const char *why) { drop_conn_e(c, why, 0); }
 
+/* 非阻塞 read 在 EAGAIN 时立即返回，若无 poll 则与 right_rx 形成紧循环、采样总落在 read() 上。 */
+static int tcp_wait_readable(int fd, int timeout_ms)
+{
+    if (fd < 0) return -1;
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    return poll(&p, 1, timeout_ms);
+}
+
 static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
 {
     struct tcp_ctx *c = ctx;
@@ -154,44 +163,64 @@ static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
 
 static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
-    (void)timeout_us;
-    struct tcp_ctx *c = ctx;
-    if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
-        if (!server_try_accept(c)) return 0;
+    struct tcp_ctx *c  = ctx;
+    int tmo_ms = (timeout_us < 0) ? -1 : (int)((unsigned)(timeout_us + 999) / 1000);
+
+    for (;;) {
+        if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
+            if (server_try_accept(c)) { /* 已建连 */ }
+            else {
+                if (c->listen_fd < 0) return 0;
+                if (tcp_wait_readable(c->listen_fd, tmo_ms) <= 0) return 0;
+                continue;
+            }
+        }
+        if (c->conn_fd < 0) return PP_ERR_CLOSED;
+
+        if (c->rxlen >= (size_t)TCP_FRAME_HDR) {
+            uint64_t sid;
+            uint16_t len;
+            memcpy(&sid, c->rxbuf, 8);
+            sid = be64toh(sid);
+            memcpy(&len, c->rxbuf + 8, 2);
+            len = ntohs(len);
+            if (c->rxlen < (size_t)TCP_FRAME_HDR + len) {
+                /* 仍缺数据，下面对 conn 做 read；若 EAGAIN 则 poll */
+            } else {
+                if (out_buf->cap < len) return PP_ERR_NOMEM;
+                memcpy(out_buf->data, c->rxbuf + TCP_FRAME_HDR, len);
+                out_buf->len  = len;
+                *out_sid = sid;
+                size_t consumed = (size_t)TCP_FRAME_HDR + len;
+                memmove(c->rxbuf, c->rxbuf + consumed, c->rxlen - consumed);
+                c->rxlen -= consumed;
+                return (int)len;
+            }
+        }
+
+        size_t room = sizeof c->rxbuf - c->rxlen;
+        if (room == 0) {
+            PP_WARN("tcp tunnel: rx buffer full (rxlen=%zu) incomplete frame, closing", c->rxlen);
+            drop_conn(c, "rx buffer full");
+            return PP_ERR_IO;
+        }
+        int n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
+        if (n == PP_ERR_CLOSED) {
+            drop_conn(c, "peer closed");
+            return 0;
+        }
+        if (n == PP_ERR_IO) {
+            int e = errno;
+            drop_conn_e(c, "recv error", e);
+            return PP_ERR_IO;
+        }
+        if (n > 0) {
+            c->rxlen += (size_t)n;
+            continue;
+        }
+        /* n==0: EAGAIN，等待可读避免在 right_rx 里对 read(2) 紧忙等 */
+        if (tcp_wait_readable(c->conn_fd, tmo_ms) <= 0) return 0;
     }
-    if (c->conn_fd < 0) return PP_ERR_CLOSED;
-
-    size_t room = sizeof c->rxbuf - c->rxlen;
-    if (room == 0) {
-        PP_WARN("tcp tunnel: rx buffer full (rxlen=%zu) incomplete frame, closing", c->rxlen);
-        drop_conn(c, "rx buffer full");
-        return PP_ERR_IO;
-    }
-    int n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
-    if (n == PP_ERR_CLOSED) { drop_conn(c, "peer closed"); return 0; }
-    if (n == PP_ERR_IO) {
-        int e = errno;
-        drop_conn_e(c, "recv error", e);
-        return PP_ERR_IO;
-    }
-    if (n > 0) c->rxlen += (size_t)n;
-
-    if (c->rxlen < TCP_FRAME_HDR) return 0;
-    uint64_t sid; uint16_t len;
-    memcpy(&sid, c->rxbuf,     8); sid = be64toh(sid);
-    memcpy(&len, c->rxbuf + 8, 2); len = ntohs(len);
-
-    if (c->rxlen < (size_t)TCP_FRAME_HDR + len) return 0;
-    if (out_buf->cap < len) return PP_ERR_NOMEM;
-
-    memcpy(out_buf->data, c->rxbuf + TCP_FRAME_HDR, len);
-    out_buf->len = len;
-    *out_sid = sid;
-
-    size_t consumed = TCP_FRAME_HDR + len;
-    memmove(c->rxbuf, c->rxbuf + consumed, c->rxlen - consumed);
-    c->rxlen -= consumed;
-    return (int)len;
 }
 
 static void tcp_session_close(void *ctx, uint64_t sid) { (void)ctx; (void)sid; }
