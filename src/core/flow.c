@@ -6,8 +6,25 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
 #include "pproxy/flow.h"
 #include "pproxy/packet.h"
+
+int pp_pkt_parse_l3_ipv4(pp_pkt_t *p)
+{
+    if (!p) return PP_ERR_INVAL;
+    if (p->data_len < sizeof(struct iphdr)) return PP_ERR_PROTO;
+    const struct iphdr *ih = (const struct iphdr *)p->data;
+    if (ih->version != 4) return PP_ERR_NOSUPPORT;
+    uint16_t ihl = (uint16_t)(ih->ihl * 4u);
+    if (ihl < 20u || ihl > p->data_len) return PP_ERR_PROTO;
+    p->meta.l3_off     = 0;
+    p->meta.l3_proto   = IPPROTO_IP;
+    p->meta.l4_off     = ihl;
+    p->meta.l4_proto   = ih->protocol;
+    p->meta.payload_off = UINT16_MAX;
+    return PP_OK;
+}
 
 /* 简单 splitmix64 风格 hash */
 static inline uint64_t mix64(uint64_t x)
@@ -107,6 +124,15 @@ int pp_flow_key_from_pkt(const pp_pkt_t *p, pp_flow_key_t *out)
             const struct udphdr *u = (const struct udphdr *)l4;
             out->sport = ntohs(u->source);
             out->dport = ntohs(u->dest);
+        } else if (out->l4_proto == IPPROTO_ICMP) {
+            if (p->data_len < p->meta.l4_off + 8) return PP_ERR_PROTO;
+            const struct icmphdr *ic = (const struct icmphdr *)l4;
+            if (ic->type == ICMP_ECHO || ic->type == ICMP_ECHOREPLY) {
+                uint16_t id = ntohs(ic->un.echo.id);
+                /* sport/dport 均用 id，normalize 交换后仍一致，echo/reply 同流 */
+                out->sport = id;
+                out->dport = id;
+            }
         }
     }
     return PP_OK;

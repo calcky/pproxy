@@ -42,7 +42,7 @@ typedef struct pp_io_cfg {
     union {
         struct {
             const char *ifname;     /* "tun0" */
-            const char *cidr;       /* "10.20.0.1/24" */
+            const char *cidr;       /* "10.20.0.0/24" */
             uint16_t    mtu;
             bool        no_pi;      /* IFF_NO_PI */
         } tun;

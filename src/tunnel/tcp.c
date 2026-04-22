@@ -9,6 +9,7 @@
  * 单连接复用所有 sid，应用层自己加帧头分包。
  */
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,8 @@
 #include "io/ks_sock.h"
 
 #define TCP_FRAME_HDR  10  /* 8B sid + 2B len */
-#define TCP_RX_BUF     65536
+/* 单帧最大 10+65535；高吞吐时需容纳未完成帧 + 多帧尾巴，64K 在 iperf 时易满导致 read(0) 误判 */
+#define TCP_RX_BUF     (256u * 1024u)
 
 struct tcp_ctx {
     pp_tunnel_cfg_t  cfg;
@@ -105,16 +107,21 @@ static bool server_try_accept(struct tcp_ctx *c)
     return true;
 }
 
-/* 业务连接失效时复位（保留 listen_fd） */
-static void drop_conn(struct tcp_ctx *c, const char *why)
+/* 业务连接失效时复位（保留 listen_fd）；err=0 不打印 errno */
+static void drop_conn_e(struct tcp_ctx *c, const char *why, int err)
 {
     if (c->conn_fd >= 0) {
-        PP_WARN("tcp tunnel: conn lost (%s); fd=%d closed", why, c->conn_fd);
+        if (err != 0)
+            PP_WARN("tcp tunnel: conn lost (%s) errno=%d (%s); fd=%d closed", why, err,
+                    strerror(err), c->conn_fd);
+        else
+            PP_WARN("tcp tunnel: conn lost (%s); fd=%d closed", why, c->conn_fd);
         close(c->conn_fd);
         c->conn_fd = -1;
     }
     c->rxlen = 0;
 }
+static void drop_conn(struct tcp_ctx *c, const char *why) { drop_conn_e(c, why, 0); }
 
 static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
 {
@@ -138,7 +145,8 @@ static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
     int w = pp_ks_tcp_sendv(c->conn_fd, iov, 2);
     if (w == PP_ERR_AGAIN) return PP_ERR_AGAIN;
     if (w < 0) {
-        drop_conn(c, "send error");
+        int e = errno;
+        drop_conn_e(c, "send error", e);
         return PP_ERR_IO;
     }
     return w;
@@ -153,11 +161,19 @@ static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int ti
     }
     if (c->conn_fd < 0) return PP_ERR_CLOSED;
 
-    int n = pp_ks_tcp_recv(c->conn_fd,
-                           c->rxbuf + c->rxlen,
-                           sizeof c->rxbuf - c->rxlen);
+    size_t room = sizeof c->rxbuf - c->rxlen;
+    if (room == 0) {
+        PP_WARN("tcp tunnel: rx buffer full (rxlen=%zu) incomplete frame, closing", c->rxlen);
+        drop_conn(c, "rx buffer full");
+        return PP_ERR_IO;
+    }
+    int n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
     if (n == PP_ERR_CLOSED) { drop_conn(c, "peer closed"); return 0; }
-    if (n == PP_ERR_IO)     { drop_conn(c, "recv error");  return PP_ERR_IO; }
+    if (n == PP_ERR_IO) {
+        int e = errno;
+        drop_conn_e(c, "recv error", e);
+        return PP_ERR_IO;
+    }
     if (n > 0) c->rxlen += (size_t)n;
 
     if (c->rxlen < TCP_FRAME_HDR) return 0;

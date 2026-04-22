@@ -1,0 +1,15 @@
+{
+  "log":     { "level": "info" },
+  "runtime": { "workers": 1 },
+  "left":    { "kind": "tun", "name": "pp2",
+               "tun": { "ifname": "ppclab2", "cidr": "192.168.0.0/24",
+                        "mtu": 1400, "no_pi": true } },
+  "tunnels": [{
+    "name": "cli", "proto": "tcp", "io": "kernel_socket",
+    "mode": "client", "server": "172.16.0.2:19900",
+    "tcp":  { "nodelay": true, "reconnect_ms": 500 }
+  }],
+  "session": { "max_per_shard": 1024 },
+  "mgmt":    { "unix_socket": "/opt/pproxy/run/pp2.sock",
+               "metrics": { "enable": true, "listen": "127.0.0.1:19992" } }
+}

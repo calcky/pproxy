@@ -10,6 +10,8 @@
 #include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/flow.h"
+#include "pproxy/packet.h"
 #include "../runtime.h"
 #include "../modules.h"
 
@@ -85,13 +87,34 @@ static void process_upstream(wk_priv_t *p, pp_pkt_t *pkt)
     (void)tb;
 }
 
-/* 处理一条右向（tunnel 收上来的）包：查 sid -> 还原 -> 投 left_tx */
+/* 处理一条右向（tunnel 收上来的）包：按内层五元组 lookup_or_create，与对端首包 sid 无关 */
 static void process_downstream(wk_priv_t *p, pp_pkt_t *pkt)
 {
     pp_session_shard_t *sh = g_rt->shards[p->idx];
-    uint64_t sid = pkt->meta.flow_hash;     /* 同样 hack */
-    pp_session_t *s = pp_session_lookup_by_sid(sh, sid);
-    if (!s) { pp_pkt_put_ref(pkt); p->drops++; return; }
+    if (pkt->meta.l3_off == UINT16_MAX) {
+        if (pp_pkt_parse_l3_ipv4(pkt) != PP_OK) {
+            pp_pkt_put_ref(pkt);
+            p->drops++;
+            return;
+        }
+    }
+    pp_flow_key_t k;
+    if (pp_flow_key_from_pkt(pkt, &k) != PP_OK) {
+        pp_pkt_put_ref(pkt);
+        p->drops++;
+        return;
+    }
+    pp_flow_dir_t dir;
+    pp_flow_key_normalize(&k, &dir);
+    bool         is_new;
+    pp_session_t *s = pp_session_lookup_or_create(sh, &k, &is_new);
+    (void)is_new;
+    if (!s) {
+        pp_pkt_put_ref(pkt);
+        p->drops++;
+        return;
+    }
+    if (s->state == PP_SS_NEW) s->state = PP_SS_EST;
 
     s->last_ns = pp_now_ns();
     s->dn.pkts++;

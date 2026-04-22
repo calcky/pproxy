@@ -44,6 +44,9 @@ int  pp_flow_key_format(const pp_flow_key_t *k, char *buf, size_t cap);
 struct pp_pkt;
 int  pp_flow_key_from_pkt(const struct pp_pkt *p, pp_flow_key_t *out);
 
+/* 数据从 L3 IPv4 起始时填充 meta（tunnel 解封后、或 TUN 已带 IP） */
+int  pp_pkt_parse_l3_ipv4(struct pp_pkt *p);
+
 #ifdef __cplusplus
 }
 #endif

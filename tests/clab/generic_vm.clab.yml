@@ -1,0 +1,42 @@
+name: generic_vm
+prefix: ""
+
+topology:
+  kinds:
+    linux:
+      image: ghcr.io/srl-labs/network-multitool
+
+  nodes:
+    client1:
+      kind: linux
+      exec:
+        - ip link set address 00:c1:ab:00:00:05 dev eth1
+        - ip addr add 192.168.0.2/24 dev eth1
+        - ip route del default
+        - ip route add default via 192.168.0.1 dev eth1
+    client2:
+      kind: linux
+      exec:
+        - ip link set address 00:c1:ab:00:00:06 dev eth1
+        - ip addr add 192.168.1.2/24 dev eth1
+        - ip route del default
+        - ip route add default via 192.168.1.1 dev eth1
+    leaf1:
+      kind: generic_vm
+      # 使用 srl-labs/vrnetlab/ubuntu 构建产物；勿在 VM 内使用 10.0.0.0/24 作数据地址（与 vrnetlab 管理网冲突）
+      image: vrnetlab/canonical_ubuntu:noble
+    leaf2:
+      kind: generic_vm
+      image: vrnetlab/canonical_ubuntu:noble
+    router:
+      kind: linux
+      exec:
+        - ip addr add 172.16.0.1/24 dev eth1
+        - ip addr add 172.16.1.1/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+  links:
+    - endpoints: ["client1:eth1", "leaf1:eth2"]
+    - endpoints: ["client2:eth1", "leaf2:eth2"]
+    - endpoints: ["leaf1:eth1", "router:eth1"]
+    - endpoints: ["leaf2:eth1", "router:eth2"]

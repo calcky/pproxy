@@ -4,6 +4,8 @@
 #include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/flow.h"
+#include "pproxy/packet.h"
 #include "../runtime.h"
 #include "../modules.h"
 
@@ -57,11 +59,29 @@ static void *rrx_loop(void *arg)
         pkt->data_len      = (uint16_t)mb.len;
         pkt->tailroom     -= (uint16_t)mb.len;
         pkt->origin        = PP_PKT_FROM_TUNNEL;
-        pkt->meta.flow_hash = sid;            /* 暂存 sid */
         pkt->meta.rx_ns    = pp_now_ns();
         p->in++;
 
-        int shard = (int)(pp_sid_shard(sid) % (uint16_t)g_rt->n_workers);
+        /* 与 left_rx 相同：按五元组 hash 选 worker，否则与 lookup_or_create 分片不一致 */
+        if (pp_pkt_parse_l3_ipv4(pkt) != PP_OK) {
+            pp_pkt_put_ref(pkt);
+            p->drops++;
+            p->loops++;
+            continue;
+        }
+        pp_flow_key_t fk;
+        pp_flow_dir_t fdir;
+        if (pp_flow_key_from_pkt(pkt, &fk) != PP_OK) {
+            pp_pkt_put_ref(pkt);
+            p->drops++;
+            p->loops++;
+            continue;
+        }
+        pp_flow_key_normalize(&fk, &fdir);
+        uint64_t h = pp_flow_key_hash(&fk);
+        int    shard = (int)(h % (uint64_t)g_rt->n_workers);
+        pkt->meta.shard = (uint16_t)shard;
+        (void)sid;
         if (pp_ring_enqueue(g_rt->worker_back_ring[shard], pkt) == 0) {
             pp_pkt_put_ref(pkt); p->drops++;
         } else {
