@@ -22,6 +22,10 @@
 #include "io/ks_sock.h"
 
 #define TCP_FRAME_HDR  10  /* 8B sid + 2B len */
+/* server：right_tx 里等 accept 时不可用 poll(listen,-1)，否则 right_rx 先 accept 后 listen 不再就绪，会永久阻塞 */
+#define TCP_SERVER_WAIT_CONN_MS  100
+/* EAGAIN 后等 POLLOUT：同用有界等待，避免 poll(,-1) 在 right_tx 线程里占死一条 syscall */
+#define TCP_POLLOUT_WAIT_MS  TCP_SERVER_WAIT_CONN_MS
 /* 单帧最大 10+65535；高吞吐时需容纳未完成帧 + 多帧尾巴，64K 在 iperf 时易满导致 read(0) 误判 */
 #define TCP_RX_BUF     (256u * 1024u)
 
@@ -132,49 +136,36 @@ static int tcp_wait_readable(int fd, int timeout_ms)
     return poll(&p, 1, timeout_ms);
 }
 
-static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
+/*
+ * server 收路径拆成「只 accept」与「只读 conn」两段，避免混在同一循环里难排查。
+ * 本段仅 listen/accept（及一次 poll listen），对 conn 不做 read。
+ * 注意：若用 for(;;)+poll 可读 且 accept 仍失败（如 EMFILE），会 poll 立即返回、形成热转。
+ * 故每轮「先试 accept → 至多阻塞等一次 → 再试 accept」，失败则返回 0 由上层下轮再进。
+ * 返回：1=已有 conn；0=本周期无新连接； -1=无 listen；-2=poll 错误。
+ */
+static int server_ensure_connected(struct tcp_ctx *c, int tmo_ms)
 {
-    struct tcp_ctx *c = ctx;
-    if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
-        if (!server_try_accept(c)) return PP_ERR_AGAIN;
-    }
-    if (c->conn_fd < 0) return PP_ERR_CLOSED;
-    if (buf->len > 65535) return PP_ERR_INVAL;
+    if (c->conn_fd >= 0) return 1;
+    if (c->cfg.mode != PP_TMODE_SERVER) return c->conn_fd >= 0 ? 1 : -1;
+    if (c->listen_fd < 0) return -1;
 
-    uint8_t hdr[TCP_FRAME_HDR];
-    uint64_t sid_be = htobe64(sid);
-    uint16_t len_be = htons((uint16_t)buf->len);
-    memcpy(hdr,     &sid_be, 8);
-    memcpy(hdr + 8, &len_be, 2);
+    if (server_try_accept(c)) return 1;
+    if (c->conn_fd >= 0) return 1;
 
-    struct iovec iov[2] = {
-        { hdr, sizeof hdr },
-        { (void *)buf->data, buf->len },
-    };
-    int w = pp_ks_tcp_sendv(c->conn_fd, iov, 2);
-    if (w == PP_ERR_AGAIN) return PP_ERR_AGAIN;
-    if (w < 0) {
-        int e = errno;
-        drop_conn_e(c, "send error", e);
-        return PP_ERR_IO;
-    }
-    return w;
+    int acc_ms = (tmo_ms < 0) ? TCP_SERVER_WAIT_CONN_MS : tmo_ms;
+    int pr     = tcp_wait_readable(c->listen_fd, acc_ms);
+    if (pr < 0) return -2;
+    if (pr == 0) return 0;
+
+    if (server_try_accept(c)) return 1;
+    if (c->conn_fd >= 0) return 1;
+    return 0;
 }
 
-static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
+/* 仅 conn_fd 已就绪：组帧 + read(conn)，不碰 listen_fd */
+static int tcp_conn_recv(struct tcp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int tmo_ms)
 {
-    struct tcp_ctx *c  = ctx;
-    int tmo_ms = (timeout_us < 0) ? -1 : (int)((unsigned)(timeout_us + 999) / 1000);
-
     for (;;) {
-        if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
-            if (server_try_accept(c)) { /* 已建连 */ }
-            else {
-                if (c->listen_fd < 0) return 0;
-                if (tcp_wait_readable(c->listen_fd, tmo_ms) <= 0) return 0;
-                continue;
-            }
-        }
         if (c->conn_fd < 0) return PP_ERR_CLOSED;
 
         if (c->rxlen >= (size_t)TCP_FRAME_HDR) {
@@ -185,7 +176,7 @@ static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int ti
             memcpy(&len, c->rxbuf + 8, 2);
             len = ntohs(len);
             if (c->rxlen < (size_t)TCP_FRAME_HDR + len) {
-                /* 仍缺数据，下面对 conn 做 read；若 EAGAIN 则 poll */
+                /* 缺尾，下面对 conn read */
             } else {
                 if (out_buf->cap < len) return PP_ERR_NOMEM;
                 memcpy(out_buf->data, c->rxbuf + TCP_FRAME_HDR, len);
@@ -218,8 +209,78 @@ static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int ti
             c->rxlen += (size_t)n;
             continue;
         }
-        /* n==0: EAGAIN，等待可读避免在 right_rx 里对 read(2) 紧忙等 */
         if (tcp_wait_readable(c->conn_fd, tmo_ms) <= 0) return 0;
+    }
+}
+
+static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
+{
+    struct tcp_ctx *c = ctx;
+    if (buf->len > 65535) return PP_ERR_INVAL;
+
+    uint8_t hdr[TCP_FRAME_HDR];
+    uint64_t sid_be = htobe64(sid);
+    uint16_t len_be = htons((uint16_t)buf->len);
+    memcpy(hdr,     &sid_be, 8);
+    memcpy(hdr + 8, &len_be, 2);
+
+    struct iovec iov[2] = {
+        { hdr, sizeof hdr },
+        { (void *)buf->data, buf->len },
+    };
+
+    /* 非阻塞 writev 遇 EAGAIN 时不可向 right_tx 抛 PP_ERR_AGAIN，否则对端背压会当 drop 丢包。
+     * 在 tunnel 内 poll 到可写/可接受连接后再重发整帧。
+     * server：conn 可能由 right_rx 的 tcp_recv→server_try_accept 建立，须定期醒转以发现 conn_fd。 */
+    for (;;) {
+        if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
+            if (!server_try_accept(c)) {
+                if (c->listen_fd < 0) return PP_ERR_CLOSED;
+                /* 另一线程可能已 accept，勿在 listen 上无限阻塞 */
+                if (c->conn_fd >= 0) continue;
+                struct pollfd p = { .fd = c->listen_fd, .events = POLLIN };
+                if (poll(&p, 1, TCP_SERVER_WAIT_CONN_MS) < 0) return PP_ERR_IO;
+                continue;
+            }
+        }
+        if (c->conn_fd < 0) return PP_ERR_CLOSED;
+
+        int w = pp_ks_tcp_sendv(c->conn_fd, iov, 2);
+        if (w == PP_ERR_AGAIN) {
+            struct pollfd p = { .fd = c->conn_fd, .events = POLLOUT };
+            if (poll(&p, 1, TCP_POLLOUT_WAIT_MS) < 0) return PP_ERR_IO;
+            continue; /* 超时也继续重试 writev，不向上抛 PP_ERR_AGAIN（见上注释） */
+        }
+        if (w < 0) {
+            int e = errno;
+            drop_conn_e(c, "send error", e);
+            return PP_ERR_IO;
+        }
+        return w;
+    }
+}
+
+static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
+{
+    struct tcp_ctx *c  = ctx;
+    int tmo_ms = (timeout_us < 0) ? -1 : (int)((unsigned)(timeout_us + 999) / 1000);
+
+    for (;;) {
+        if (c->conn_fd < 0) {
+            if (c->cfg.mode == PP_TMODE_SERVER) {
+                int sc = server_ensure_connected(c, tmo_ms);
+                if (sc == 0) return 0;
+                if (sc == -1) return 0; /* 无 listen，与历史行为一致可改为 PP_ERR_CLOSED */
+                if (sc == -2) return PP_ERR_IO;
+            } else
+                return PP_ERR_CLOSED;
+        }
+        if (c->conn_fd < 0) return PP_ERR_CLOSED;
+
+        int r = tcp_conn_recv(c, out_sid, out_buf, tmo_ms);
+        if (r == PP_ERR_NOMEM) return r;
+        if (r == PP_ERR_IO) return r;
+        return r; /* >0 一帧; 0 本周期无完整帧/对端关/EAGAIN */
     }
 }
 

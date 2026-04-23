@@ -2,9 +2,11 @@
 # tests/clab/deploy.sh -- 部署 containerlab 拓扑、配置 leaf 数据面、可选安装并测试 pproxy
 #
 # 用法:
-#   ./deploy.sh                    # 部署拓扑 + 配置 leaf + 部署 pproxy 并做简单检查
-#   ./deploy.sh --no-pproxy        # 只部署拓扑 + 配置 leaf（其余参数仍传给 containerlab）
+#   ./deploy.sh                    # 先宿主机 ./build.sh --xdp --pcap，再部署拓扑 + … + pproxy
+#   PPROXY_SKIP_BUILD=1 ./deploy.sh  # 不自动编译（已自备 build/pproxy 或仅试拓扑时）
+#   ./deploy.sh --no-pproxy        # 只部署拓扑 + 配置 leaf（不跑 build、不装 pproxy）
 #   PPROXY_BIN=/path/to/pproxy ./deploy.sh
+#   默认 PPROXY_COREDUMP=1（各 VM 上 core 落 /opt/pproxy；勿需则 PPROXY_COREDUMP=0）
 #
 # 宿主机 containerlab：
 #   默认 **不** 使用 sudo（适合已加入 docker 组、且按 containerlab 文档配好免 sudo 的环境）。
@@ -17,13 +19,19 @@
 #
 # 改 leaf1 的 WAN 地址时：须同步改 tests/clab/config/pp2.json 里 tunnels[0].server（对端 TCP）。
 #
-# 先在本仓库根目录执行 ./build.sh --xdp --pcap 生成 build/pproxy（与 Ubuntu noble 动态库兼容时可直接 scp）
+# Core dump（各 leaf VM 内 pproxy 若 segfault，core 落 /opt/pproxy/core-*.%e.%p）:
+#   默认开启；会设 kernel.core_pattern 且 nohup 前 ulimit -c unlimited；用 gdb: gdb /opt/pproxy/pproxy core-…
+#   关闭: PPROXY_COREDUMP=0 ./deploy.sh
+#
+# 未设 PPROXY_SKIP_BUILD=1 且非 --no-pproxy 时，本脚本会在「[1/5]」前自动在仓库根执行
+#   ./build.sh --xdp --pcap
+# 以生成与 leaf 上 libbpf/libxdp/libpcap 依赖一致的 build/pproxy。宿主机缺依赖则先装或跳过编译。
 #
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-TOPO="generic_vm.clab.yml"
+TOPO="pproxy.clab.yml"
 UBUNTU_USER="clab"
 UBUNTU_PASS='clab@123'
 # 与 deploy 中 configure_ubuntu_leaf 的地址一致（见 generic_vm 拓扑 + 路由）
@@ -50,6 +58,8 @@ VM_PP1_CFG="$VM_PPROXY_ROOT/pp1.json"
 VM_PP2_CFG="$VM_PPROXY_ROOT/pp2.json"
 VM_PP1_LOG="$VM_PPROXY_ROOT/log/pp1.log"
 VM_PP2_LOG="$VM_PPROXY_ROOT/log/pp2.log"
+# 1=各 VM 启用 core 到 ${VM_PPROXY_ROOT}/core-*（与 doc/debug.md 一致；默认 1）
+: "${PPROXY_COREDUMP:=1}"
 
 SSH_OPTS=(
   -o StrictHostKeyChecking=no
@@ -79,7 +89,13 @@ require sshpass "sshpass"
 require scp "openssh-client"
 require containerlab "containerlab (https://containerlab.dev)"
 
-echo "=== [1/4] Deploying containerlab topology ==="
+# 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap）
+if [[ "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
+  echo "=== [0/5] Host: $REPO_ROOT/build.sh --xdp --pcap --debug ==="
+  (cd "$REPO_ROOT" && ./build.sh --xdp --pcap --debug)
+fi
+
+echo "=== [1/5] Deploying containerlab topology ==="
 if [[ "${CLAB_SUDO:-0}" == "1" ]]; then
   echo "  (using: sudo containerlab …; set CLAB_SUDO=0 to try without sudo)"
   sudo containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
@@ -200,6 +216,23 @@ s install -d -m 0755 -o "$U" -g "$U" -- /opt/pproxy /opt/pproxy/log /opt/pproxy/
 EOP
 }
 
+pproxy_coredump_setup() {
+  local host=$1
+  [[ "$PPROXY_COREDUMP" == "1" ]] || return 0
+  echo "  pproxy: coredump → ${VM_PPROXY_ROOT}/core-* (kernel.core_pattern + 启动时 ulimit) on ${host} …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$VM_PPROXY_ROOT" <<'EOC'
+set -euo pipefail
+PASS="$1" ROOT="$2"
+PATTERN="${ROOT}/core-%e-%p-%t"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s install -d -m 0755 "$ROOT" 2>/dev/null || true
+if ! s sysctl -w "kernel.core_pattern=$PATTERN" 2>/dev/null; then
+  printf '%s' "$PATTERN" | s tee /proc/sys/kernel/core_pattern >/dev/null
+fi
+EOC
+}
+
 pproxy_scp_bin() {
   local host=$1
   sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$PPROXY_BIN" "${UBUNTU_USER}@${host}:${VM_PPROXY_BIN}"
@@ -225,20 +258,26 @@ pproxy_push_cfgs() {
 
 pproxy_start() {
   local host=$1 bin=$2 cfg=$3 log=$4
+  local cd_on="${PPROXY_COREDUMP:-1}"
   echo "  pproxy: starting on ${host} ($bin -c $cfg) …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" "$bin" "$cfg" "$log" <<'EOS'
+    bash -s -- "$UBUNTU_PASS" "$bin" "$cfg" "$log" "$cd_on" <<'EOS'
 set -euo pipefail
 PASS="$1"
 BIN="$2"
 CFG="$3"
 LOG="$4"
+CD="$5"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
 s pkill -f "pproxy -c $CFG" 2>/dev/null || true
 sleep 0.5
 # TUN 需 root；标准输出/错入日志（见 /opt/pproxy/log/）
 s install -d -m 0755 "$(dirname "$LOG")" 2>/dev/null || true
-s sh -c "nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+if [[ "$CD" == "1" ]]; then
+  s sh -c "ulimit -c unlimited; nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+else
+  s sh -c "nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+fi
 sleep 0.5
 # nohup 以 root 写日志；放宽权限便于 clab 用户 tail
 s chmod 0644 "$LOG" 2>/dev/null || true
@@ -266,10 +305,10 @@ wait_vm_http() {
 
 pproxy_smoke() {
   echo ""
-  echo "=== [4/4] pproxy: binary, configs, start, smoke test ==="
+  echo "=== [4/5] pproxy: binary, configs, start, smoke test ==="
   if [[ ! -x "$PPROXY_BIN" ]]; then
     echo "  ✗ 未找到可执行文件: $PPROXY_BIN" >&2
-    echo "     在仓库根目录先执行: ./build.sh --xdp --pcap" >&2
+    echo "     在仓库根执行: ./build.sh --xdp --pcap，或勿设 PPROXY_SKIP_BUILD=1 后重跑本脚本" >&2
     exit 1
   fi
   echo "  Using: $PPROXY_BIN"
@@ -278,6 +317,8 @@ pproxy_smoke() {
   pproxy_apt_deps "$LEAF2_HOST"
   pproxy_remote_prepare "$LEAF1_HOST"
   pproxy_remote_prepare "$LEAF2_HOST"
+  pproxy_coredump_setup "$LEAF1_HOST"
+  pproxy_coredump_setup "$LEAF2_HOST"
   pproxy_scp_bin "$LEAF1_HOST"
   pproxy_scp_bin "$LEAF2_HOST"
   pproxy_push_cfgs
@@ -305,23 +346,26 @@ pproxy_smoke() {
     "${UBUNTU_USER}@${LEAF2_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP2_LOG}" 2>/dev/null | grep -q "tcp tunnel connected" \
     || { echo "  ✗ leaf2 log missing 'tcp tunnel connected'" >&2; exit 1; }
 
-  echo "  ✓ pproxy smoke test OK (leaf1=server, leaf2=client → ${LEAF1_WAN_IP}:${TUNNEL_PORT})"
+  echo "  OK: pproxy smoke, leaf1=server leaf2=client -> ${LEAF1_WAN_IP}:${TUNNEL_PORT}"
   echo ""
   echo "  二进制: ${VM_PPROXY_BIN}"
-  echo "  配置:   ${VM_PP1_CFG} / ${VM_PP2_CFG}（源文件: ${PPROXY_CFG_DIR}/）"
+  echo "  配置:   ${VM_PP1_CFG} / ${VM_PP2_CFG}  (源目录: ${PPROXY_CFG_DIR}/)"
   echo "  日志:   tail -f ${VM_PP1_LOG}  |  tail -f ${VM_PP2_LOG}"
-  echo "  停进程: ssh clab@leaf1 \"echo '$UBUNTU_PASS' | sudo -S pkill -f ${VM_PP1_CFG}\""
-  echo "         ssh clab@leaf2 \"echo '$UBUNTU_PASS' | sudo -S pkill -f ${VM_PP2_CFG}\""
+  echo "  停进程: 各 leaf 上需要 sudo 时, 把本脚本的 UBUNTU_PASS 用管道喂给: sudo -S pkill -f 下面路径"
+  echo "         ${VM_PP1_CFG}  (leaf1)    ${VM_PP2_CFG}  (leaf2)"
+  if [[ "${PPROXY_COREDUMP:-1}" == "1" ]]; then
+    echo "  coredump: ${VM_PPROXY_ROOT}/core-pproxy-*.  gdb: gdb ${VM_PPROXY_BIN} ${VM_PPROXY_ROOT}/core-..."
+  fi
 }
 
 echo ""
-echo "=== [2/4] Waiting for Ubuntu (generic_vm) SSH ==="
+echo "=== [2/5] Waiting for Ubuntu (generic_vm) SSH ==="
 echo "  SSH targets: ${LEAF1_HOST}, ${LEAF2_HOST} (clab 节点名; /etc/hosts 由 containerlab 维护)"
 wait_for_ssh leaf1 "$LEAF1_HOST"
 wait_for_ssh leaf2 "$LEAF2_HOST"
 
 echo ""
-echo "=== [3/4] Applying Ubuntu data-plane configuration ==="
+echo "=== [3/5] Applying Ubuntu data-plane configuration ==="
 configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24"
 configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24"
 
@@ -329,11 +373,11 @@ if [[ "$SKIP_PPROXY" -eq 0 ]]; then
   pproxy_smoke
 else
   echo ""
-  echo "=== [4/4] pproxy: skipped (--no-pproxy) ==="
+  echo "=== [4/5] pproxy: skipped (--no-pproxy) ==="
 fi
 
 echo ""
-echo "=== Done ==="
+echo "=== [5/5] Done ==="
 echo "  client1 → 192.168.0.2 (GW 192.168.0.1 on leaf1)"
 echo "  client2 → 192.168.1.2 (GW 192.168.1.1 on leaf2)"
 echo "  Test: docker exec -it client1 ping -c 3 192.168.1.2"

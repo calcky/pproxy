@@ -10,6 +10,7 @@
 #include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "pproxy/flow.h"
 #include "pproxy/packet.h"
 #include "../runtime.h"
@@ -44,6 +45,8 @@ static void process_upstream(wk_priv_t *p, pp_pkt_t *pkt)
     pp_session_shard_t *sh = g_rt->shards[idx];
     pp_flow_key_t k;
     if (pp_flow_key_from_pkt(pkt, &k) != PP_OK) {
+        pp_drop_orphan_pkt(1, PP_ORPHAN_WK_UP_BAD_KEY, "worker",
+                           "flow_key_from_pkt failed", pkt);
         pp_pkt_put_ref(pkt); p->drops++; return;
     }
     pp_flow_dir_t dir;
@@ -51,7 +54,11 @@ static void process_upstream(wk_priv_t *p, pp_pkt_t *pkt)
 
     bool is_new;
     pp_session_t *s = pp_session_lookup_or_create(sh, &k, &is_new);
-    if (!s) { pp_pkt_put_ref(pkt); p->drops++; return; }
+    if (!s) {
+        pp_drop_orphan(1, PP_ORPHAN_WK_UP_TABLE_FULL, "worker",
+                       "session table full (lookup_or_create)", &k);
+        pp_pkt_put_ref(pkt); p->drops++; return;
+    }
 
     /* 设 payload 偏移（简化：tcp 假定无 options） */
     if (pkt->meta.l4_off != UINT16_MAX && pkt->meta.payload_off == UINT16_MAX) {
@@ -64,8 +71,6 @@ static void process_upstream(wk_priv_t *p, pp_pkt_t *pkt)
     pp_dpi_chain_run(g_rt->dpi, s, pkt, dir);
 
     s->last_ns = pp_now_ns();
-    s->up.pkts++;
-    s->up.bytes += pkt->data_len;
     if (s->state == PP_SS_NEW) s->state = PP_SS_EST;
 
     /* 选 tunnel：MVP 简单取模 */
@@ -79,9 +84,13 @@ static void process_upstream(wk_priv_t *p, pp_pkt_t *pkt)
      *     更正式做法是封装 pp_tx_item_t。
      */
     pkt->meta.flow_hash = s->sid;
+    pkt->meta.sid       = s->sid;
     if (pp_ring_enqueue(g_rt->right_tx_ring[j], pkt) == 0) {
+        pp_drop_session(s, 1, "worker", "right_tx ring full");
         pp_pkt_put_ref(pkt); p->drops++;
     } else {
+        s->up.pkts++;
+        s->up.bytes += pkt->data_len;
         p->out++;
     }
     (void)tb;
@@ -93,6 +102,8 @@ static void process_downstream(wk_priv_t *p, pp_pkt_t *pkt)
     pp_session_shard_t *sh = g_rt->shards[p->idx];
     if (pkt->meta.l3_off == UINT16_MAX) {
         if (pp_pkt_parse_l3_ipv4(pkt) != PP_OK) {
+            pp_drop_orphan_pkt(0, PP_ORPHAN_WK_DN_L3, "worker",
+                               "parse_l3_ipv4 failed", pkt);
             pp_pkt_put_ref(pkt);
             p->drops++;
             return;
@@ -100,6 +111,8 @@ static void process_downstream(wk_priv_t *p, pp_pkt_t *pkt)
     }
     pp_flow_key_t k;
     if (pp_flow_key_from_pkt(pkt, &k) != PP_OK) {
+        pp_drop_orphan_pkt(0, PP_ORPHAN_WK_DN_BAD_KEY, "worker",
+                           "flow_key_from_pkt failed", pkt);
         pp_pkt_put_ref(pkt);
         p->drops++;
         return;
@@ -110,6 +123,8 @@ static void process_downstream(wk_priv_t *p, pp_pkt_t *pkt)
     pp_session_t *s = pp_session_lookup_or_create(sh, &k, &is_new);
     (void)is_new;
     if (!s) {
+        pp_drop_orphan(0, PP_ORPHAN_WK_DN_TABLE_FULL, "worker",
+                       "session table full (lookup_or_create)", &k);
         pp_pkt_put_ref(pkt);
         p->drops++;
         return;
@@ -117,12 +132,14 @@ static void process_downstream(wk_priv_t *p, pp_pkt_t *pkt)
     if (s->state == PP_SS_NEW) s->state = PP_SS_EST;
 
     s->last_ns = pp_now_ns();
-    s->dn.pkts++;
-    s->dn.bytes += pkt->data_len;
 
+    pkt->meta.sid = s->sid;
     if (pp_ring_enqueue(g_rt->left_tx_ring, pkt) == 0) {
+        pp_drop_session(s, 0, "worker", "left_tx ring full");
         pp_pkt_put_ref(pkt); p->drops++;
     } else {
+        s->dn.pkts++;
+        s->dn.bytes += pkt->data_len;
         p->out++;
     }
 }
@@ -152,7 +169,7 @@ static void *wk_loop(void *arg)
 {
     pp_module_t *m = arg;
     wk_priv_t   *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started (shard=%d)", m->name, p->idx);
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];

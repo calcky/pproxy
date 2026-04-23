@@ -7,6 +7,7 @@
  *   - 没有 RCU；mgmt snapshot 直接拷贝快照（只读 worker 的状态）
  *   - 实际用于高并发可换 cuckoo / RCU hash table
  */
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include "pproxy/session.h"
@@ -104,6 +105,8 @@ pp_session_t *pp_session_lookup_or_create(pp_session_shard_t *sh,
     uint32_t idx = sh->free_stack[--sh->nfree];
     s = &sh->slots[idx];
     memset(s, 0, sizeof *s);
+    atomic_init(&s->up.drops, 0);
+    atomic_init(&s->dn.drops, 0);
     s->key        = *k;
     s->state      = PP_SS_NEW;
     s->app_proto  = PP_APP_UNKNOWN;
@@ -190,9 +193,17 @@ int pp_session_snapshot(pp_session_shard_t *const *shards, int n_shards,
             v->state      = s->state;
             v->app_proto  = s->app_proto;
             v->created_ns = s->created_ns;
-            v->last_ns    = s->last_ns;
-            v->up         = s->up;
-            v->dn         = s->dn;
+            v->last_ns     = s->last_ns;
+            v->up.pkts     = s->up.pkts;
+            v->up.bytes    = s->up.bytes;
+            v->up.drops    = (uint64_t)atomic_load_explicit(
+                &s->up.drops, memory_order_relaxed);
+            v->up.retrans  = s->up.retrans;
+            v->dn.pkts     = s->dn.pkts;
+            v->dn.bytes    = s->dn.bytes;
+            v->dn.drops    = (uint64_t)atomic_load_explicit(
+                &s->dn.drops, memory_order_relaxed);
+            v->dn.retrans  = s->dn.retrans;
         }
     }
     return n;

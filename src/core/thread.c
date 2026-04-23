@@ -7,8 +7,14 @@
 #include "pproxy/module.h"
 #include "pproxy/log.h"
 
-int pp_thread_setup(const char *name, int cpu)
+int pp_thread_setup(pp_module_t *m, const char *name, int cpu)
 {
+#ifdef __linux__
+    if (m)
+        m->lwp = (int32_t)syscall(SYS_gettid);
+#else
+    (void)m;
+#endif
     if (name && *name) {
         char tn[16];
         snprintf(tn, sizeof tn, "%s", name);

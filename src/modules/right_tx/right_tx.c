@@ -4,6 +4,7 @@
 #include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "../runtime.h"
 #include "../modules.h"
 
@@ -35,7 +36,7 @@ static void *rtx_loop(void *arg)
 {
     pp_module_t *m = arg;
     rtx_priv_t  *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started (tunnel=%d)", m->name, p->idx);
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];
@@ -50,11 +51,14 @@ static void *rtx_loop(void *arg)
         p->in += n;
         for (int i = 0; i < n; i++) {
             pp_pkt_t *pkt = batch[i];
-            uint64_t sid = pkt->meta.flow_hash;
+            uint64_t sid = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
             pp_tun_buf_t b = { .data = pkt->data, .len = pkt->data_len };
             int r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], sid, &b);
-            if (r < 0) p->drops++;
-            else       p->out++;
+            if (r < 0) {
+                pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
+                p->drops++;
+            } else
+                p->out++;
             pp_pkt_put_ref(pkt);
         }
         p->loops++;

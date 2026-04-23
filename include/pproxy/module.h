@@ -41,6 +41,7 @@ typedef struct pp_mod_stat {
 typedef struct pp_module {
     char            name[PP_MODULE_NAME_MAX];
     pthread_t       tid;
+    int32_t         lwp;            /* Linux gettid(2)，与 htop 线程列一致；-1 未启动 */
     int             cpu;            /* -1 表示不绑核 */
     atomic_int      quit;           /* 主循环检查；0 = run, 1 = stop */
     atomic_int      state;          /* pp_mod_state_t */
@@ -93,8 +94,8 @@ PP_INLINE bool pp_module_should_quit(const pp_module_t *m)
     return atomic_load_explicit(&m->quit, memory_order_relaxed) != 0;
 }
 
-/* 设置当前线程名 + 绑核（模块 start 内部调用） */
-int pp_thread_setup(const char *name, int cpu);
+/* 设置当前线程名 + 绑核，并写入 m->lwp=gettid（m 可为 NULL） */
+int pp_thread_setup(pp_module_t *m, const char *name, int cpu);
 
 /* ---------- 内置模块实例（具体定义在各 modules/<x>/<x>.c 中） ---------- */
 extern pp_module_ops_t pp_mod_left_rx_ops;

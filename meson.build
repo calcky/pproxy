@@ -83,6 +83,38 @@ executable('pproxy', sources,
   install: true,
 )
 
+# ---------- 测试：无锁环 ----------
+test_ring = executable('test_ring',
+  [
+    'tests/test_ring.c',
+    'src/core/ring.c',
+  ],
+  include_directories: inc,
+  dependencies: deps,
+)
+test('ring', test_ring)
+
+# ring 多生产者基准：同源码链两次 ring.c，仅 PP_RING_USE_CPU_BACKOFF 不同
+test_ring_bench = executable('test_ring_bench',
+  [
+    'tests/test_ring_bench.c',
+    'src/core/ring.c',
+  ],
+  include_directories: inc,
+  dependencies: deps,
+  c_args: ['-DPP_RING_USE_CPU_BACKOFF=1'],
+)
+test_ring_bench_nobackoff = executable('test_ring_bench_nobackoff',
+  [
+    'tests/test_ring_bench.c',
+    'src/core/ring.c',
+  ],
+  include_directories: inc,
+  dependencies: deps,
+  c_args: ['-DPP_RING_USE_CPU_BACKOFF=0'],
+)
+# 仅生成可执行文件；与负载相关，不加入默认 meson test。见 doc/ring.md
+
 # ---------- 测试：tunnel 本机回环（同进程 server↔client） ----------
 # 只链接 tunnel 和 core 的少量 .o，不依赖 main / module / left-I/O，无需 root。
 test_tunnel_loopback = executable('test_tunnel_loopback',
@@ -135,6 +167,7 @@ test_mgmt_http = executable('test_mgmt_http',
   [
     'tests/test_mgmt_http.c',
     'src/modules/mgmt/mgmt.c',
+    'src/core/drop.c',
     'src/config/config.c',
     'src/core/module.c',
     'src/core/thread.c',

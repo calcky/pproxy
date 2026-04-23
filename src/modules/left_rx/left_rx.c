@@ -13,6 +13,7 @@
 #include <errno.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "pproxy/flow.h"
 #include "../runtime.h"
 
@@ -43,7 +44,7 @@ static void *lrx_loop(void *arg)
 {
     pp_module_t *m = arg;
     lrx_priv_t  *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started (fd=%d)", m->name, p->rx_fd);
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];
@@ -61,6 +62,8 @@ static void *lrx_loop(void *arg)
             pp_pkt_t *pkt = batch[i];
             pp_flow_key_t k;
             if (pp_flow_key_from_pkt(pkt, &k) != PP_OK) {
+                pp_drop_orphan_pkt(1, PP_ORPHAN_LRX_BAD_KEY, "left_rx",
+                                    "flow_key_from_pkt failed", pkt);
                 pp_pkt_put_ref(pkt); p->drops++; continue;
             }
             pp_flow_dir_t dir;
@@ -71,6 +74,8 @@ static void *lrx_loop(void *arg)
             pkt->meta.flow_hash = h;
 
             if (pp_ring_enqueue(g_rt->worker_rx_ring[idx], pkt) == 0) {
+                pp_drop_orphan(1, PP_ORPHAN_LRX_WKR_RX_RING, "left_rx",
+                               "worker_rx ring full", &k);
                 pp_pkt_put_ref(pkt); p->drops++;
             } else {
                 p->out++;

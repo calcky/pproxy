@@ -21,7 +21,7 @@ static void *tm_loop(void *arg)
 {
     pp_module_t *m = arg;
     tm_priv_t   *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started", m->name);
 
     while (!pp_module_should_quit(m)) {

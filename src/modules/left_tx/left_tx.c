@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "../runtime.h"
 
 typedef struct ltx_priv {
@@ -22,7 +23,7 @@ static void *ltx_loop(void *arg)
 {
     pp_module_t *m = arg;
     ltx_priv_t  *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started", m->name);
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];
@@ -37,7 +38,14 @@ static void *ltx_loop(void *arg)
         p->in += n;
         int sent = g_rt->left_ops->tx_burst(g_rt->left_ctx, batch, n);
         p->out += sent;
-        p->drops += (n - sent);
+        p->drops += (unsigned)(n - sent);
+        for (int i = sent; i < n; i++) {
+            uint64_t psid = batch[i]->meta.sid
+                          ? batch[i]->meta.sid
+                          : batch[i]->meta.flow_hash;
+            pp_drop_by_sid(g_rt, psid, 0, "left_tx",
+                          "left tx_burst drop (backlog/errno)");
+        }
         for (int i = 0; i < n; i++) pp_pkt_put_ref(batch[i]);
         p->loops++;
     }

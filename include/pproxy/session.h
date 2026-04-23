@@ -13,6 +13,7 @@
 #ifndef PPROXY_SESSION_H
 #define PPROXY_SESSION_H
 
+#include <stdatomic.h>
 #include "pproxy/pproxy.h"
 #include "pproxy/flow.h"
 
@@ -42,13 +43,20 @@ typedef enum pp_app_proto {
     /* ... 由 dpi 插件注册扩展 */
 } pp_app_proto_t;
 
-/* ---------- 单向计数器（per-direction） ---------- */
+/* ---------- 单向计数器（per-direction） ----------
+ * drops: 多线程可累加（I/O 与 worker 可能同时更新同一 session 的统计）
+ */
 typedef struct pp_stats {
-    uint64_t pkts;
-    uint64_t bytes;
-    uint64_t drops;
-    uint64_t retrans;
+    uint64_t          pkts;
+    uint64_t          bytes;
+    _Atomic uint64_t  drops;
+    uint64_t          retrans;
 } pp_stats_t;
+
+/* mgmt/快照用：全为定宽整型，便于打印与序列化 */
+typedef struct pp_stats_line {
+    uint64_t pkts, bytes, drops, retrans;
+} pp_stats_line_t;
 
 /* ---------- 会话主体 ----------
  * 注意：跨 cacheline 布局；高频字段（state/last_ns/stats）放第一行。
@@ -115,9 +123,9 @@ typedef struct pp_session_view {
     pp_flow_key_t   key;
     uint8_t         state;
     uint8_t         app_proto;
-    uint64_t        created_ns;
-    uint64_t        last_ns;
-    pp_stats_t      up, dn;
+    uint64_t         created_ns;
+    uint64_t         last_ns;
+    pp_stats_line_t  up, dn;
 } pp_session_view_t;
 
 typedef struct pp_session_filter {

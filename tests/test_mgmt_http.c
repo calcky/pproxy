@@ -152,6 +152,8 @@ int main(void)
     ASSERT_HAS(buf, "pp_module_loops{module=\"mgmt\"}");
     ASSERT_HAS(buf, "pp_sessions 0");
     ASSERT_HAS(buf, "pp_sessions_by_app{app=\"unknown\"}");
+    ASSERT_HAS(buf, "pp_session_drops_sum{dir=\"up\"}");
+    ASSERT_HAS(buf, "pp_drop_orphan{kind=\"lrx_flow_key\"}");
 
     /* ---- GET / ---- */
     memset(buf, 0, sizeof buf);

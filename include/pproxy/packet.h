@@ -38,7 +38,8 @@ typedef struct pp_pkt_meta {
     uint8_t  l3_proto;          /* IPPROTO_IP / IPPROTO_IPV6 */
     uint8_t  l4_proto;          /* IPPROTO_TCP / UDP / ICMP */
     uint16_t shard;             /* 计算好的 worker 分片号 */
-    uint64_t flow_hash;         /* FlowKey hash，缓存避免重复算 */
+    uint64_t flow_hash;         /* FlowKey hash 或 (upstream) 上送 right_tx 时复用为 sid */
+    uint64_t sid;               /* 会话 id；0=未设；与 worker/隧道路径上一致时便于 tx 侧丢包归会话 */
     uint64_t rx_ns;             /* 收到的时间戳 */
 } pp_pkt_meta_t;
 

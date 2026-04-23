@@ -230,6 +230,7 @@ static pp_module_t *new_mod(const char *name, int cpu, pp_module_ops_t *ops)
     pp_module_t *m = &mod_storage[mod_n++];
     snprintf(m->name, sizeof m->name, "%s", name);
     m->cpu = cpu;
+    m->lwp = -1;
     m->ops = ops;
     return m;
 }

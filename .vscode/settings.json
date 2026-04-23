@@ -1,6 +1,14 @@
 {
     "files.associations": {
         "pproxy.h": "c",
-        "cstdint": "c"
+        "cstdint": "c",
+        "*.tcc": "c",
+        "deque": "c",
+        "string": "c",
+        "vector": "c",
+        "string_view": "c",
+        "sstream": "c",
+        "functional": "c",
+        "cstdlib": "c"
     }
 }

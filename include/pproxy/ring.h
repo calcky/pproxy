@@ -1,9 +1,14 @@
 /*
  * ring.h -- 无锁环形队列
  *
- * 提供两种实现：
- *   - SPSC：单生产者单消费者，最快路径，用于 left_rx -> worker[i]；
- *   - MPSC：多生产者单消费者，用于 worker[*] -> right_tx[j] / left_tx；
+ * 统一为四下标序线发布（与常见 j_ring / DPDK 式做法一致，无互斥）：
+ *   入队：CAS prod_head → 写 slot → 自旋至 prod_tail==old_ph → 发布 prod_tail；
+ *   出队：CAS cons_head → 读 slot → 自旋至 cons_tail==old_ch → 发布 cons_tail。
+ * `PP_RING_SPSC` / `PP_RING_MPSC` 仅表示预期用法，**实现相同**；单生产者+单消费者时
+ * 无跨生产者重序，自旋极短。多生产者+单消费者为无锁 MPSC。
+ *
+ * 对 `src/core/ring.c` 可编译期定义 `PP_RING_USE_CPU_BACKOFF`：默认 1，自旋阶段使用
+ * `pause`/`yield` 提示；为 0 时该阶段为忙等（见 `doc/ring.md` 基准）。
  *
  * 元素类型限定为指针（pp_pkt_t* 或控制消息指针）。
  */
@@ -26,7 +31,7 @@ typedef enum pp_ring_kind {
 } pp_ring_kind_t;
 
 typedef struct pp_ring_cfg {
-    pp_ring_kind_t kind;
+    pp_ring_kind_t kind;            /* SPSC / MPSC 创建相同环；见头文件说明 */
     size_t         capacity;        /* 必须是 2 的幂 */
     int            numa_node;       /* -1 = 不绑定 */
     const char    *name;            /* 调试用 */

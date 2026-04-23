@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "../runtime.h"
 #include "../../config/config.h"
 
@@ -50,11 +51,16 @@ static const char HELP_TEXT[] =
     "commands:\n"
     "  help                   -- this message\n"
     "  stat                   -- module statistics\n"
-    "  sessions               -- session snapshot\n"
+    "  sessions               -- session snapshot (per-flow up/dn pkts/bytes/drops)\n"
+    "  drops                  -- orphan drop breakdown + sum of session drops\n"
     "  reload [path]          -- hot-reload JSON (log.level, session.*_ttl_ms,\n"
     "                            dpi.plugins[].enable); path defaults to\n"
     "                            the file given via -c at startup\n"
-    "  quit                   -- shut the process down (debug only)\n";
+    "  quit                   -- shut the process down (debug only)\n"
+    "\n"
+    "session line: up = path toward tunnel/server (left_rx→…→right_tx); drops there are up_drops.\n"
+    "              dn = return path to client (right_rx→…→left_tx); drops there are dn_drops.\n"
+    "              Set log level to trace to log every drop (session + 5-tuple + reason).\n";
 
 /* ---------- 统计收集 ---------- */
 
@@ -86,8 +92,13 @@ static int stat_walk_human(pp_module_t *m, void *user)
     struct stat_acc *a = user;
     pp_mod_stat_t s; memset(&s, 0, sizeof s);
     if (m->ops->stat) m->ops->stat(m, &s);
-    acc_printf(a, "  %-12s loops=%lu in=%lu out=%lu drops=%lu cpu=%u\n",
-        s.name, (unsigned long)s.loops,
+    char tbuf[24];
+    if (m->lwp >= 0) snprintf(tbuf, sizeof tbuf, "%d", (int)m->lwp);
+    else snprintf(tbuf, sizeof tbuf, "na");
+    acc_printf(a,
+        "  %-12s tid=%s loops=%lu in=%lu out=%lu drops=%lu cpu=%u\n",
+        s.name, tbuf,
+        (unsigned long)s.loops,
         (unsigned long)s.events_in, (unsigned long)s.events_out,
         (unsigned long)s.drops, s.cpu);
     return PP_OK;
@@ -148,11 +159,48 @@ static void handle_unix(int cfd)
             char k[128];
             pp_flow_key_format(&views[i].key, k, sizeof k);
             acc_printf(&a,
-                "  sid=%lx state=%u app=%u  %s  up=%lu/%lu dn=%lu/%lu\n",
+                "  sid=%lx state=%u app=%u  %s\n"
+                "    up(rx-tunnel):  pkts=%lu bytes=%lu drops=%lu\n"
+                "    dn(tx-to-client): pkts=%lu bytes=%lu drops=%lu\n",
                 (unsigned long)views[i].sid, views[i].state, views[i].app_proto, k,
                 (unsigned long)views[i].up.pkts, (unsigned long)views[i].up.bytes,
-                (unsigned long)views[i].dn.pkts, (unsigned long)views[i].dn.bytes);
+                (unsigned long)views[i].up.drops,
+                (unsigned long)views[i].dn.pkts, (unsigned long)views[i].dn.bytes,
+                (unsigned long)views[i].dn.drops);
         }
+    } else if (strcmp(req, "drops") == 0) {
+        pp_drop_orphan_totals_t ot;
+        pp_drop_orphan_get(&ot);
+        static const char *const okind[PP_ORPHAN__N] = {
+            "lrx_flow_key",
+            "lrx_worker_rx_ring_full",
+            "rrx_l3_parse",
+            "rrx_flow_key",
+            "rrx_worker_back_ring_full",
+            "wk_up_flow_key",
+            "wk_up_session_table_full",
+            "wk_up_right_tx_ring_full",
+            "wk_down_l3_parse",
+            "wk_down_flow_key",
+            "wk_down_session_table_full",
+            "wk_down_left_tx_ring_full",
+        };
+        acc_printf(&a, "orphan drops (before session or I/O-only, by kind):\n");
+        for (int i = 0; i < PP_ORPHAN__N; i++)
+            acc_printf(&a, "  %-36s %lu\n", okind[i],
+                       (unsigned long)ot.v[i]);
+        pp_session_view_t dv[1024];
+        int g2 = pp_session_snapshot(g_rt->shards, g_rt->n_workers,
+                                     NULL, dv, 1024);
+        uint64_t sud = 0, sdd = 0;
+        for (int i = 0; i < g2; i++) {
+            sud += dv[i].up.drops;
+            sdd += dv[i].dn.drops;
+        }
+        acc_printf(&a,
+                   "session drops (sum over current snapshot, up=toward-tunnel dn=to-client):\n"
+                   "  up_drops=%lu dn_drops=%lu\n",
+                   (unsigned long)sud, (unsigned long)sdd);
     } else if (strncmp(req, "reload", 6) == 0
                && (req[6] == 0 || req[6] == ' ' || req[6] == '\t')) {
         const char *path = req + 6;
@@ -235,6 +283,40 @@ static size_t build_metrics(char *body, size_t cap)
     acc_printf(&a, "# TYPE pp_sessions_by_app gauge\n");
     for (int p = 0; p < 8; p++)
         acc_printf(&a, "pp_sessions_by_app{app=\"%s\"} %u\n", app_names[p], cnt[p]);
+
+    uint64_t sud = 0, sdd = 0;
+    for (int i = 0; i < got; i++) {
+        sud += views[i].up.drops;
+        sdd += views[i].dn.drops;
+    }
+    acc_printf(&a, "# HELP pp_session_drops_sum Sum of per-session drop counters (snapshot)\n");
+    acc_printf(&a, "# TYPE pp_session_drops_sum counter\n");
+    acc_printf(&a, "pp_session_drops_sum{dir=\"up\"} %lu\n", (unsigned long)sud);
+    acc_printf(&a, "pp_session_drops_sum{dir=\"dn\"} %lu\n", (unsigned long)sdd);
+
+    {
+        pp_drop_orphan_totals_t ot;
+        pp_drop_orphan_get(&ot);
+        static const char *const promkind[PP_ORPHAN__N] = {
+            "lrx_flow_key",
+            "lrx_worker_rx_ring_full",
+            "rrx_l3_parse",
+            "rrx_flow_key",
+            "rrx_worker_back_ring_full",
+            "wk_up_flow_key",
+            "wk_up_session_table_full",
+            "wk_up_right_tx_ring_full",
+            "wk_down_l3_parse",
+            "wk_down_flow_key",
+            "wk_down_session_table_full",
+            "wk_down_left_tx_ring_full",
+        };
+        acc_printf(&a, "# HELP pp_drop_orphan Drops before session or without session counter\n");
+        acc_printf(&a, "# TYPE pp_drop_orphan counter\n");
+        for (int i = 0; i < PP_ORPHAN__N; i++)
+            acc_printf(&a, "pp_drop_orphan{kind=\"%s\"} %lu\n",
+                       promkind[i], (unsigned long)ot.v[i]);
+    }
 
     return a.pos;
 }
@@ -389,7 +471,7 @@ static void *mg_loop(void *arg)
 {
     pp_module_t *m = arg;
     mg_priv_t   *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started", m->name);
 
     while (!pp_module_should_quit(m)) {

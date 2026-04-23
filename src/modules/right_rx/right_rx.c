@@ -4,6 +4,7 @@
 #include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
+#include "pproxy/drop.h"
 #include "pproxy/flow.h"
 #include "pproxy/packet.h"
 #include "../runtime.h"
@@ -32,7 +33,7 @@ static void *rrx_loop(void *arg)
 {
     pp_module_t *m = arg;
     rrx_priv_t  *p = m->priv;
-    pp_thread_setup(m->name, m->cpu);
+    pp_thread_setup(m, m->name, m->cpu);
     PP_INFO("%s: started (tunnel=%d)", m->name, p->idx);
 
     while (!pp_module_should_quit(m)) {
@@ -64,6 +65,8 @@ static void *rrx_loop(void *arg)
 
         /* 与 left_rx 相同：按五元组 hash 选 worker，否则与 lookup_or_create 分片不一致 */
         if (pp_pkt_parse_l3_ipv4(pkt) != PP_OK) {
+            pp_drop_orphan_pkt(0, PP_ORPHAN_RRX_L3, "right_rx",
+                                "parse_l3_ipv4 failed", pkt);
             pp_pkt_put_ref(pkt);
             p->drops++;
             p->loops++;
@@ -72,6 +75,8 @@ static void *rrx_loop(void *arg)
         pp_flow_key_t fk;
         pp_flow_dir_t fdir;
         if (pp_flow_key_from_pkt(pkt, &fk) != PP_OK) {
+            pp_drop_orphan_pkt(0, PP_ORPHAN_RRX_BAD_KEY, "right_rx",
+                                "flow_key_from_pkt failed", pkt);
             pp_pkt_put_ref(pkt);
             p->drops++;
             p->loops++;
@@ -83,6 +88,8 @@ static void *rrx_loop(void *arg)
         pkt->meta.shard = (uint16_t)shard;
         (void)sid;
         if (pp_ring_enqueue(g_rt->worker_back_ring[shard], pkt) == 0) {
+            pp_drop_orphan(0, PP_ORPHAN_RRX_WKR_BACK_RING, "right_rx",
+                           "worker_back ring full", &fk);
             pp_pkt_put_ref(pkt); p->drops++;
         } else {
             p->out++;

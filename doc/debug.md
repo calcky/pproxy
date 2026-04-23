@@ -29,7 +29,7 @@ watch -n1 'curl -s http://127.0.0.1:19992/metrics | grep pp_module_'
 - `left_rx`：从 TUN 读入
 - `right_rx0`：从隧道收
 - `worker0`：worker 处理条数（含左环 + 右环）
-- `right_tx0`：往隧道发
+- `right_tx0`：往隧道发；`drops` 为 `send` 返回真错。TCP 隧道曾把 **可恢复** 的 `EAGAIN`（对端发窗满）当 drop；现于 `src/tunnel/tcp.c` 内 `poll` 可写/可 `accept` 后重发整帧，背压时不再误涨
 - `left_tx`：写回 TUN
 - `pp_module_drops{module="worker0"}`：解析失败、会话表满、环满等会涨
 
@@ -77,6 +77,58 @@ sudo tcpdump -i ppclab1 -n -c 30
 ```bash
 ssh clab@leaf1 'ip route get 192.168.1.2; tail -n 20 /opt/pproxy/log/pp1.log'
 ssh clab@leaf2 'ip route get 192.168.0.2; tail -n 20 /opt/pproxy/log/pp2.log'
+```
+
+## Core 文件（segfault 后用 gdb 分析）
+
+在 **clab 里**：**`./tests/clab/deploy.sh` 默认即启用**（`PPROXY_COREDUMP=1`），会在各 leaf VM 上设置 `kernel.core_pattern` 为 `/opt/pproxy/core-%e-%p-%t` 且 **`nohup` 前 `ulimit -c unlimited`**，见 `deploy.sh` 中 `pproxy_coredump_setup` / 头注释。不需要时设 **`PPROXY_COREDUMP=0`**。
+
+手动调试时，在**运行 pproxy 的 shell** 里或启动脚本**同一行**先放开核心限制，并指定**生成路径为 `/opt/pproxy`**（需 **root** 写内核参数；进程若以 **sudo** 起，core 会按 root 的 `cwd`/pattern 走）。
+
+**1. 目录与权限**
+
+```bash
+sudo install -d -m 0755 -o root -g root /opt/pproxy
+```
+
+**2. 本会话允许写 core（若用 `deploy.sh` / `nohup`，在写 `nohup` 的 shell 里先执行）**
+
+```bash
+ulimit -c unlimited
+# 可选：看当前软限制
+# ulimit -a | grep core
+```
+
+**3. 指定 core 落盘到 `/opt/pproxy`（重启后失效，可改用下面 4. 持久化）**
+
+先看重定向方式（**若以 `|` 开头**，说明被 **apport** 等接走，需改成文件路径**或**关 apport 再试）：
+
+```bash
+cat /proc/sys/kernel/core_pattern
+```
+
+改为写到目录（`%e` 可执行名、`%p` pid、`%t` 时间戳，防覆盖）：
+
+```bash
+echo '/opt/pproxy/core-%e-%p-%t' | sudo tee /proc/sys/kernel/core_pattern
+# 同效果（一行）
+# sudo sysctl -w kernel.core_pattern=/opt/pproxy/core-%e-%p-%t
+```
+
+**4. 持久化（可选）**
+
+```bash
+echo 'kernel.core_pattern=/opt/pproxy/core-%e-%p-%t' | sudo tee /etc/sysctl.d/60-pproxy-coredump.conf
+sudo sysctl -p /etc/sysctl.d/60-pproxy-coredump.conf
+```
+
+若仍无文件：看 **`dmesg`** 里 `core_pattern` 是否被 **systemd-coredump** 接管，此时可用 **`coredumpctl gdb`** 取 core；**WSL/容器** 对 core 也常有额外限制。
+
+**5. 用 gdb 打开**
+
+```bash
+gdb -q /opt/pproxy/pproxy /opt/pproxy/core-pproxy-12345-...
+(gdb) bt full
 ```
 
 ## 相关配置路径（clab 约定）

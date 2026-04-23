@@ -58,3 +58,4 @@ dkms.conf
 build/
 tags
 TAGS
+tests/clab/clab-pproxy
