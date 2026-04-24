@@ -6,6 +6,8 @@
 #   PPROXY_SKIP_BUILD=1 ./deploy.sh  # 不自动编译（已自备 build/pproxy 或仅试拓扑时）
 #   ./deploy.sh --no-pproxy        # 只部署拓扑 + 配置 leaf（不跑 build、不装 pproxy）
 #   PPROXY_BIN=/path/to/pproxy ./deploy.sh
+#   ./deploy.sh --tunnel=udp       # 隧道协议：默认 tcp；可选 udp、icmp（选用 tests/clab/config/pp{1,2}[.udp|.icmp].json）
+#   PPROXY_TUNNEL_MODE=icmp ./deploy.sh   # 同上，环境变量（命令行 --tunnel= 优先）
 #   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
 #   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
 #   仅要隧道不要改 gdb 起法:  --gdb-tunnel  或  PPROXY_GDB_TUNNEL=1
@@ -52,9 +54,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CLAB_DIR="$(cd "$(dirname "$0")" && pwd)"
 PPROXY_CFG_DIR="${PPROXY_CFG_DIR:-$CLAB_DIR/config}"
 PPROXY_BIN="${PPROXY_BIN:-$REPO_ROOT/build/pproxy}"
-# 与 tests/clab/config/pp1.json 中 listen 端口一致
-PP1_JSON="$PPROXY_CFG_DIR/pp1.json"
-PP2_JSON="$PPROXY_CFG_DIR/pp2.json"
+# 隧道模式：tcp（默认）| udp | icmp → 见下方 resolve_tunnel_cfgs；与 listen 端口 19900（tcp/udp）一致
+: "${PPROXY_TUNNEL_MODE:=tcp}"
+TUNNEL_MODE="$PPROXY_TUNNEL_MODE"
+PP1_JSON=""
+PP2_JSON=""
 # 虚拟机内统一安装前缀（与本仓库配置文件路径一致）
 VM_PPROXY_ROOT="/opt/pproxy"
 VM_PPROXY_BIN="$VM_PPROXY_ROOT/pproxy"
@@ -90,12 +94,40 @@ for a in "$@"; do
     PPROXY_GDB_TUNNEL=1
   elif [[ "$a" == "--no-gdb-tunnel" ]]; then
     PPROXY_GDB_TUNNEL=0
+  elif [[ "$a" == --tunnel=* ]]; then
+    TUNNEL_MODE="${a#--tunnel=}"
   else
     CLAB_ARGS+=("$a")
   fi
 done
 # set -u：未设时为空串；可由 --gdb-tunnel / --no-gdb-tunnel 或环境变量覆盖
 : "${PPROXY_GDB_TUNNEL:=}"
+
+resolve_tunnel_cfgs() {
+  TUNNEL_MODE="${TUNNEL_MODE,,}"
+  case "$TUNNEL_MODE" in
+    tcp|udp|icmp) ;;
+    *)
+      echo "Invalid tunnel mode: $TUNNEL_MODE (use tcp, udp, or icmp; or PPROXY_TUNNEL_MODE=...)" >&2
+      exit 1
+      ;;
+  esac
+  case "$TUNNEL_MODE" in
+    tcp)
+      PP1_JSON="$PPROXY_CFG_DIR/pp1.json"
+      PP2_JSON="$PPROXY_CFG_DIR/pp2.json"
+      ;;
+    udp)
+      PP1_JSON="$PPROXY_CFG_DIR/pp1.udp.json"
+      PP2_JSON="$PPROXY_CFG_DIR/pp2.udp.json"
+      ;;
+    icmp)
+      PP1_JSON="$PPROXY_CFG_DIR/pp1.icmp.json"
+      PP2_JSON="$PPROXY_CFG_DIR/pp2.icmp.json"
+      ;;
+  esac
+}
+resolve_tunnel_cfgs
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -351,6 +383,7 @@ pproxy_smoke() {
     exit 1
   fi
   echo "  Using: $PPROXY_BIN"
+  echo "  Tunnel: $TUNNEL_MODE  ($PP1_JSON + $PP2_JSON)"
 
   pproxy_apt_deps "$LEAF1_HOST"
   pproxy_apt_deps "$LEAF2_HOST"
@@ -387,16 +420,30 @@ pproxy_smoke() {
       "curl -sf -m3 http://127.0.0.1:${PP2_METRICS}/metrics" | grep -q "pp_info" \
       || { echo "  ✗ leaf2 metrics missing pp_info" >&2; exit 1; }
 
-    echo "  Checking TCP tunnel in logs …"
+    echo "  Checking tunnel (${TUNNEL_MODE}) in logs …"
+    case "$TUNNEL_MODE" in
+      tcp)
+        _g1="tcp tunnel listening"
+        _g2="tcp tunnel connected"
+        ;;
+      udp)
+        _g1="udp tunnel bound"
+        _g2="udp tunnel connected"
+        ;;
+      icmp)
+        _g1="icmp raw_socket listening"
+        _g2="icmp raw_socket client ready"
+        ;;
+    esac
     # stdin → 远端 sudo -S
     printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
-      "${UBUNTU_USER}@${LEAF1_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP1_LOG}" 2>/dev/null | grep -q "tcp tunnel listening" \
-      || { echo "  ✗ leaf1 log missing 'tcp tunnel listening'" >&2; exit 1; }
+      "${UBUNTU_USER}@${LEAF1_HOST}" "sudo -S -p '' tail -n 120 ${VM_PP1_LOG}" 2>/dev/null | grep -q "$_g1" \
+      || { echo "  ✗ leaf1 log missing '$_g1'" >&2; exit 1; }
     printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
-      "${UBUNTU_USER}@${LEAF2_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP2_LOG}" 2>/dev/null | grep -q "tcp tunnel connected" \
-      || { echo "  ✗ leaf2 log missing 'tcp tunnel connected'" >&2; exit 1; }
+      "${UBUNTU_USER}@${LEAF2_HOST}" "sudo -S -p '' tail -n 120 ${VM_PP2_LOG}" 2>/dev/null | grep -q "$_g2" \
+      || { echo "  ✗ leaf2 log missing '$_g2'" >&2; exit 1; }
 
-    echo "  OK: pproxy smoke, leaf1=server leaf2=client -> ${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    echo "  OK: pproxy smoke (${TUNNEL_MODE}), leaf1=server leaf2=client -> ${LEAF1_WAN_IP}:${TUNNEL_PORT}"
   fi
   echo ""
   echo "  二进制: ${VM_PPROXY_BIN}"

@@ -13,6 +13,10 @@ typedef struct rtx_priv {
     uint64_t loops, in, out, drops;
 } rtx_priv_t;
 
+/* 高带宽时 UDP/TCP 隧道 send 常见 PP_ERR_AGAIN（内核发送缓冲满）；短重试避免立刻按会话 drop。 */
+#define RTX_SEND_AGAIN_MAX   10
+#define RTX_SEND_AGAIN_NS    (200 * 1000L)   /* 每轮 0.2ms，合计约 2ms */
+
 int pp_right_tx_set_index(pp_module_t *m, int idx)
 {
     rtx_priv_t *p = calloc(1, sizeof *p);
@@ -60,8 +64,16 @@ static void *rtx_loop(void *arg)
             }
             uint64_t sid = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
             pp_tun_buf_t b = { .data = pkt->data, .len = pkt->data_len };
-            int r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], &b);
+            int r;
+            for (int a = 0; ; a++) {
+                r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], &b);
+                if (r != PP_ERR_AGAIN) break;
+                if (a >= RTX_SEND_AGAIN_MAX) break;
+                struct timespec ts = {0, RTX_SEND_AGAIN_NS};
+                nanosleep(&ts, NULL);
+            }
             if (r < 0) {
+                PP_TRACE("right_tx: tunnel send failed: %s (r=%d)", pp_strerror(r), r);
                 pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
                 p->drops++;
             } else
