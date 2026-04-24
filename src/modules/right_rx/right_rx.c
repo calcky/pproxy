@@ -46,13 +46,16 @@ static void *rrx_loop(void *arg)
         pp_tun_mbuf_t mb = { .data = pkt->data,
                              .cap  = pkt->buf_len - pkt->headroom,
                              .len  = 0 };
-        uint64_t sid;
-        int r = g_rt->tun_ops[p->idx]->recv(g_rt->tun_ctx[p->idx], &sid, &mb, 100000);
+        int r = g_rt->tun_ops[p->idx]->recv(g_rt->tun_ctx[p->idx], &mb, 100000);
         if (r <= 0) {
             pp_pkt_put_ref(pkt);
             p->loops++;
             if (r < 0) {
                 struct timespec ts = {0, 1000 * 1000};
+                nanosleep(&ts, NULL);
+            } else {
+                /* r==0：多数 tunnel 已在 poll 上等过；兜底线程极快自旋（如旧 TCP 立即 EAGAIN） */
+                struct timespec ts = {0, 200 * 1000};
                 nanosleep(&ts, NULL);
             }
             continue;
@@ -86,7 +89,6 @@ static void *rrx_loop(void *arg)
         uint64_t h = pp_flow_key_hash(&fk);
         int    shard = (int)(h % (uint64_t)g_rt->n_workers);
         pkt->meta.shard = (uint16_t)shard;
-        (void)sid;
         if (pp_ring_enqueue(g_rt->worker_back_ring[shard], pkt) == 0) {
             pp_drop_orphan(0, PP_ORPHAN_RRX_WKR_BACK_RING, "right_rx",
                            "worker_back ring full", &fk);

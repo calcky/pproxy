@@ -72,11 +72,11 @@ static void apply_defaults(pp_runtime_t *rt)
         .nelem = 2048, .buf_size = 2048, .headroom = 64, .cpu = -1,
     };
 
-    rt->ring_cap_worker_rx   = 1024;
-    rt->ring_cap_worker_back = 1024;
+    rt->ring_cap_worker_rx   = 4096;
+    rt->ring_cap_worker_back = 4096;
     rt->ring_cap_worker_ctrl = 256;
-    rt->ring_cap_right_tx    = 1024;
-    rt->ring_cap_left_tx     = 1024;
+    rt->ring_cap_right_tx    = 4096;
+    rt->ring_cap_left_tx     = 4096;
 
     /* 左手默认 tun pproxy0 */
     rt->left_kind             = PP_IO_TUN;

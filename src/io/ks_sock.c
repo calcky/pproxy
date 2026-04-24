@@ -181,7 +181,14 @@ int pp_ks_tcp_connect(int af,
         return PP_ERR_IO;
     }
     if (connect(fd, sa, sl) < 0) {
-        PP_ERROR("tcp connect: %s", strerror(errno));
+        int e = errno;
+        char ep[128] = "(?)";
+        pp_sockaddr_format(sa, sl, ep, sizeof ep);
+        if (e == ECONNREFUSED)
+            PP_WARN("tcp connect to %s: %s (remote not listening or wrong port)",
+                    ep, strerror(e));
+        else
+            PP_ERROR("tcp connect to %s: %s", ep, strerror(e));
         close(fd);
         return PP_ERR_IO;
     }
@@ -205,7 +212,7 @@ int pp_ks_tcp_recv(int fd, void *buf, size_t cap)
     ssize_t n = read(fd, buf, cap);
     if (n == 0) return PP_ERR_CLOSED;
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return PP_ERR_AGAIN;
         return PP_ERR_IO;
     }
     return (int)n;

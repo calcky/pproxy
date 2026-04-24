@@ -9,7 +9,7 @@
  *   - netmap     留作未来
  *
  * Wire format（在 ICMP Echo 数据区中）:
- *   ICMP_HDR(8B) + [u64 sid_be] + [payload bytes]
+ *   仅 payload 字节（标准 8B ICMP 头之后），线路上不携带 sid。
  *
  * 注意：对端为服务端时建议
  *     sysctl -w net.ipv4.icmp_echo_ignore_all=1
@@ -36,7 +36,6 @@
 #define ICMP_HDR_LEN    8
 #define ICMP_TYPE_REQ   8
 #define ICMP_TYPE_REPLY 0
-#define IC_SID_LEN      8
 #define IC_FRAME_MAX    65535
 #define IP_HDR_LEN_MIN  20
 
@@ -79,12 +78,12 @@ static uint16_t inet_csum16(const void *data, size_t len)
     return (uint16_t)~sum;
 }
 
-/* 构造 ICMP body：[ICMP_HDR][sid][payload]，返回长度。checksum 会填。 */
+/* 构造 ICMP body：[ICMP_HDR][payload]，返回长度。checksum 会填。 */
 static size_t build_icmp_body(uint8_t *buf, size_t cap,
                               uint8_t type, uint16_t id, uint16_t seq,
-                              uint64_t sid, const uint8_t *payload, size_t plen)
+                              const uint8_t *payload, size_t plen)
 {
-    size_t total = ICMP_HDR_LEN + IC_SID_LEN + plen;
+    size_t total = ICMP_HDR_LEN + plen;
     if (total > cap || total > IC_FRAME_MAX) return 0;
     struct icmp_hdr *h = (struct icmp_hdr *)buf;
     h->type  = type;
@@ -92,9 +91,7 @@ static size_t build_icmp_body(uint8_t *buf, size_t cap,
     h->cksum = 0;
     h->id    = htons(id);
     h->seq   = htons(seq);
-    uint64_t sid_be = htobe64(sid);
-    memcpy(buf + ICMP_HDR_LEN,               &sid_be, IC_SID_LEN);
-    memcpy(buf + ICMP_HDR_LEN + IC_SID_LEN,  payload, plen);
+    memcpy(buf + ICMP_HDR_LEN, payload, plen);
     h->cksum = inet_csum16(buf, total);
     return total;
 }
@@ -123,7 +120,7 @@ static size_t wrap_ip(uint8_t *frame, size_t cap,
     return total;
 }
 
-/* 解析入包 [IP][ICMP][sid][payload]：跳过 IP 头，过滤 id/type。 */
+/* 解析入包 [IP][ICMP][payload]：跳过 IP+ICMP 头，过滤 id/type。 */
 static int parse_icmp_rx(const uint8_t *frame, size_t n, const struct icmp_ctx *c,
                          uint32_t *out_saddr_be,
                          const uint8_t **out_body, size_t *out_body_len)
@@ -132,7 +129,7 @@ static int parse_icmp_rx(const uint8_t *frame, size_t n, const struct icmp_ctx *
     if ((frame[0] >> 4) != 4) return 0;
     size_t ip_hl = (frame[0] & 0x0F) * 4u;
     if (ip_hl < IP_HDR_LEN_MIN) return 0;
-    if (n < ip_hl + ICMP_HDR_LEN + IC_SID_LEN) return 0;
+    if (n < ip_hl + ICMP_HDR_LEN) return 0;
 
     const struct iphdr *iph = (const struct iphdr *)frame;
     if (iph->protocol != IPPROTO_ICMP) return 0;
@@ -268,13 +265,13 @@ static int raw_connect(struct icmp_ctx *c)
 }
 
 /* raw_socket 的"帧"只需要 ICMP body，不带 IP 头（内核自己加） */
-static int raw_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int raw_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t body[IC_FRAME_MAX];
     uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
     size_t blen = build_icmp_body(body, sizeof body, type,
-                                  c->identifier, c->seq++, sid,
+                                  c->identifier, c->seq++,
                                   buf->data, buf->len);
     if (!blen) return PP_ERR_INVAL;
 
@@ -284,7 +281,7 @@ static int raw_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     return (int)buf->len;
 }
 
-static int raw_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int raw_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     uint8_t frame[IC_FRAME_MAX];
     struct sockaddr_storage src;
@@ -296,20 +293,13 @@ static int raw_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_bu
     uint32_t saddr_be;
     const uint8_t *body; size_t body_len;
     if (parse_icmp_rx(frame, (size_t)n, c, &saddr_be, &body, &body_len) != 1) return 0;
-    if (body_len < IC_SID_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, IC_SID_LEN);
-    *out_sid = be64toh(sid_be);
-
-    size_t plen = body_len - IC_SID_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + IC_SID_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server_ic(c, saddr_be, "raw_socket");
-    return (int)plen;
+    return (int)body_len;
 }
 
 /* -------------------- tun 路径 -------------------- */
@@ -333,14 +323,14 @@ static int tun_connect(struct icmp_ctx *c)
     return PP_OK;
 }
 
-static int tun_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int tun_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
 
     uint8_t body[IC_FRAME_MAX];
     uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
     size_t blen = build_icmp_body(body, sizeof body, type,
-                                  c->identifier, c->seq++, sid,
+                                  c->identifier, c->seq++,
                                   buf->data, buf->len);
     if (!blen) return PP_ERR_INVAL;
 
@@ -356,7 +346,7 @@ static int tun_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     return (int)buf->len;
 }
 
-static int tun_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int tun_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     uint8_t frame[IC_FRAME_MAX];
     int n = pp_tun_io_read_ip(c->fd, frame, sizeof frame);
@@ -365,19 +355,13 @@ static int tun_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_bu
     uint32_t saddr_be;
     const uint8_t *body; size_t body_len;
     if (parse_icmp_rx(frame, (size_t)n, c, &saddr_be, &body, &body_len) != 1) return 0;
-    if (body_len < IC_SID_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, IC_SID_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - IC_SID_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + IC_SID_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server_ic(c, saddr_be, "tun");
-    return (int)plen;
+    return (int)body_len;
 }
 
 /* -------------------- pcap 路径 -------------------- */
@@ -402,13 +386,13 @@ static int pc_connect(struct icmp_ctx *c)
     return PP_OK;
 }
 
-static int pc_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int pc_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t body[IC_FRAME_MAX];
     uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
     size_t blen = build_icmp_body(body, sizeof body, type,
-                                  c->identifier, c->seq++, sid,
+                                  c->identifier, c->seq++,
                                   buf->data, buf->len);
     if (!blen) return PP_ERR_INVAL;
     uint8_t frame[IC_FRAME_MAX];
@@ -422,7 +406,7 @@ static int pc_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     return (int)buf->len;
 }
 
-static int pc_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int pc_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     size_t n = 0;
     const uint8_t *ip = pp_pcap_io_next_ip(c->pcap, &n);
@@ -430,18 +414,12 @@ static int pc_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf
     uint32_t saddr_be;
     const uint8_t *body; size_t body_len;
     if (parse_icmp_rx(ip, n, c, &saddr_be, &body, &body_len) != 1) return 0;
-    if (body_len < IC_SID_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, IC_SID_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - IC_SID_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + IC_SID_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server_ic(c, saddr_be, "pcap");
-    return (int)plen;
+    return (int)body_len;
 }
 #endif /* PP_HAVE_PCAP */
 
@@ -467,13 +445,13 @@ static int xc_connect(struct icmp_ctx *c)
     return PP_OK;
 }
 
-static int xc_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int xc_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t body[IC_FRAME_MAX];
     uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
     size_t blen = build_icmp_body(body, sizeof body, type,
-                                  c->identifier, c->seq++, sid,
+                                  c->identifier, c->seq++,
                                   buf->data, buf->len);
     if (!blen) return PP_ERR_INVAL;
     uint8_t frame[IC_FRAME_MAX];
@@ -487,7 +465,7 @@ static int xc_send(struct icmp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     return (int)buf->len;
 }
 
-static int xc_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int xc_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     size_t n = 0;
     const uint8_t *ip = pp_xsk_io_next_ip(c->xsk, &n);
@@ -495,18 +473,12 @@ static int xc_recv(struct icmp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf
     uint32_t saddr_be;
     const uint8_t *body; size_t body_len;
     if (parse_icmp_rx(ip, n, c, &saddr_be, &body, &body_len) != 1) return 0;
-    if (body_len < IC_SID_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, IC_SID_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - IC_SID_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + IC_SID_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server_ic(c, saddr_be, "af_xdp");
-    return (int)plen;
+    return (int)body_len;
 }
 #endif /* PP_HAVE_XDP */
 
@@ -528,23 +500,23 @@ static int ic_connect(void *ctx)
     }
 }
 
-static int ic_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
+static int ic_send(void *ctx, const pp_tun_buf_t *buf)
 {
     struct icmp_ctx *c = ctx;
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
-    case PP_TIO_TUN:        return tun_send(c, sid, buf);
+    case PP_TIO_TUN:        return tun_send(c, buf);
 #ifdef PP_HAVE_PCAP
-    case PP_TIO_PCAP:       return pc_send(c, sid, buf);
+    case PP_TIO_PCAP:       return pc_send(c, buf);
 #endif
 #ifdef PP_HAVE_XDP
-    case PP_TIO_AF_XDP:     return xc_send(c, sid, buf);
+    case PP_TIO_AF_XDP:     return xc_send(c, buf);
 #endif
-    default:                return raw_send(c, sid, buf);
+    default:                return raw_send(c, buf);
     }
 }
 
-static int ic_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
+static int ic_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
     struct icmp_ctx *c = ctx;
     if (c->fd < 0) return PP_ERR_CLOSED;
@@ -555,14 +527,14 @@ static int ic_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int tim
         if (pr <= 0) return 0;
     }
     switch (c->cfg.io) {
-    case PP_TIO_TUN:        return tun_recv(c, out_sid, out_buf);
+    case PP_TIO_TUN:        return tun_recv(c, out_buf);
 #ifdef PP_HAVE_PCAP
-    case PP_TIO_PCAP:       return pc_recv(c, out_sid, out_buf);
+    case PP_TIO_PCAP:       return pc_recv(c, out_buf);
 #endif
 #ifdef PP_HAVE_XDP
-    case PP_TIO_AF_XDP:     return xc_recv(c, out_sid, out_buf);
+    case PP_TIO_AF_XDP:     return xc_recv(c, out_buf);
 #endif
-    default:                return raw_recv(c, out_sid, out_buf);
+    default:                return raw_recv(c, out_buf);
     }
 }
 

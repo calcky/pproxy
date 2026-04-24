@@ -77,6 +77,11 @@ typedef struct pp_endpoint {
 int  pp_endpoint_parse(const char *str, pp_endpoint_t *out);
 int  pp_endpoint_format(const pp_endpoint_t *ep, char *buf, size_t cap);
 
+/* right_tx → tunnel 单帧载荷上界（与常见以太 MTU 一致） */
+#define PP_TUN_TX_PAYLOAD_MAX  1500U
+#define PP_TUN_TX_PAYLOAD_LEN_OK(len) \
+    ((len) > 0U && (len) <= PP_TUN_TX_PAYLOAD_MAX)
+
 /* ---------- 时间 ---------- */
 PP_INLINE uint64_t pp_now_ns(void)
 {

@@ -2,7 +2,7 @@
  * tunnel.h -- 右手 Tunnel 抽象（vtable）
  *
  * 一条 tunnel = (proto, io) 组合：
- *   proto = 协议编码     —— TCP/UDP/ICMP/KCP/QUIC，决定 wire format 与 sid 复用
+ *   proto = 协议编码     —— TCP/UDP/ICMP/KCP/QUIC，决定 wire format
  *   io    = I/O 后端     —— kernel_socket / raw_socket / af_xdp / netmap
  *
  * proto 与 io 在概念上正交：
@@ -136,9 +136,8 @@ typedef struct pp_tunnel_ops {
     void  (*close) (void *ctx);
 
     int   (*connect)(void *ctx);
-    int   (*send)(void *ctx, uint64_t sid, const pp_tun_buf_t *buf);
-    int   (*recv)(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf,
-                  int timeout_us);
+    int   (*send)(void *ctx, const pp_tun_buf_t *buf);
+    int   (*recv)(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us);
 
     void  (*session_close)(void *ctx, uint64_t sid);
 

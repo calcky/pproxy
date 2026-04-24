@@ -1,12 +1,11 @@
 /* src/tunnel/tcp.c -- TCP tunnel 后端（proto 层）
  *
  * 只负责 TCP 隧道的 proto 语义：帧格式 + 服务端 accept 复位等。
- * 所有 socket / connect / accept / writev / read 的 syscall 都走 src/io/ks_sock。
+ * 所有 socket / connect / accept / write / read 的 syscall 都走内核；send 用连续缓冲写满整帧，避免 writev 短写。
  *
- * 简化协议（载荷格式）：
- *   [u64 sid][u16 len][payload ...]  循环
- *
- * 单连接复用所有 sid，应用层自己加帧头分包。
+ * 线上帧格式（循环）：
+ *   [0x55 0xAA][u16 len be][payload ...]
+ *   len 为载荷字节数，与 right_tx/PP_TUN_TX_PAYLOAD_MAX 一致。失步时向前扫描到下一处 0x55AA 再解。
  */
 #include <arpa/inet.h>
 #include <errno.h>
@@ -15,18 +14,19 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/uio.h>
 #include <unistd.h>
 #include "pproxy/tunnel.h"
 #include "pproxy/log.h"
 #include "io/ks_sock.h"
 
-#define TCP_FRAME_HDR  10  /* 8B sid + 2B len */
+#define TCP_FRAME_MAGIC0 0x55
+#define TCP_FRAME_MAGIC1 0xAA
+#define TCP_FRAME_HDR    4u   /* [magic 2B][u16 len be] */
 /* server：right_tx 里等 accept 时不可用 poll(listen,-1)，否则 right_rx 先 accept 后 listen 不再就绪，会永久阻塞 */
 #define TCP_SERVER_WAIT_CONN_MS  100
 /* EAGAIN 后等 POLLOUT：同用有界等待，避免 poll(,-1) 在 right_tx 线程里占死一条 syscall */
-#define TCP_POLLOUT_WAIT_MS  TCP_SERVER_WAIT_CONN_MS
-/* 单帧最大 10+65535；高吞吐时需容纳未完成帧 + 多帧尾巴，64K 在 iperf 时易满导致 read(0) 误判 */
+#define TCP_POLLOUT_WAIT_MS  1
+/* 单帧最大 4+PP_TUN_TX_PAYLOAD_MAX；需容纳失步扫描、未完成帧、多帧尾巴 */
 #define TCP_RX_BUF     (256u * 1024u)
 
 struct tcp_ctx {
@@ -162,105 +162,94 @@ static int server_ensure_connected(struct tcp_ctx *c, int tmo_ms)
     return 0;
 }
 
+/* 将 rxbuf 对齐到以 0x55AA 起头；无完整魔数则丢弃，仅保留可能跨 read 的尾字节 0x55 */
+static void tcp_align_rx_to_magic(struct tcp_ctx *c)
+{
+    if (c->rxlen < 1) return;
+    for (size_t i = 0; i + 1 < c->rxlen; i++) {
+        if (c->rxbuf[i] == TCP_FRAME_MAGIC0 && c->rxbuf[i + 1] == TCP_FRAME_MAGIC1) {
+            if (i > 0) {
+                memmove(c->rxbuf, c->rxbuf + i, c->rxlen - i);
+                c->rxlen -= i;
+            }
+            return;
+        }
+    }
+    if (c->rxbuf[c->rxlen - 1] == TCP_FRAME_MAGIC0) {
+        c->rxbuf[0] = TCP_FRAME_MAGIC0;
+        c->rxlen    = 1;
+    } else
+        c->rxlen = 0;
+}
+
 /* 仅 conn_fd 已就绪：组帧 + read(conn)，不碰 listen_fd */
-static int tcp_conn_recv(struct tcp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int tmo_ms)
+static int tcp_conn_recv(struct tcp_ctx *c, pp_tun_mbuf_t *out_buf, int tmo_ms)
 {
     for (;;) {
-        if (c->conn_fd < 0) return PP_ERR_CLOSED;
+        tcp_align_rx_to_magic(c);
 
         if (c->rxlen >= (size_t)TCP_FRAME_HDR) {
-            uint64_t sid;
             uint16_t len;
-            memcpy(&sid, c->rxbuf, 8);
-            sid = be64toh(sid);
-            memcpy(&len, c->rxbuf + 8, 2);
+            memcpy(&len, c->rxbuf + 2, 2);
             len = ntohs(len);
-            if (c->rxlen < (size_t)TCP_FRAME_HDR + len) {
-                /* 缺尾，下面对 conn read */
-            } else {
-                if (out_buf->cap < len) return PP_ERR_NOMEM;
+            if (len > PP_TUN_TX_PAYLOAD_MAX) {
+                PP_WARN("tcp tunnel: bad frame len=%u (max %u); drop 1 byte, resync",
+                        (unsigned)len, (unsigned)PP_TUN_TX_PAYLOAD_MAX);
+                c->rxlen--;
+                if (c->rxlen > 0)
+                    memmove(c->rxbuf, c->rxbuf + 1, c->rxlen);
+                continue;
+            }
+            if (c->rxlen >= (size_t)TCP_FRAME_HDR + (size_t)len) {
+                if (out_buf->cap < len) {
+                    PP_WARN("tcp tunnel: recv frame len=%u exceeds mbuf cap=%zu",
+                            (unsigned)len, out_buf->cap);
+                    return PP_ERR_NOMEM;
+                }
                 memcpy(out_buf->data, c->rxbuf + TCP_FRAME_HDR, len);
-                out_buf->len  = len;
-                *out_sid = sid;
-                size_t consumed = (size_t)TCP_FRAME_HDR + len;
-                memmove(c->rxbuf, c->rxbuf + consumed, c->rxlen - consumed);
+                out_buf->len = len;
+
+                size_t consumed = (size_t)TCP_FRAME_HDR + (size_t)len;
                 c->rxlen -= consumed;
+                if (c->rxlen > 0) {
+                    memmove(c->rxbuf, c->rxbuf + consumed, c->rxlen);
+                }
                 return (int)len;
             }
         }
 
-        size_t room = sizeof c->rxbuf - c->rxlen;
-        if (room == 0) {
-            PP_WARN("tcp tunnel: rx buffer full (rxlen=%zu) incomplete frame, closing", c->rxlen);
-            drop_conn(c, "rx buffer full");
-            return PP_ERR_IO;
-        }
+        size_t room = sizeof(c->rxbuf) - c->rxlen;
         int n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
-        if (n == PP_ERR_CLOSED) {
-            drop_conn(c, "peer closed");
-            return 0;
-        }
-        if (n == PP_ERR_IO) {
-            int e = errno;
-            drop_conn_e(c, "recv error", e);
-            return PP_ERR_IO;
-        }
+
         if (n > 0) {
             c->rxlen += (size_t)n;
             continue;
         }
-        if (tcp_wait_readable(c->conn_fd, tmo_ms) <= 0) return 0;
-    }
-}
-
-static int tcp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
-{
-    struct tcp_ctx *c = ctx;
-    if (buf->len > 65535) return PP_ERR_INVAL;
-
-    uint8_t hdr[TCP_FRAME_HDR];
-    uint64_t sid_be = htobe64(sid);
-    uint16_t len_be = htons((uint16_t)buf->len);
-    memcpy(hdr,     &sid_be, 8);
-    memcpy(hdr + 8, &len_be, 2);
-
-    struct iovec iov[2] = {
-        { hdr, sizeof hdr },
-        { (void *)buf->data, buf->len },
-    };
-
-    /* 非阻塞 writev 遇 EAGAIN 时不可向 right_tx 抛 PP_ERR_AGAIN，否则对端背压会当 drop 丢包。
-     * 在 tunnel 内 poll 到可写/可接受连接后再重发整帧。
-     * server：conn 可能由 right_rx 的 tcp_recv→server_try_accept 建立，须定期醒转以发现 conn_fd。 */
-    for (;;) {
-        if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
-            if (!server_try_accept(c)) {
-                if (c->listen_fd < 0) return PP_ERR_CLOSED;
-                /* 另一线程可能已 accept，勿在 listen 上无限阻塞 */
-                if (c->conn_fd >= 0) continue;
-                struct pollfd p = { .fd = c->listen_fd, .events = POLLIN };
-                if (poll(&p, 1, TCP_SERVER_WAIT_CONN_MS) < 0) return PP_ERR_IO;
-                continue;
-            }
+        if (n == PP_ERR_AGAIN) {
+            /* 与 UDP/ICMP 一致：无数据时按 timeout 等在 poll 上，避免 right_rx 里 r==0 狂转 CPU */
+            int pr;
+            if (tmo_ms < 0)
+                pr = tcp_wait_readable(c->conn_fd, -1);
+            else
+                pr = tcp_wait_readable(c->conn_fd, tmo_ms);
+            if (pr < 0)
+                return PP_ERR_IO;
+            if (pr == 0)
+                return 0;
+            continue;
         }
-        if (c->conn_fd < 0) return PP_ERR_CLOSED;
-
-        int w = pp_ks_tcp_sendv(c->conn_fd, iov, 2);
-        if (w == PP_ERR_AGAIN) {
-            struct pollfd p = { .fd = c->conn_fd, .events = POLLOUT };
-            if (poll(&p, 1, TCP_POLLOUT_WAIT_MS) < 0) return PP_ERR_IO;
-            continue; /* 超时也继续重试 writev，不向上抛 PP_ERR_AGAIN（见上注释） */
+        if (n == PP_ERR_CLOSED) {
+            drop_conn(c, "peer closed");
+            return PP_ERR_CLOSED;
         }
-        if (w < 0) {
-            int e = errno;
-            drop_conn_e(c, "send error", e);
+        if (n == PP_ERR_IO) {
+            drop_conn_e(c, "recv error", errno);
             return PP_ERR_IO;
         }
-        return w;
     }
 }
 
-static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
+static int tcp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
     struct tcp_ctx *c  = ctx;
     int tmo_ms = (timeout_us < 0) ? -1 : (int)((unsigned)(timeout_us + 999) / 1000);
@@ -277,10 +266,70 @@ static int tcp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int ti
         }
         if (c->conn_fd < 0) return PP_ERR_CLOSED;
 
-        int r = tcp_conn_recv(c, out_sid, out_buf, tmo_ms);
+        int r = tcp_conn_recv(c, out_buf, tmo_ms);
         if (r == PP_ERR_NOMEM) return r;
         if (r == PP_ERR_IO) return r;
         return r; /* >0 一帧; 0 本周期无完整帧/对端关/EAGAIN */
+    }
+}
+
+static int tcp_send(void *ctx, const pp_tun_buf_t *buf)
+{
+    struct tcp_ctx *c = ctx;
+
+    if (buf->len > PP_TUN_TX_PAYLOAD_MAX) {
+        PP_WARN("tcp tunnel: send frame too long (%zu > %u), rejected",
+                buf->len, (unsigned)PP_TUN_TX_PAYLOAD_MAX);
+        return PP_ERR_INVAL;
+    }
+
+    uint8_t frame[4 + PP_TUN_TX_PAYLOAD_MAX];
+    frame[0] = TCP_FRAME_MAGIC0;
+    frame[1] = TCP_FRAME_MAGIC1;
+    uint16_t len_be = htons((uint16_t)buf->len);
+    memcpy(frame + 2, &len_be, sizeof len_be);
+    memcpy(frame + 4, buf->data, buf->len);
+    const size_t tot = 4 + buf->len;
+    size_t       off = 0;
+
+    /* 非阻塞 write 可能短写；off 推进直到整帧发出，避免半包上线路。
+     * EAGAIN 时在 tunnel 内 poll 可写，不向 right_tx 抛 PP_ERR_AGAIN。
+     * server：conn 可能由 right_rx accept；client：对端晚启动时在此重试 connect。 */
+    for (;;) {
+        if (c->cfg.mode == PP_TMODE_SERVER && c->conn_fd < 0) {
+            if (!server_try_accept(c)) {
+                if (c->listen_fd < 0) return PP_ERR_CLOSED;
+                /* 另一线程可能已 accept，勿在 listen 上无限阻塞 */
+                if (c->conn_fd >= 0) continue;
+                struct pollfd p = { .fd = c->listen_fd, .events = POLLIN };
+                if (poll(&p, 1, TCP_SERVER_WAIT_CONN_MS) < 0) return PP_ERR_IO;
+                continue;
+            }
+        } else if (c->cfg.mode == PP_TMODE_CLIENT && c->conn_fd < 0) {
+            (void)tcp_connect(c);
+            if (c->conn_fd >= 0)
+                continue;
+            if (poll(NULL, 0, TCP_SERVER_WAIT_CONN_MS) < 0)
+                return PP_ERR_IO;
+            continue;
+        }
+        if (c->conn_fd < 0) return PP_ERR_CLOSED;
+
+        while (off < tot) {
+            ssize_t n = write(c->conn_fd, frame + off, tot - off);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    struct pollfd p = { .fd = c->conn_fd, .events = POLLOUT };
+                    if (poll(&p, 1, TCP_POLLOUT_WAIT_MS) < 0) return PP_ERR_IO;
+                    continue;
+                }
+                int e = errno;
+                drop_conn_e(c, "send error", e);
+                return PP_ERR_IO;
+            }
+            off += (size_t)n;
+        }
+        return (int)buf->len;
     }
 }
 
@@ -302,7 +351,7 @@ static int  tcp_stat(void *ctx, char *json, size_t cap)
 const pp_tunnel_ops_t pp_tunnel_tcp = {
     .name = "tcp", .proto = PP_PROTO_TCP,
     .supported_io_mask = PP_TIO_MASK_KERNEL_SOCKET,
-    .caps = PP_TUN_CAP_RELIABLE | PP_TUN_CAP_MUX,
+    .caps = PP_TUN_CAP_RELIABLE,
     .open = tcp_open, .close = tcp_close,
     .connect = tcp_connect, .send = tcp_send, .recv = tcp_recv,
     .session_close = tcp_session_close,

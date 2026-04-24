@@ -10,7 +10,7 @@
  *   io=af_xdp        -> src/io/xsk
  *
  * Wire format（每个 UDP 数据报一帧）：
- *   [u64 sid_be][payload bytes]
+ *   内核/原始路径上 UDP 载荷即为内层报文，线路上不携带 sid。
  */
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -30,7 +30,6 @@
 #include "io/pcap.h"
 #include "io/xsk.h"
 
-#define UDP_HDR_LEN     8   /* tunnel sid 头 */
 #define UDP_RX_MAX      65535
 #define L4_UDP_HDR_LEN  8   /* 真正的 UDP 头 */
 #define IP_HDR_LEN_MIN  20
@@ -73,16 +72,16 @@ static uint16_t inet_csum16(const void *data, size_t len)
     return (uint16_t)~sum;
 }
 
-/* 把 sid+payload 填进 frame，形成完整的 IPv4+UDP 报文。返回总长度。 */
+/* 把 payload 填进 frame，形成完整的 IPv4+UDP 报文。返回总长度。 */
 static size_t build_ip_udp_frame(uint8_t *frame, size_t cap,
                                  uint32_t src_ip_be, uint32_t dst_ip_be,
                                  uint16_t src_port, uint16_t dst_port,
-                                 uint16_t ip_id, uint64_t sid,
+                                 uint16_t ip_id,
                                  const uint8_t *payload, size_t plen)
 {
     const size_t ip_hl   = IP_HDR_LEN_MIN;
     const size_t udp_hl  = L4_UDP_HDR_LEN;
-    const size_t udp_tot = udp_hl + UDP_HDR_LEN + plen;
+    const size_t udp_tot = udp_hl + plen;
     const size_t ip_tot  = ip_hl + udp_tot;
     if (ip_tot > cap || ip_tot > 65535) return 0;
 
@@ -105,9 +104,7 @@ static size_t build_ip_udp_frame(uint8_t *frame, size_t cap,
     uh->len    = htons((uint16_t)udp_tot);
     uh->check  = 0;                     /* IPv4 UDP 校验可选 */
 
-    uint64_t sid_be = htobe64(sid);
-    memcpy(frame + ip_hl + udp_hl,               &sid_be,  UDP_HDR_LEN);
-    memcpy(frame + ip_hl + udp_hl + UDP_HDR_LEN, payload,  plen);
+    memcpy(frame + ip_hl + udp_hl, payload, plen);
     return ip_tot;
 }
 
@@ -121,7 +118,7 @@ static int parse_ip_udp_frame(const uint8_t *frame, size_t n,
     if ((frame[0] >> 4) != 4) return 0;
     size_t ip_hl = (frame[0] & 0x0F) * 4u;
     if (ip_hl < IP_HDR_LEN_MIN) return 0;
-    if (n < ip_hl + L4_UDP_HDR_LEN + UDP_HDR_LEN) return 0;
+    if (n < ip_hl + L4_UDP_HDR_LEN) return 0;
 
     const struct iphdr  *iph = (const struct iphdr  *)frame;
     if (iph->protocol != IPPROTO_UDP) return 0;
@@ -134,7 +131,7 @@ static int parse_ip_udp_frame(const uint8_t *frame, size_t n,
     if (c->cfg.mode == PP_TMODE_CLIENT && sport != c->dst_port) return 0;
 
     size_t udp_total = ntohs(uh->len);
-    if (udp_total < L4_UDP_HDR_LEN + UDP_HDR_LEN) return 0;
+    if (udp_total < L4_UDP_HDR_LEN) return 0;
     size_t body_len = udp_total - L4_UDP_HDR_LEN;
     if (n < ip_hl + udp_total) return 0;
 
@@ -261,36 +258,29 @@ static int ks_connect(struct udp_ctx *c)
     return PP_OK;
 }
 
-static int ks_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int ks_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
-    if (buf->len + UDP_HDR_LEN > UDP_RX_MAX) return PP_ERR_INVAL;
-    uint8_t frame[UDP_HDR_LEN + 65507];
-    uint64_t sid_be = htobe64(sid);
-    memcpy(frame, &sid_be, UDP_HDR_LEN);
-    memcpy(frame + UDP_HDR_LEN, buf->data, buf->len);
-    size_t total = UDP_HDR_LEN + buf->len;
+    if (buf->len > UDP_RX_MAX) return PP_ERR_INVAL;
 
     int w;
     if (c->cfg.mode == PP_TMODE_SERVER) {
         if (!c->peer_known) return PP_ERR_AGAIN;
-        w = pp_ks_udp_send(c->fd, frame, total,
+        w = pp_ks_udp_send(c->fd, buf->data, buf->len,
                            (struct sockaddr *)&c->peer_sa, c->peer_sl);
     } else {
-        w = pp_ks_udp_send(c->fd, frame, total, NULL, 0);
+        w = pp_ks_udp_send(c->fd, buf->data, buf->len, NULL, 0);
     }
     if (w < 0) return w;
-    return (int)(w - UDP_HDR_LEN);
+    return (int)buf->len;
 }
 
-static int ks_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int ks_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
-    uint8_t frame[UDP_HDR_LEN + 65507];
     struct sockaddr_storage src;
     socklen_t sl = sizeof src;
-    int n = pp_ks_udp_recv(c->fd, frame, sizeof frame,
+    int n = pp_ks_udp_recv(c->fd, out_buf->data, out_buf->cap,
                            (struct sockaddr *)&src, &sl);
     if (n <= 0) return n;
-    if (n < (int)UDP_HDR_LEN) return 0;
 
     if (c->cfg.mode == PP_TMODE_SERVER) {
         if (!c->peer_known ||
@@ -305,15 +295,8 @@ static int ks_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
         }
     }
 
-    size_t plen = (size_t)n - UDP_HDR_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, frame, UDP_HDR_LEN);
-    *out_sid = be64toh(sid_be);
-    memcpy(out_buf->data, frame + UDP_HDR_LEN, plen);
-    out_buf->len = plen;
-    return (int)plen;
+    out_buf->len = (size_t)n;
+    return n;
 }
 
 /* -------------------- raw_socket / tun 共用：配置 L3 端口 -------------------- */
@@ -362,7 +345,7 @@ static int raw_connect(struct udp_ctx *c)
     return PP_OK;
 }
 
-static int raw_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int raw_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t frame[65535];
@@ -370,14 +353,14 @@ static int raw_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
                                        c->src_ip_be, dst_ip_be,
                                        c->src_port, c->dst_port,
-                                       c->ip_id++, sid, buf->data, buf->len);
+                                       c->ip_id++, buf->data, buf->len);
     if (!ip_tot) return PP_ERR_INVAL;
     int w = pp_raw_ip_send(c->fd, frame, ip_tot, dst_ip_be);
     if (w < 0) return w;
     return (int)buf->len;
 }
 
-static int raw_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int raw_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     uint8_t frame[UDP_RX_MAX];
     struct sockaddr_storage src;
@@ -390,19 +373,13 @@ static int raw_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf
     const uint8_t *body; size_t body_len;
     int r = parse_ip_udp_frame(frame, (size_t)n, c, &sport, &saddr_be, &body, &body_len);
     if (r != 1) return 0;
-    if (body_len < UDP_HDR_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, UDP_HDR_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - UDP_HDR_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + UDP_HDR_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server(c, saddr_be, sport, "raw_socket");
-    return (int)plen;
+    return (int)body_len;
 }
 
 /* -------------------- tun 路径 -------------------- */
@@ -426,7 +403,7 @@ static int tun_connect(struct udp_ctx *c)
     return PP_OK;
 }
 
-static int tun_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int tun_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t frame[65535];
@@ -434,14 +411,14 @@ static int tun_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
                                        c->src_ip_be, dst_ip_be,
                                        c->src_port, c->dst_port,
-                                       c->ip_id++, sid, buf->data, buf->len);
+                                       c->ip_id++, buf->data, buf->len);
     if (!ip_tot) return PP_ERR_INVAL;
     int w = pp_tun_io_write_ip(c->fd, frame, ip_tot);
     if (w < 0) return w;
     return (int)buf->len;
 }
 
-static int tun_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int tun_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     uint8_t frame[UDP_RX_MAX];
     int n = pp_tun_io_read_ip(c->fd, frame, sizeof frame);
@@ -451,19 +428,13 @@ static int tun_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf
     const uint8_t *body; size_t body_len;
     int r = parse_ip_udp_frame(frame, (size_t)n, c, &sport, &saddr_be, &body, &body_len);
     if (r != 1) return 0;
-    if (body_len < UDP_HDR_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, UDP_HDR_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - UDP_HDR_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + UDP_HDR_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server(c, saddr_be, sport, "tun");
-    return (int)plen;
+    return (int)body_len;
 }
 
 /* -------------------- pcap 路径 -------------------- */
@@ -504,7 +475,7 @@ static int pc_connect(struct udp_ctx *c)
     return PP_OK;
 }
 
-static int pc_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int pc_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t frame[65535];
@@ -512,14 +483,14 @@ static int pc_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
                                        c->src_ip_be, dst_ip_be,
                                        c->src_port, c->dst_port,
-                                       c->ip_id++, sid, buf->data, buf->len);
+                                       c->ip_id++, buf->data, buf->len);
     if (!ip_tot) return PP_ERR_INVAL;
     int r = pp_pcap_io_inject_ip(c->pcap, frame, ip_tot);
     if (r < 0) return r;
     return (int)buf->len;
 }
 
-static int pc_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int pc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     size_t n = 0;
     const uint8_t *ip = pp_pcap_io_next_ip(c->pcap, &n);
@@ -529,19 +500,13 @@ static int pc_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
     const uint8_t *body; size_t body_len;
     int r = parse_ip_udp_frame(ip, n, c, &sport, &saddr_be, &body, &body_len);
     if (r != 1) return 0;
-    if (body_len < UDP_HDR_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, UDP_HDR_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - UDP_HDR_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + UDP_HDR_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server(c, saddr_be, sport, "pcap");
-    return (int)plen;
+    return (int)body_len;
 }
 #endif  /* PP_HAVE_PCAP */
 
@@ -575,7 +540,7 @@ static int xc_connect(struct udp_ctx *c)
     return PP_OK;
 }
 
-static int xc_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
+static int xc_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
     uint8_t frame[65535];
@@ -583,14 +548,14 @@ static int xc_send(struct udp_ctx *c, uint64_t sid, const pp_tun_buf_t *buf)
     size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
                                        c->src_ip_be, dst_ip_be,
                                        c->src_port, c->dst_port,
-                                       c->ip_id++, sid, buf->data, buf->len);
+                                       c->ip_id++, buf->data, buf->len);
     if (!ip_tot) return PP_ERR_INVAL;
     int r = pp_xsk_io_inject_ip(c->xsk, frame, ip_tot);
     if (r < 0) return r;
     return (int)buf->len;
 }
 
-static int xc_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
+static int xc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     size_t n = 0;
     const uint8_t *ip = pp_xsk_io_next_ip(c->xsk, &n);
@@ -600,19 +565,13 @@ static int xc_recv(struct udp_ctx *c, uint64_t *out_sid, pp_tun_mbuf_t *out_buf)
     const uint8_t *body; size_t body_len;
     int r = parse_ip_udp_frame(ip, n, c, &sport, &saddr_be, &body, &body_len);
     if (r != 1) return 0;
-    if (body_len < UDP_HDR_LEN) return 0;
-
-    uint64_t sid_be;
-    memcpy(&sid_be, body, UDP_HDR_LEN);
-    *out_sid = be64toh(sid_be);
-    size_t plen = body_len - UDP_HDR_LEN;
-    if (out_buf->cap < plen) return PP_ERR_NOMEM;
-    memcpy(out_buf->data, body + UDP_HDR_LEN, plen);
-    out_buf->len = plen;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
 
     if (c->cfg.mode == PP_TMODE_SERVER)
         learn_peer_server(c, saddr_be, sport, "af_xdp");
-    return (int)plen;
+    return (int)body_len;
 }
 #endif  /* PP_HAVE_XDP */
 
@@ -635,24 +594,24 @@ static int udp_connect(void *ctx)
     }
 }
 
-static int udp_send(void *ctx, uint64_t sid, const pp_tun_buf_t *buf)
+static int udp_send(void *ctx, const pp_tun_buf_t *buf)
 {
     struct udp_ctx *c = ctx;
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
-    case PP_TIO_RAW_SOCKET: return raw_send(c, sid, buf);
-    case PP_TIO_TUN:        return tun_send(c, sid, buf);
+    case PP_TIO_RAW_SOCKET: return raw_send(c, buf);
+    case PP_TIO_TUN:        return tun_send(c, buf);
 #ifdef PP_HAVE_PCAP
-    case PP_TIO_PCAP:       return pc_send(c, sid, buf);
+    case PP_TIO_PCAP:       return pc_send(c, buf);
 #endif
 #ifdef PP_HAVE_XDP
-    case PP_TIO_AF_XDP:     return xc_send(c, sid, buf);
+    case PP_TIO_AF_XDP:     return xc_send(c, buf);
 #endif
-    default:                return ks_send (c, sid, buf);
+    default:                return ks_send (c, buf);
     }
 }
 
-static int udp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int timeout_us)
+static int udp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
     struct udp_ctx *c = ctx;
     if (c->fd < 0) return PP_ERR_CLOSED;
@@ -663,15 +622,15 @@ static int udp_recv(void *ctx, uint64_t *out_sid, pp_tun_mbuf_t *out_buf, int ti
         if (pr <= 0) return 0;
     }
     switch (c->cfg.io) {
-    case PP_TIO_RAW_SOCKET: return raw_recv(c, out_sid, out_buf);
-    case PP_TIO_TUN:        return tun_recv(c, out_sid, out_buf);
+    case PP_TIO_RAW_SOCKET: return raw_recv(c, out_buf);
+    case PP_TIO_TUN:        return tun_recv(c, out_buf);
 #ifdef PP_HAVE_PCAP
-    case PP_TIO_PCAP:       return pc_recv(c, out_sid, out_buf);
+    case PP_TIO_PCAP:       return pc_recv(c, out_buf);
 #endif
 #ifdef PP_HAVE_XDP
-    case PP_TIO_AF_XDP:     return xc_recv(c, out_sid, out_buf);
+    case PP_TIO_AF_XDP:     return xc_recv(c, out_buf);
 #endif
-    default:                return ks_recv (c, out_sid, out_buf);
+    default:                return ks_recv (c, out_buf);
     }
 }
 

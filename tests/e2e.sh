@@ -131,7 +131,7 @@ gen_cfg() {
   "runtime": { "workers": 1 },
   "left":    { "kind": "tun", "name": "$PP2_IF",
                "tun": { "ifname": "$PP2_IF", "cidr": "10.30.0.1/24",
-                        "mtu": 1400, "no_pi": true } },
+                        "mtu": 1500, "no_pi": true } },
   "tunnels": [{
     "name": "srv", "proto": "tcp", "io": "kernel_socket",
     "mode": "server", "listen": "127.0.0.1:$TUN_PORT",
@@ -150,7 +150,7 @@ JSON
   "runtime": { "workers": 1 },
   "left":    { "kind": "tun", "name": "$PP1_IF",
                "tun": { "ifname": "$PP1_IF", "cidr": "10.20.0.1/24",
-                        "mtu": 1400, "no_pi": true } },
+                        "mtu": 1500, "no_pi": true } },
   "tunnels": [{
     "name": "cli", "proto": "tcp", "io": "kernel_socket",
     "mode": "client", "server": "127.0.0.1:$TUN_PORT",

@@ -51,9 +51,16 @@ static void *rtx_loop(void *arg)
         p->in += n;
         for (int i = 0; i < n; i++) {
             pp_pkt_t *pkt = batch[i];
+            if (!PP_TUN_TX_PAYLOAD_LEN_OK(pkt->data_len)) {
+                pp_drop_orphan_pkt(0, PP_ORPHAN_RTX_BAD_PKT, "right_tx",
+                                    "bad pkt length", pkt);
+                pp_pkt_put_ref(pkt);
+                p->drops++;
+                continue;
+            }
             uint64_t sid = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
             pp_tun_buf_t b = { .data = pkt->data, .len = pkt->data_len };
-            int r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], sid, &b);
+            int r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], &b);
             if (r < 0) {
                 pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
                 p->drops++;

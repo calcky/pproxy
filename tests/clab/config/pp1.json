@@ -3,7 +3,7 @@
   "runtime": { "workers": 1 },
   "left":    { "kind": "tun", "name": "pp1",
                "tun": { "ifname": "ppclab1", "cidr": "192.168.1.0/24",
-                        "mtu": 1400, "no_pi": true } },
+                        "mtu": 1500, "no_pi": true } },
   "tunnels": [{
     "name": "srv", "proto": "tcp", "io": "kernel_socket",
     "mode": "server", "listen": "0.0.0.0:19900",

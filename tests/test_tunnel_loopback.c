@@ -69,43 +69,41 @@ static int test_tcp(void)
     /* client -> server: send 一帧 */
     const char *msg_c2s = "hello-from-client";
     pp_tun_buf_t buf = { .data = (const uint8_t *)msg_c2s, .len = strlen(msg_c2s) };
-    int w = pp_tunnel_tcp.send(cctx, 0xdeadbeefcafebabeULL, &buf);
+    int w = pp_tunnel_tcp.send(cctx, &buf);
     if (w <= 0) { printf("client send fail (%d)\n", w); return 1; }
     printf("  client -> server: sent %zu bytes\n", buf.len);
 
     /* server 接收；第一次 recv 会触发 accept */
     uint8_t rx[256]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
-    uint64_t sid;
     int r = 0;
     for (int i = 0; i < 100 && r == 0; i++) {
-        r = pp_tunnel_tcp.recv(sctx, &sid, &mb, 0);
+        r = pp_tunnel_tcp.recv(sctx, &mb, 0);
         if (r == 0) { struct timespec t = {0, 10 * 1000 * 1000}; nanosleep(&t, NULL); }
     }
-    if (r <= 0 || sid != 0xdeadbeefcafebabeULL ||
-        mb.len != strlen(msg_c2s) || memcmp(mb.data, msg_c2s, mb.len) != 0) {
-        printf("  server recv mismatch (r=%d sid=%lx len=%zu)\n", r, (unsigned long)sid, mb.len);
+    if (r <= 0 || mb.len != strlen(msg_c2s) || memcmp(mb.data, msg_c2s, mb.len) != 0) {
+        printf("  server recv mismatch (r=%d len=%zu)\n", r, mb.len);
         return 1;
     }
-    printf("  server recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  server recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     /* server -> client */
     const char *msg_s2c = "reply-from-server";
     buf.data = (const uint8_t *)msg_s2c; buf.len = strlen(msg_s2c);
-    w = pp_tunnel_tcp.send(sctx, 0x1122334455667788ULL, &buf);
+    w = pp_tunnel_tcp.send(sctx, &buf);
     if (w <= 0) { printf("server send fail (%d)\n", w); return 1; }
 
     mb.len = 0;
     r = 0;
     for (int i = 0; i < 100 && r == 0; i++) {
-        r = pp_tunnel_tcp.recv(cctx, &sid, &mb, 0);
+        r = pp_tunnel_tcp.recv(cctx, &mb, 0);
         if (r == 0) { struct timespec t = {0, 10 * 1000 * 1000}; nanosleep(&t, NULL); }
     }
-    if (r <= 0 || sid != 0x1122334455667788ULL || memcmp(mb.data, msg_s2c, mb.len) != 0) {
+    if (r <= 0 || memcmp(mb.data, msg_s2c, mb.len) != 0) {
         printf("  client recv mismatch (r=%d)\n", r); return 1;
     }
-    printf("  client recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  client recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     pp_tunnel_tcp.close(cctx);
     pp_tunnel_tcp.close(sctx);
@@ -132,23 +130,30 @@ static int test_udp(void)
 
     const char *msg = "ping-udp";
     pp_tun_buf_t buf = { .data = (const uint8_t *)msg, .len = strlen(msg) };
-    if (pp_tunnel_udp.send(cctx, 0xaaaabbbbULL, &buf) <= 0) return 1;
+    if (pp_tunnel_udp.send(cctx, &buf) <= 0) return 1;
 
     uint8_t rx[256]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
-    uint64_t sid;
-    int r = pp_tunnel_udp.recv(sctx, &sid, &mb, 500000);
-    if (r <= 0 || sid != 0xaaaabbbbULL) { printf("server recv fail (r=%d)\n", r); return 1; }
-    printf("  server recv: sid=0x%lx bytes=%zu OK\n", (unsigned long)sid, mb.len);
+    int r = pp_tunnel_udp.recv(sctx, &mb, 500000);
+    if (r <= 0 || mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) {
+        printf("server recv fail (r=%d len=%zu)\n", r, mb.len);
+        return 1;
+    }
+    printf("  server recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     /* server 回包，peer 应在上条 recv 时已学到 */
     const char *rep = "pong-udp";
     buf.data = (const uint8_t *)rep; buf.len = strlen(rep);
-    if (pp_tunnel_udp.send(sctx, 0xccccddddULL, &buf) <= 0) return 1;
+    if (pp_tunnel_udp.send(sctx, &buf) <= 0) return 1;
 
     mb.len = 0;
-    r = pp_tunnel_udp.recv(cctx, &sid, &mb, 500000);
-    if (r <= 0 || sid != 0xccccddddULL) { printf("client recv fail\n"); return 1; }
-    printf("  client recv: sid=0x%lx bytes=%zu OK\n", (unsigned long)sid, mb.len);
+    r = pp_tunnel_udp.recv(cctx, &mb, 500000);
+    if (r <= 0 || mb.len != strlen(rep) || memcmp(mb.data, rep, mb.len) != 0) {
+        printf("client recv fail\n");
+        return 1;
+    }
+    printf("  client recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     pp_tunnel_udp.close(cctx);
     pp_tunnel_udp.close(sctx);
@@ -203,44 +208,40 @@ static int test_udp_raw(void)
     /* client -> server */
     const char *msg = "ping-udp-raw";
     pp_tun_buf_t buf = { .data = (const uint8_t *)msg, .len = strlen(msg) };
-    int w = pp_tunnel_udp.send(cctx, 0x1111222233334444ULL, &buf);
+    int w = pp_tunnel_udp.send(cctx, &buf);
     if (w <= 0) { printf("  client send fail (%d)\n", w); return 1; }
 
     uint8_t rx[512]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
-    uint64_t sid = 0;
     int r = 0;
     for (int i = 0; i < 100 && r == 0; i++) {
-        r = pp_tunnel_udp.recv(sctx, &sid, &mb, 10 * 1000);   /* 10ms */
+        r = pp_tunnel_udp.recv(sctx, &mb, 10 * 1000);   /* 10ms */
     }
-    if (r <= 0 || sid != 0x1111222233334444ULL ||
-        mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) {
-        printf("  server recv mismatch (r=%d sid=%lx len=%zu)\n",
-               r, (unsigned long)sid, mb.len);
+    if (r <= 0 || mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) {
+        printf("  server recv mismatch (r=%d len=%zu)\n", r, mb.len);
         pp_tunnel_udp.close(cctx); pp_tunnel_udp.close(sctx);
         return 1;
     }
-    printf("  server recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  server recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     /* server -> client */
     const char *rep = "pong-udp-raw";
     buf.data = (const uint8_t *)rep; buf.len = strlen(rep);
-    w = pp_tunnel_udp.send(sctx, 0x5555666677778888ULL, &buf);
+    w = pp_tunnel_udp.send(sctx, &buf);
     if (w <= 0) { printf("  server send fail (%d)\n", w); return 1; }
 
     mb.len = 0;
     r = 0;
     for (int i = 0; i < 100 && r == 0; i++) {
-        r = pp_tunnel_udp.recv(cctx, &sid, &mb, 10 * 1000);
+        r = pp_tunnel_udp.recv(cctx, &mb, 10 * 1000);
     }
-    if (r <= 0 || sid != 0x5555666677778888ULL ||
-        mb.len != strlen(rep) || memcmp(mb.data, rep, mb.len) != 0) {
+    if (r <= 0 || mb.len != strlen(rep) || memcmp(mb.data, rep, mb.len) != 0) {
         printf("  client recv mismatch (r=%d)\n", r);
         pp_tunnel_udp.close(cctx); pp_tunnel_udp.close(sctx);
         return 1;
     }
-    printf("  client recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  client recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     pp_tunnel_udp.close(cctx);
     pp_tunnel_udp.close(sctx);
@@ -313,39 +314,35 @@ static int test_udp_pcap(void)
 
     const char *msg = "ping-udp-pcap";
     pp_tun_buf_t buf = { .data = (const uint8_t *)msg, .len = strlen(msg) };
-    if (pp_tunnel_udp.send(cctx, 0xAAAAAAAABBBBBBBBULL, &buf) <= 0) {
+    if (pp_tunnel_udp.send(cctx, &buf) <= 0) {
         printf("  client send fail\n"); goto fail;
     }
 
     uint8_t rx[512]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
-    uint64_t sid = 0;
     int r = 0;
     for (int i = 0; i < 200 && r == 0; i++)
-        r = pp_tunnel_udp.recv(sctx, &sid, &mb, 10 * 1000);
-    if (r <= 0 || sid != 0xAAAAAAAABBBBBBBBULL ||
-        mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) {
-        printf("  server recv mismatch (r=%d sid=%lx len=%zu)\n",
-               r, (unsigned long)sid, mb.len);
+        r = pp_tunnel_udp.recv(sctx, &mb, 10 * 1000);
+    if (r <= 0 || mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) {
+        printf("  server recv mismatch (r=%d len=%zu)\n", r, mb.len);
         goto fail;
     }
-    printf("  server recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  server recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     const char *rep = "pong-udp-pcap";
     buf.data = (const uint8_t *)rep; buf.len = strlen(rep);
-    if (pp_tunnel_udp.send(sctx, 0xCCCCCCCCDDDDDDDDULL, &buf) <= 0) {
+    if (pp_tunnel_udp.send(sctx, &buf) <= 0) {
         printf("  server send fail\n"); goto fail;
     }
     mb.len = 0; r = 0;
     for (int i = 0; i < 200 && r == 0; i++)
-        r = pp_tunnel_udp.recv(cctx, &sid, &mb, 10 * 1000);
-    if (r <= 0 || sid != 0xCCCCCCCCDDDDDDDDULL ||
-        mb.len != strlen(rep) || memcmp(mb.data, rep, mb.len) != 0) {
+        r = pp_tunnel_udp.recv(cctx, &mb, 10 * 1000);
+    if (r <= 0 || mb.len != strlen(rep) || memcmp(mb.data, rep, mb.len) != 0) {
         printf("  client recv mismatch (r=%d)\n", r);
         goto fail;
     }
-    printf("  client recv: sid=0x%lx bytes=%zu '%.*s' OK\n",
-           (unsigned long)sid, mb.len, (int)mb.len, (const char *)mb.data);
+    printf("  client recv: bytes=%zu '%.*s' OK\n",
+           mb.len, (int)mb.len, (const char *)mb.data);
 
     pp_tunnel_udp.close(cctx); pp_tunnel_udp.close(sctx);
     printf("=== UDP pcap OK ===\n\n");

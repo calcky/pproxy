@@ -19,6 +19,7 @@ static const char *orphan_name(pp_orphan_drop_t k)
         "rrx_l3_parse",
         "rrx_flow_key",
         "rrx_worker_back_ring_full",
+        "rtx_bad_pkt",
         "wk_up_flow_key",
         "wk_up_session_table_full",
         "wk_up_right_tx_ring_full",

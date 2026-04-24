@@ -9,6 +9,7 @@
         "string_view": "c",
         "sstream": "c",
         "functional": "c",
-        "cstdlib": "c"
+        "cstdlib": "c",
+        "random": "c"
     }
 }

@@ -28,6 +28,8 @@ typedef enum {
     PP_ORPHAN_RRX_L3,
     PP_ORPHAN_RRX_BAD_KEY,
     PP_ORPHAN_RRX_WKR_BACK_RING,
+    /* right_tx */
+    PP_ORPHAN_RTX_BAD_PKT,
     /* worker: 有/无五元组见具体调用 */
     PP_ORPHAN_WK_UP_BAD_KEY,
     PP_ORPHAN_WK_UP_TABLE_FULL,
