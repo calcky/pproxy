@@ -6,6 +6,10 @@
 #   PPROXY_SKIP_BUILD=1 ./deploy.sh  # 不自动编译（已自备 build/pproxy 或仅试拓扑时）
 #   ./deploy.sh --no-pproxy        # 只部署拓扑 + 配置 leaf（不跑 build、不装 pproxy）
 #   PPROXY_BIN=/path/to/pproxy ./deploy.sh
+#   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
+#   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
+#   仅要隧道不要改 gdb 起法:  --gdb-tunnel  或  PPROXY_GDB_TUNNEL=1
+#   PPROXY_GDB=0 ./deploy.sh       # 显式用传统 nohup（若以后默认想切 gdb 可用）
 #   默认 PPROXY_COREDUMP=1（各 VM 上 core 落 /opt/pproxy；勿需则 PPROXY_COREDUMP=0）
 #
 # 宿主机 containerlab：
@@ -60,6 +64,11 @@ VM_PP1_LOG="$VM_PPROXY_ROOT/log/pp1.log"
 VM_PP2_LOG="$VM_PPROXY_ROOT/log/pp2.log"
 # 1=各 VM 启用 core 到 ${VM_PPROXY_ROOT}/core-*（与 doc/debug.md 一致；默认 1）
 : "${PPROXY_COREDUMP:=1}"
+# 0=nohup 起 pproxy；1=gdbserver 起（等 VSCode/ gdb 连上后进程才跑完初始化，与 gdb-tunnel.sh / launch.json 同端口）
+: "${PPROXY_GDB:=0}"
+# 与 .vscode/launch.json、tests/clab/gdb-tunnel.sh 中端口一致
+GDBSERVER_PORT_LEAF1=2345
+GDBSERVER_PORT_LEAF2=2346
 
 SSH_OPTS=(
   -o StrictHostKeyChecking=no
@@ -73,10 +82,20 @@ SKIP_PPROXY=0
 for a in "$@"; do
   if [[ "$a" == "--no-pproxy" ]]; then
     SKIP_PPROXY=1
+  elif [[ "$a" == "--gdb" ]]; then
+    PPROXY_GDB=1
+  elif [[ "$a" == "--no-gdb" ]]; then
+    PPROXY_GDB=0
+  elif [[ "$a" == "--gdb-tunnel" ]]; then
+    PPROXY_GDB_TUNNEL=1
+  elif [[ "$a" == "--no-gdb-tunnel" ]]; then
+    PPROXY_GDB_TUNNEL=0
   else
     CLAB_ARGS+=("$a")
   fi
 done
+# set -u：未设时为空串；可由 --gdb-tunnel / --no-gdb-tunnel 或环境变量覆盖
+: "${PPROXY_GDB_TUNNEL:=}"
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -199,6 +218,9 @@ export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
 # 与 build.sh 链接的 libbpf/libxdp/libpcap 匹配；24.04 上部分包名为 *t64
 s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb
+if ! command -v gdbserver >/dev/null 2>&1; then
+  s apt-get install -y -qq gdbserver
+fi
 s apt-get install -y -qq libelf1t64 2>/dev/null || s apt-get install -y -qq libelf1
 s apt-get install -y -qq libpcap0.8t64 2>/dev/null || s apt-get install -y -qq libpcap0.8
 EOA
@@ -258,25 +280,42 @@ pproxy_push_cfgs() {
 
 pproxy_start() {
   local host=$1 bin=$2 cfg=$3 log=$4
+  local gdbport="${5:-0}"
   local cd_on="${PPROXY_COREDUMP:-1}"
-  echo "  pproxy: starting on ${host} ($bin -c $cfg) …"
+  if [[ "$gdbport" != "0" ]]; then
+    echo "  pproxy: starting on ${host} (gdbserver 127.0.0.1:${gdbport} $bin -c $cfg) …"
+  else
+    echo "  pproxy: starting on ${host} ($bin -c $cfg) …"
+  fi
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" "$bin" "$cfg" "$log" "$cd_on" <<'EOS'
+    bash -s -- "$UBUNTU_PASS" "$bin" "$cfg" "$log" "$cd_on" "$gdbport" <<'EOS'
 set -euo pipefail
 PASS="$1"
 BIN="$2"
 CFG="$3"
 LOG="$4"
 CD="$5"
+GDBPORT="${6:-0}"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
 s pkill -f "pproxy -c $CFG" 2>/dev/null || true
+if [[ "$GDBPORT" != "0" ]]; then
+  s pkill -f "gdbserver 127.0.0.1:${GDBPORT}" 2>/dev/null || true
+fi
 sleep 0.5
 # TUN 需 root；标准输出/错入日志（见 /opt/pproxy/log/）
 s install -d -m 0755 "$(dirname "$LOG")" 2>/dev/null || true
-if [[ "$CD" == "1" ]]; then
-  s sh -c "ulimit -c unlimited; nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+if [[ "$GDBPORT" != "0" ]]; then
+  if [[ "$CD" == "1" ]]; then
+    s sh -c "ulimit -c unlimited; nohup gdbserver 127.0.0.1:${GDBPORT} $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+  else
+    s sh -c "nohup gdbserver 127.0.0.1:${GDBPORT} $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+  fi
 else
-  s sh -c "nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+  if [[ "$CD" == "1" ]]; then
+    s sh -c "ulimit -c unlimited; nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+  else
+    s sh -c "nohup $BIN -c $CFG >> $LOG 2>&1 < /dev/null &"
+  fi
 fi
 sleep 0.5
 # nohup 以 root 写日志；放宽权限便于 clab 用户 tail
@@ -323,30 +362,42 @@ pproxy_smoke() {
   pproxy_scp_bin "$LEAF2_HOST"
   pproxy_push_cfgs
 
-  pproxy_start "$LEAF1_HOST" "$VM_PPROXY_BIN" "$VM_PP1_CFG" "$VM_PP1_LOG"
-  pproxy_start "$LEAF2_HOST" "$VM_PPROXY_BIN" "$VM_PP2_CFG" "$VM_PP2_LOG"
+  g1=0
+  g2=0
+  if [[ "$PPROXY_GDB" == "1" ]]; then
+    g1=$GDBSERVER_PORT_LEAF1
+    g2=$GDBSERVER_PORT_LEAF2
+  fi
+  pproxy_start "$LEAF1_HOST" "$VM_PPROXY_BIN" "$VM_PP1_CFG" "$VM_PP1_LOG" "$g1"
+  pproxy_start "$LEAF2_HOST" "$VM_PPROXY_BIN" "$VM_PP2_CFG" "$VM_PP2_LOG" "$g2"
 
-  wait_vm_http "$LEAF1_HOST" "$PP1_METRICS" "leaf1"
-  wait_vm_http "$LEAF2_HOST" "$PP2_METRICS" "leaf2"
+  if [[ "$PPROXY_GDB" == "1" ]]; then
+    echo ""
+    echo "  pproxy: PPROXY_GDB=1 — gdbserver 会等远程调试器，进程在 VSCode/ gdb「继续」前可能未完成初始化。"
+    echo "  已跳过 metrics / 日志的 smoke 检查。请在本机: ./tests/clab/gdb-tunnel.sh  再在 VSCode F5 连接 localhost:${GDBSERVER_PORT_LEAF1} / :${GDBSERVER_PORT_LEAF2}。"
+  else
+    wait_vm_http "$LEAF1_HOST" "$PP1_METRICS" "leaf1"
+    wait_vm_http "$LEAF2_HOST" "$PP2_METRICS" "leaf2"
 
-  echo "  Checking metrics (pp_info) …"
-  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${LEAF1_HOST}" \
-    "curl -sf -m3 http://127.0.0.1:${PP1_METRICS}/metrics" | grep -q "pp_info" \
-    || { echo "  ✗ leaf1 metrics missing pp_info" >&2; exit 1; }
-  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${LEAF2_HOST}" \
-    "curl -sf -m3 http://127.0.0.1:${PP2_METRICS}/metrics" | grep -q "pp_info" \
-    || { echo "  ✗ leaf2 metrics missing pp_info" >&2; exit 1; }
+    echo "  Checking metrics (pp_info) …"
+    sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${LEAF1_HOST}" \
+      "curl -sf -m3 http://127.0.0.1:${PP1_METRICS}/metrics" | grep -q "pp_info" \
+      || { echo "  ✗ leaf1 metrics missing pp_info" >&2; exit 1; }
+    sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${LEAF2_HOST}" \
+      "curl -sf -m3 http://127.0.0.1:${PP2_METRICS}/metrics" | grep -q "pp_info" \
+      || { echo "  ✗ leaf2 metrics missing pp_info" >&2; exit 1; }
 
-  echo "  Checking TCP tunnel in logs …"
-  # stdin → 远端 sudo -S
-  printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
-    "${UBUNTU_USER}@${LEAF1_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP1_LOG}" 2>/dev/null | grep -q "tcp tunnel listening" \
-    || { echo "  ✗ leaf1 log missing 'tcp tunnel listening'" >&2; exit 1; }
-  printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
-    "${UBUNTU_USER}@${LEAF2_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP2_LOG}" 2>/dev/null | grep -q "tcp tunnel connected" \
-    || { echo "  ✗ leaf2 log missing 'tcp tunnel connected'" >&2; exit 1; }
+    echo "  Checking TCP tunnel in logs …"
+    # stdin → 远端 sudo -S
+    printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
+      "${UBUNTU_USER}@${LEAF1_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP1_LOG}" 2>/dev/null | grep -q "tcp tunnel listening" \
+      || { echo "  ✗ leaf1 log missing 'tcp tunnel listening'" >&2; exit 1; }
+    printf '%s\n' "$UBUNTU_PASS" | sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" \
+      "${UBUNTU_USER}@${LEAF2_HOST}" "sudo -S -p '' tail -n 80 ${VM_PP2_LOG}" 2>/dev/null | grep -q "tcp tunnel connected" \
+      || { echo "  ✗ leaf2 log missing 'tcp tunnel connected'" >&2; exit 1; }
 
-  echo "  OK: pproxy smoke, leaf1=server leaf2=client -> ${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    echo "  OK: pproxy smoke, leaf1=server leaf2=client -> ${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+  fi
   echo ""
   echo "  二进制: ${VM_PPROXY_BIN}"
   echo "  配置:   ${VM_PP1_CFG} / ${VM_PP2_CFG}  (源目录: ${PPROXY_CFG_DIR}/)"
@@ -382,3 +433,29 @@ echo "  client1 → 192.168.0.2 (GW 192.168.0.1 on leaf1)"
 echo "  client2 → 192.168.1.2 (GW 192.168.1.1 on leaf2)"
 echo "  Test: docker exec -it client1 ping -c 3 192.168.1.2"
 echo "  Test: docker exec -it client2 ping -c 3 192.168.0.2"
+
+# 本机拉 gdb 端口（避免 generic_vm 上 clab ports 对 VM 内 127.0.0.1 无效，须 ssh -L）
+if [[ "$SKIP_PPROXY" -eq 0 ]]; then
+  _tun=0
+  if [[ "$PPROXY_GDB_TUNNEL" == "1" ]]; then
+    _tun=1
+  elif [[ "$PPROXY_GDB_TUNNEL" == "0" ]]; then
+    _tun=0
+  elif [[ -z "$PPROXY_GDB_TUNNEL" && "$PPROXY_GDB" == "1" ]]; then
+    _tun=1
+  fi
+  if [[ "$_tun" == "1" ]]; then
+    echo ""
+    echo "=== [5.1/5] Host: gdb SSH local forwards (gdb-tunnel.sh → localhost:${GDBSERVER_PORT_LEAF1}/${GDBSERVER_PORT_LEAF2}) ==="
+    if [[ -x "$CLAB_DIR/gdb-tunnel.sh" ]]; then
+      if "$CLAB_DIR/gdb-tunnel.sh"; then
+        echo "  VSCode 可连 miDebuggerServerAddress: localhost:${GDBSERVER_PORT_LEAF1} / :${GDBSERVER_PORT_LEAF2}"
+        echo "  停转发:  $CLAB_DIR/gdb-tunnel.sh stop"
+      else
+        echo "  ⚠ gdb-tunnel.sh 失败；稍后可手跑: $CLAB_DIR/gdb-tunnel.sh" >&2
+      fi
+    else
+      echo "  ⚠ 未找到可执行: $CLAB_DIR/gdb-tunnel.sh" >&2
+    fi
+  fi
+fi

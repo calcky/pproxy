@@ -131,6 +131,17 @@ gdb -q /opt/pproxy/pproxy /opt/pproxy/core-pproxy-12345-...
 (gdb) bt full
 ```
 
+## VSCode + gdbserver 联调（leaf1 / leaf2）
+
+1. **带符号构建并部署**（与线上一致）：`./tests/clab/deploy.sh` 已默认 `--debug` 编译并拷贝 `build/pproxy` → 各 leaf 的 `/opt/pproxy/pproxy`。本机保留同一次构建的 `build/pproxy`，供 VSCode 找符号。若希望**部署时**即在各 VM 上用 **`gdbserver` 起 pproxy**（绑定 `127.0.0.1:2345` / `2346`），可 **`./tests/clab/deploy.sh --gdb`** 或 **`PPROXY_GDB=1 ./tests/clab/deploy.sh`**；此时会**跳过**需进程已跑起来的 metrics 自动检查（gdbserver 会等远程调试器再往下执行）。仅跑传统 **`nohup`**：`--no-gdb` 或 **`PPROXY_GDB=0`**。
+2. **SSH 端口转发**（本机 `localhost:2345` / `2346` 对应各 VM 上 `gdbserver`）：
+   - **`./tests/clab/deploy.sh --gdb`** 结束后会**自动**跑 **`gdb-tunnel.sh`**（除非 `--no-gdb-tunnel` / `PPROXY_GDB_TUNNEL=0`）；非 `--gdb` 也可单独要隧道：`--gdb-tunnel` 或 `PPROXY_GDB_TUNNEL=1`。  
+   - 手动：`./tests/clab/gdb-tunnel.sh`（与 `deploy.sh` 相同 `clab@leaf1` / `leaf2`、密码可用 `CLAB_SSH_PASS` 覆盖）；结束用 `./tests/clab/gdb-tunnel.sh stop`。
+   - 或手动两条 `ssh -L 2345:127.0.0.1:2345 -N -f clab@leaf1` 与 `2346` + `leaf2`。
+3. **在每台 leaf 上**（先停掉 `deploy` 用 `nohup` 起的实例，避免重复占配置/端口）：  
+   `gdbserver 127.0.0.1:2345 /opt/pproxy/pproxy -c /opt/pproxy/pp1.json`（leaf1），leaf2 把端口与 `pp2.json` 换成 `2346`。
+4. **VSCode**：安装 **C/C++** 扩展；用工作区里的 **`.vscode/launch.json`**，选 **「pproxy: gdbserver leaf1」** / **leaf2**，或 **compound「pproxy: leaf1 + leaf2」** 同时下断。**路径/打不开源文件/断点飘**：`launch.json` 里已对 GDB 做了 **`set substitute-path /workspace ${workspaceFolder}`**；**重新整编**时，**非 `--native` 的 `./build.sh`** 会通过 **Meson `-Dhost_repo_abs=<本机仓库绝对路径>`** 写入 **`-fdebug-prefix-map`**，使 DWARF 与本地 `src/...` 一致（**仅**设环境变量 `CFLAGS` 在 Meson 下不可靠）。若老二进制里仍是 `/workspace/...`，依赖上述 **substitute-path** 或临时加 **`sourceFileMap`**: `"/workspace"` → `${workspaceFolder}`。
+
 ## 相关配置路径（clab 约定）
 
 - 配置：`/opt/pproxy/pp1.json`、`/opt/pproxy/pp2.json`

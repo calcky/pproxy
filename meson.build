@@ -11,6 +11,15 @@ project('pproxy', 'c',
 
 cc = meson.get_compiler('c')
 
+# Meson 会忽略/覆盖环境里的 CFLAGS，仅传 -e CFLAGS 时不会进编译行；Docker 用 build.sh 传 -Dhost_repo_abs=... 方可靠。
+_host = get_option('host_repo_abs')
+if _host != ''
+  add_project_arguments(
+    '-fdebug-prefix-map=/workspace=' + _host,
+    language: 'c',
+  )
+endif
+
 # ---------- 全局编译选项 ----------
 add_project_arguments(
   '-D_GNU_SOURCE',

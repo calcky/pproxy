@@ -69,6 +69,7 @@ if [[ $CLEAN -eq 1 ]]; then
 fi
 
 # ---------- meson 选项 ----------
+# Docker 时下面会追加 -Dhost_repo_abs= 当前仓库绝对路径，把 DWARF 中 /workspace/... 映到本机（VSCode/GDB 打开源码）
 MESON_OPTS=(
     "-Dxdp=$([[ $XDP    -eq 1 ]] && echo true || echo false)"
     "-Dpcap=$([[ $PCAP   -eq 1 ]] && echo true || echo false)"
@@ -117,12 +118,21 @@ if [[ $NATIVE -eq 1 ]]; then
     run_build
 else
     ensure_image
+    _HOST_ABS="$(pwd -P)"
+    MESON_OPTS+=("-Dhost_repo_abs=${_HOST_ABS}")
     DOCKER_OPTS=(
         --rm
         -v "$(pwd):/workspace"
         -w /workspace
         -u "$(id -u):$(id -g)"
     )
+    # 用户自定义 CFLAGS 仍可传入容器（对 Meson 主工程 c_args 作用有限，见 meson_options host_repo_abs）
+    if [[ -n ${CFLAGS+set} && -n ${CFLAGS-} ]]; then
+        DOCKER_OPTS+=(-e "CFLAGS=${CFLAGS}")
+    fi
+    if [[ -n ${CXXFLAGS+set} && -n ${CXXFLAGS-} ]]; then
+        DOCKER_OPTS+=(-e "CXXFLAGS=${CXXFLAGS}")
+    fi
     if [[ $SHELL_MODE -eq 1 ]]; then
         log "entering shell in $IMAGE"
         exec docker run -it "${DOCKER_OPTS[@]}" "$IMAGE" /bin/bash

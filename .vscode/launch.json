@@ -1,0 +1,63 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "pproxy: gdbserver leaf1 (localhost:2345)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/pproxy",
+      "args": ["-c", "/opt/pproxy/pp1.json"],
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "miDebuggerServerAddress": "localhost:2345",
+      "stopAtEntry": false,
+      "setupCommands": [
+        {
+          "text": "set substitute-path /workspace ${workspaceFolder}",
+          "description": "将 DWARF/栈里的 /workspace/... 映到本机，便于从 Docker 编出的二进制打开源文件",
+          "ignoreFailures": true
+        },
+        {
+          "text": "set print thread-events off",
+          "description": "减少线程事件噪声",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "pproxy: gdbserver leaf2 (localhost:2346)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/pproxy",
+      "args": ["-c", "/opt/pproxy/pp2.json"],
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "miDebuggerServerAddress": "localhost:2346",
+      "stopAtEntry": false,
+      "setupCommands": [
+        {
+          "text": "set substitute-path /workspace ${workspaceFolder}",
+          "description": "将 DWARF/栈里的 /workspace/... 映到本机，便于从 Docker 编出的二进制打开源文件",
+          "ignoreFailures": true
+        },
+        {
+          "text": "set print thread-events off",
+          "description": "减少线程事件噪声",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ],
+  "compounds": [
+    {
+      "name": "pproxy: leaf1 + leaf2 (两个 gdb 会话)",
+      "configurations": [
+        "pproxy: gdbserver leaf1 (localhost:2345)",
+        "pproxy: gdbserver leaf2 (localhost:2346)"
+      ],
+      "stopAll": true
+    }
+  ]
+}
