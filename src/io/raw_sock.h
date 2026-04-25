@@ -2,9 +2,9 @@
  *
  * 本文件同时公开两类"raw socket"相关能力，对应左/右手两侧使用场景：
  *
- *   (A) 右手侧 tunnel/{udp,icmp} 的 raw_socket 路径：
- *       AF_INET SOCK_RAW + IP_HDRINCL 薄封装 —— pp_raw_ip_*
- *       逐包 sendto/recvfrom 一整个 IPv4 帧（ip 头+payload）。
+ *   (A) 右手侧 tunnel/{udp,icmp} 的 raw_socket 路径：pp_raw_ip_*
+ *       AF_INET SOCK_RAW、**不** 设 IP_HDRINCL。send 仅 L4+载荷，内核加 IPv4 头。
+ *       recv 仍为「IP+载荷」整包，供 tunnel 与现有 parse_* 使用。
  *
  *   (B) 左手侧 L2 抓包/注包：AF_PACKET SOCK_RAW + ETH_P_ALL（pp_io_raw_socket），
  *       收完整以太帧；rx 仅把 IPv4（0x0800）交给上层并填 meta（l2_off=0, l3_off）。
@@ -20,7 +20,7 @@
 #include <sys/socket.h>
 #include "pproxy/pproxy.h"
 
-/* ---------- (A) 右手侧 AF_INET SOCK_RAW + IP_HDRINCL ---------- */
+/* ---------- (A) 右手侧 AF_INET SOCK_RAW（不手拼 IP 头） ---------- */
 
 /* ipproto：IPPROTO_UDP / IPPROTO_ICMP / 0（收所有协议，不推荐）。
  * bindtodevice_ifname 可为 NULL/""（走路由表）。
@@ -30,9 +30,9 @@ int pp_raw_ip_open(int ipproto, const char *bindtodevice_ifname, int *out_fd);
 /* 可选：把 raw fd 绑定到本地 IPv4（只限制源地址，端口无效）。失败不致命。 */
 void pp_raw_ip_bind_src_v4(int fd, uint32_t src_ip_be);
 
-/* 发送：dst_ip_be 是网络字节序的目的 IPv4；内核仅看 sin_addr。
+/* 发送：buf 为 L4+数据（如 UDP/ICMP 体）；dst_ip_be=目的主机 IPv4（网络序）。
  * 返回 >=0 / PP_ERR_AGAIN / PP_ERR_IO。 */
-int pp_raw_ip_send(int fd, const uint8_t *ip_frame, size_t len, uint32_t dst_ip_be);
+int pp_raw_ip_send(int fd, const uint8_t *buf, size_t len, uint32_t dst_ip_be);
 
 /* 接收：返回帧长度 >=0 / 0(EAGAIN) / PP_ERR_IO。
  * 如果 out_src_sa 非 NULL 会填入源地址（sockaddr_in）。 */

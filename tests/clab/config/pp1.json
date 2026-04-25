@@ -11,5 +11,5 @@
   }],
   "session": { "max_per_shard": 1024 },
   "mgmt":    { "unix_socket": "/opt/pproxy/run/pp1.sock",
-               "metrics": { "enable": true, "listen": "127.0.0.1:19991" } }
+               "metrics": { "enable": true, "listen": "127.0.0.1:1999" } }
 }

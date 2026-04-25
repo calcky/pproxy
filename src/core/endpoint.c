@@ -46,6 +46,7 @@ int pp_endpoint_parse(const char *str, pp_endpoint_t *out)
         *end = 0;
         host = buf + 1;
         port = end + 2;
+        if (port[0] == '\0') return PP_ERR_INVAL;
         out->addr.af = PP_AF_INET6;
         if (inet_pton(AF_INET6, host, &out->addr.u.v6) != 1) return PP_ERR_INVAL;
     } else {
@@ -54,6 +55,7 @@ int pp_endpoint_parse(const char *str, pp_endpoint_t *out)
         *colon = 0;
         host = buf;
         port = colon + 1;
+        if (port[0] == '\0') return PP_ERR_INVAL;
         /* 先试纯 IPv4，再 IPv6，再域名 */
         out->addr.af = PP_AF_INET;
         if (inet_pton(AF_INET, host, &out->addr.u.v4) != 1) {
@@ -65,7 +67,8 @@ int pp_endpoint_parse(const char *str, pp_endpoint_t *out)
         }
     }
     long p = strtol(port, NULL, 10);
-    if (p <= 0 || p > 65535) return PP_ERR_INVAL;
+    /* 0 合法：ICMP 等配置用 host:0 表示「无 TCP/UDP 端口」仅 IP 有效 */
+    if (p < 0 || p > 65535) return PP_ERR_INVAL;
     out->port = (uint16_t)p;
     return PP_OK;
 }

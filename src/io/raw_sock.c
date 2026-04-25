@@ -1,8 +1,9 @@
 /* src/io/raw_sock.c -- Linux 原始套接字 I/O
  *
  * 一、右手侧（tunnel/udp、tunnel/icmp 复用 raw_socket 路径）：
- *     pp_raw_ip_* 系列基于 AF_INET SOCK_RAW + IP_HDRINCL，逐包
- *     sendto/recvfrom 一整个 IPv4 帧（ip 头+payload）。需要 CAP_NET_RAW。
+ *     AF_INET SOCK_RAW，**不** 设 IP_HDRINCL：write 时 buffer 为 L4+载荷（UDP 头+数据或
+ *     ICMP 报文），**由内核** 组 IPv4 头。recv 仍收到「IP+载荷」整包（与 tunnel 解析一致）。
+ *     需要 CAP_NET_RAW。
  *
  * 二、左手侧（pp_pkt_io_ops_t vtable，名为 pp_io_raw_socket）：
  *     AF_PACKET SOCK_RAW + ETH_P_ALL：收/发完整 L2 以太帧（含目的 MAC）。
@@ -28,7 +29,7 @@
 #include "pproxy/pkt_io.h"
 
 /* =============================================================
- * 右手侧：AF_INET SOCK_RAW + IP_HDRINCL
+ * 右手侧：AF_INET SOCK_RAW（无 IP_HDRINCL：用户态不手拼 IP 头）
  * ============================================================= */
 
 void pp_raw_ip_bind_src_v4(int fd, uint32_t src_ip_be)
@@ -50,25 +51,19 @@ int pp_raw_ip_open(int ipproto, const char *ifname, int *out_fd)
                  ipproto, strerror(errno));
         return PP_ERR_IO;
     }
-    int one = 1;
-    if (setsockopt(fd, IPPROTO_IP, IP_HDRINCL, &one, sizeof one) < 0) {
-        PP_ERROR("raw_ip IP_HDRINCL: %s", strerror(errno));
-        close(fd);
-        return PP_ERR_IO;
-    }
     pp_ks_bind_to_device(fd, ifname);
     *out_fd = fd;
     return PP_OK;
 }
 
-int pp_raw_ip_send(int fd, const uint8_t *ip, size_t len, uint32_t dst_ip_be)
+int pp_raw_ip_send(int fd, const uint8_t *l4_and_payload, size_t len, uint32_t dst_ip_be)
 {
     struct sockaddr_in dst = {
         .sin_family      = AF_INET,
         .sin_port        = 0,
         .sin_addr.s_addr = dst_ip_be,
     };
-    ssize_t w = sendto(fd, ip, len, 0, (struct sockaddr *)&dst, sizeof dst);
+    ssize_t w = sendto(fd, l4_and_payload, len, 0, (struct sockaddr *)&dst, sizeof dst);
     if (w < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return PP_ERR_AGAIN;
         return PP_ERR_IO;

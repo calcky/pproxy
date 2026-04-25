@@ -275,7 +275,7 @@ static int smoke_icmp_tun(void)
     cfg.proto = PP_PROTO_ICMP; cfg.io = PP_TIO_TUN;
     cfg.mode  = PP_TMODE_CLIENT;
     cfg.io_cfg.tun.ifname = "pp-test-itun";
-    /* port 忽略，只 ICMP 用 identifier，但 pp_endpoint_parse 不接受 port=0 */
+    /* port 在 ICMP 上可写 :1 等占位；:0 亦合法（见 endpoint 解析） */
     if (ep(&cfg.server, "10.99.0.2", 1) != PP_OK) return 1;
 
     void *ctx = NULL;

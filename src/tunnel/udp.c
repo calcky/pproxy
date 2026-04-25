@@ -4,7 +4,7 @@
  * session 语义。具体"把字节打到线上"的动作都交给 src/io/ 下的模块做：
  *
  *   io=kernel_socket -> src/io/ks_sock
- *   io=raw_socket    -> src/io/raw_ip (+ 手拼 IP+UDP 头)
+ *   io=raw_socket    -> src/io/raw_ip（仅手拼 UDP 头+载荷；IP 头由内核组）
  *   io=tun           -> src/io/tun_io (+ 手拼 IP+UDP 头)
  *   io=pcap          -> src/io/pcap
  *   io=af_xdp        -> src/io/xsk
@@ -43,7 +43,7 @@ struct udp_ctx {
     struct sockaddr_storage peer_sa;
     socklen_t               peer_sl;
 
-    /* raw_socket / tun / pcap / af_xdp 需要自造 IP+UDP 头时用 */
+    /* raw：仅 L4+载荷；tun/pcap/xdp：自造 IP+UDP 头 */
     uint16_t                src_port;
     uint16_t                dst_port;
     uint16_t                listen_port;
@@ -106,6 +106,23 @@ static size_t build_ip_udp_frame(uint8_t *frame, size_t cap,
 
     memcpy(frame + ip_hl + udp_hl, payload, plen);
     return ip_tot;
+}
+
+/* raw_socket（无 IP_HDRINCL）：只写 [UDP 头][payload] */
+static size_t build_udp_l4(uint8_t *buf, size_t cap,
+                          uint16_t src_port, uint16_t dst_port,
+                          const uint8_t *payload, size_t plen)
+{
+    const size_t udp_tot = L4_UDP_HDR_LEN + plen;
+    if (udp_tot > cap || udp_tot > 65535) return 0;
+    memset(buf, 0, L4_UDP_HDR_LEN);
+    struct udphdr *uh = (struct udphdr *)buf;
+    uh->source = htons(src_port);
+    uh->dest   = htons(dst_port);
+    uh->len    = htons((uint16_t)udp_tot);
+    uh->check  = 0;
+    memcpy(buf + L4_UDP_HDR_LEN, payload, plen);
+    return udp_tot;
 }
 
 /* 解析入包：成功返回 1，忽略返回 0。 */
@@ -348,14 +365,13 @@ static int raw_connect(struct udp_ctx *c)
 static int raw_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
 {
     if (!c->peer_known) return PP_ERR_AGAIN;
-    uint8_t frame[65535];
+    uint8_t seg[65535];
     uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
-    size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
-                                       c->src_ip_be, dst_ip_be,
-                                       c->src_port, c->dst_port,
-                                       c->ip_id++, buf->data, buf->len);
-    if (!ip_tot) return PP_ERR_INVAL;
-    int w = pp_raw_ip_send(c->fd, frame, ip_tot, dst_ip_be);
+    size_t n = build_udp_l4(seg, sizeof seg,
+                            c->src_port, c->dst_port,
+                            buf->data, buf->len);
+    if (!n) return PP_ERR_INVAL;
+    int w = pp_raw_ip_send(c->fd, seg, n, dst_ip_be);
     if (w < 0) return w;
     return (int)buf->len;
 }
