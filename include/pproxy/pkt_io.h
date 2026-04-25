@@ -14,6 +14,7 @@
 
 #include "pproxy/pproxy.h"
 #include "pproxy/packet.h"
+#include "pproxy/xsk_filt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,8 @@ typedef struct pp_io_cfg {
             bool        need_wakeup;
             uint8_t     peer_mac[6];/* 注包时填入 Ethernet dst */
             bool        has_peer_mac;
+            uint32_t    arp_nexthop_be;/* 非 0：从本机 /proc/net/arp 查该 IPv4 的邻居 MAC 作为 eth dst，优先于 has_peer_mac */
+            pp_xsk_filt_t xdp_filt;     /* 全 0=入站裸 IPv4 全进 XSK；与隧道一致时由 tunnel 填 目的IP/udp端口/ipproto；仅 PPROXY_XDPCAP_BPF 的 eBPF 使用 */
         } xdp;
         struct {
             const char *ifname;     /* "netmap:eth0" 或 "vale0:1" */

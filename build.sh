@@ -140,6 +140,20 @@ else
     run_build docker run "${DOCKER_OPTS[@]}" "$IMAGE"
 fi
 
+if [[ $XDP -eq 1 ]]; then
+    log "compile bpf: build/xsk_xdpcap.bpf.o"
+    if [[ $NATIVE -eq 1 ]]; then
+        if ! ./scripts/compile_xsk_xdpcap_bpf.sh; then
+            err "xsk_xdpcap.bpf.o compile failed; install clang + kernel headers, or set PPROXY build without the .o"
+        fi
+    else
+        if ! docker run --rm -v "$(pwd -P):/workspace" -w /workspace -u "$(id -u):$(id -g)" \
+            "$IMAGE" ./scripts/compile_xsk_xdpcap_bpf.sh; then
+            err "xsk_xdpcap.bpf.o compile failed in container"
+        fi
+    fi
+fi
+
 BIN="$BUILD_DIR/pproxy"
 if [[ -x "$BIN" ]]; then
     log "built: $BIN ($(stat -c '%s' "$BIN") bytes)"

@@ -32,6 +32,7 @@
 #include "io/tun.h"
 #include "io/pcap.h"
 #include "io/xsk.h"
+#include "pproxy/xsk_filt.h"
 
 #define ICMP_HDR_LEN    8
 #define ICMP_TYPE_REQ   8
@@ -162,6 +163,13 @@ static void learn_peer_server_ic(struct icmp_ctx *c, uint32_t saddr_be, const ch
     char a[INET_ADDRSTRLEN] = "";
     inet_ntop(AF_INET, &saddr_be, a, sizeof a);
     PP_INFO("icmp %s peer learned: %s", tag, a);
+#ifdef PP_HAVE_XDP
+    if (c->cfg.io == PP_TIO_AF_XDP && c->xsk) {
+        int r = pp_xsk_io_refresh_arp(c->xsk, saddr_be);
+        if (r != PP_OK)
+            PP_WARN("icmp %s: xsk refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
+    }
+#endif
 }
 
 static void client_fix_peer(struct icmp_ctx *c)
@@ -425,23 +433,68 @@ static int pc_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 
 /* -------------------- af_xdp 路径 -------------------- */
 #ifdef PP_HAVE_XDP
+static void icmp_af_xdp_tun_log(const struct icmp_ctx *c, const char *xif, uint32_t xq)
+{
+    char lsn[64] = "", svr[64] = "";
+    pp_endpoint_format(&c->cfg.listen, lsn, sizeof lsn);
+    pp_endpoint_format(&c->cfg.server, svr, sizeof svr);
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        char la[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.listen.addr.u.v4, la, sizeof la);
+        PP_INFO("icmp af_xdp tunnel: mode=server if=%s q=%u nframes=%u zc=%d need_wakeup=%d "
+                "listen=%s id=0x%04x peer_known=%d server_cfg=%s",
+                xif, (unsigned)xq, c->cfg.io_cfg.xdp.nframes,
+                c->cfg.io_cfg.xdp.zero_copy ? 1 : 0, c->cfg.io_cfg.xdp.need_wakeup ? 1 : 0,
+                la, c->identifier, c->peer_known ? 1 : 0, svr);
+    } else {
+        char sa[INET_ADDRSTRLEN] = "", da[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.listen.addr.u.v4, sa, sizeof sa);
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
+        PP_INFO("icmp af_xdp tunnel: mode=client if=%s q=%u nframes=%u zc=%d need_wakeup=%d "
+                "listen=%s id=0x%04x peer=%s (dst_mac/ARP 使用对端 %s) server_ep=%s",
+                xif, (unsigned)xq, c->cfg.io_cfg.xdp.nframes,
+                c->cfg.io_cfg.xdp.zero_copy ? 1 : 0, c->cfg.io_cfg.xdp.need_wakeup ? 1 : 0,
+                sa, c->identifier, da, da, svr);
+    }
+}
+
 static int xc_connect(struct icmp_ctx *c)
 {
+    if (c->cfg.mode == PP_TMODE_CLIENT) client_fix_peer(c);
+    if (c->cfg.listen.addr.u.v4.s_addr == 0 && c->cfg.io_cfg.xdp.ifname
+        && c->cfg.io_cfg.xdp.ifname[0]) {
+        uint32_t s;
+        if (pp_xsk_ifname_first_ipv4(c->cfg.io_cfg.xdp.ifname, &s) == PP_OK) {
+            c->cfg.listen.addr.u.v4.s_addr = s;
+            c->cfg.listen.addr.af     = PP_AF_INET;
+            char a[INET_ADDRSTRLEN] = "";
+            struct in_addr _ia = { .s_addr = s };
+            inet_ntop(AF_INET, &_ia, a, sizeof a);
+            PP_INFO("icmp af_xdp: 未配 listen 源，使用 %s 上 IPv4 %s 为 IP 头源",
+                    c->cfg.io_cfg.xdp.ifname, a);
+        } else
+            PP_WARN("icmp af_xdp: listen 为 0.0.0.0 且无法从 %s 取 IPv4，IP 头源仍为 0.0.0.0",
+                    c->cfg.io_cfg.xdp.ifname);
+    }
+    uint32_t arp_nexthop_be = 0;
+    if (c->cfg.mode == PP_TMODE_CLIENT)
+        arp_nexthop_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    pp_xsk_filt_t xf;
+    memset(&xf, 0, sizeof xf);
+    xf.daddr_be = c->cfg.listen.addr.u.v4.s_addr;
+    xf.ipproto  = (uint8_t)IPPROTO_ICMP;
     int rc = pp_xsk_io_new(&c->xsk,
                            c->cfg.io_cfg.xdp.ifname,
                            c->cfg.io_cfg.xdp.queue_id,
                            c->cfg.io_cfg.xdp.nframes,
                            c->cfg.io_cfg.xdp.zero_copy,
                            c->cfg.io_cfg.xdp.need_wakeup,
-                           NULL);
+                           NULL,
+                           arp_nexthop_be,
+                           &xf);
     if (rc != PP_OK) return rc;
     c->fd = pp_xsk_io_get_fd(c->xsk);
-
-    if (c->cfg.mode == PP_TMODE_CLIENT) client_fix_peer(c);
-    PP_INFO("icmp af_xdp: iface=%s q=%u id=0x%04x mode=%s",
-            pp_xsk_io_get_ifname(c->xsk), pp_xsk_io_get_queue(c->xsk),
-            c->identifier,
-            c->cfg.mode == PP_TMODE_SERVER ? "server" : "client");
+    icmp_af_xdp_tun_log(c, pp_xsk_io_get_ifname(c->xsk), pp_xsk_io_get_queue(c->xsk));
     return PP_OK;
 }
 

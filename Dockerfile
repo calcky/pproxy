@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbpf-dev \
         libxdp-dev \
         libpcap-dev \
+        clang \
+        llvm \
+        linux-libc-dev \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 

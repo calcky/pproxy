@@ -10,6 +10,6 @@
     "tcp":  { "nodelay": true }
   }],
   "session": { "max_per_shard": 1024 },
-  "mgmt":    { "unix_socket": "/opt/pproxy/run/pp1.sock",
+  "mgmt":    { "unix_socket": "/opt/pproxy/run/pp.sock",
                "metrics": { "enable": true, "listen": "127.0.0.1:1999" } }
 }

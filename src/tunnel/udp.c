@@ -29,6 +29,7 @@
 #include "io/tun.h"
 #include "io/pcap.h"
 #include "io/xsk.h"
+#include "pproxy/xsk_filt.h"
 
 #define UDP_RX_MAX      65535
 #define L4_UDP_HDR_LEN  8   /* 真正的 UDP 头 */
@@ -176,6 +177,13 @@ static void learn_peer_server(struct udp_ctx *c, uint32_t saddr_be, uint16_t spo
     char a[INET_ADDRSTRLEN] = "";
     inet_ntop(AF_INET, &saddr_be, a, sizeof a);
     PP_INFO("udp %s peer learned: %s:%u", tag, a, sport);
+#ifdef PP_HAVE_XDP
+    if (c->cfg.io == PP_TIO_AF_XDP && c->xsk) {
+        int r = pp_xsk_io_refresh_arp(c->xsk, saddr_be);
+        if (r != PP_OK)
+            PP_WARN("udp %s: xsk refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
+    }
+#endif
 }
 
 /* -------------------- open / close -------------------- */
@@ -528,31 +536,92 @@ static int pc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 
 /* -------------------- af_xdp 路径 -------------------- */
 #ifdef PP_HAVE_XDP
+static void udp_af_xdp_tun_log(const struct udp_ctx *c, const char *xif, uint32_t xq)
+{
+    char lsn[64] = "", svr[64] = "";
+    char sm[24] = "n/a", dm[24] = "n/a";
+    uint8_t src_mac[6], dst_mac[6];
+    if (c->xsk) {
+        pp_xsk_io_get_macs(c->xsk, src_mac, dst_mac);
+        snprintf(sm, sizeof sm, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]);
+        snprintf(dm, sizeof dm, "%02x:%02x:%02x:%02x:%02x:%02x",
+                 dst_mac[0], dst_mac[1], dst_mac[2], dst_mac[3], dst_mac[4], dst_mac[5]);
+    }
+    pp_endpoint_format(&c->cfg.listen, lsn, sizeof lsn);
+    pp_endpoint_format(&c->cfg.server, svr, sizeof svr);
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        PP_INFO("udp af_xdp tunnel: mode=server if=%s q=%u nframes=%u zc=%d need_wakeup=%d "
+                "src_mac=%s dst_mac=%s listen_ep=%s listen_port=%u src_ip=0x%08x peer_known=%d server_cfg=%s",
+                xif, (unsigned)xq, c->cfg.io_cfg.xdp.nframes,
+                c->cfg.io_cfg.xdp.zero_copy ? 1 : 0, c->cfg.io_cfg.xdp.need_wakeup ? 1 : 0,
+                sm, dm, lsn, c->listen_port, c->src_ip_be, c->peer_known ? 1 : 0, svr);
+    } else {
+        char sa[INET_ADDRSTRLEN] = "", da[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->src_ip_be, sa, sizeof sa);
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
+        PP_INFO("udp af_xdp tunnel: mode=client if=%s q=%u nframes=%u zc=%d need_wakeup=%d "
+                "src_mac=%s dst_mac=%s flow %s:%u -> %s:%u listen_ep=%s (ARP 目标 %s)",
+                xif, (unsigned)xq, c->cfg.io_cfg.xdp.nframes,
+                c->cfg.io_cfg.xdp.zero_copy ? 1 : 0, c->cfg.io_cfg.xdp.need_wakeup ? 1 : 0,
+                sm, dm, sa, c->src_port, da, c->dst_port, lsn, da);
+    }
+}
+
 static int xc_connect(struct udp_ctx *c)
 {
     l3_init_ports(c);
+    /* 手拼 IP+UDP 时 0.0.0.0 不能当合法源；未配 bind / listen 时用 XDP 口上的主 IPv4。 */
+    if (c->src_ip_be == 0 && c->cfg.io_cfg.xdp.ifname && c->cfg.io_cfg.xdp.ifname[0]) {
+        uint32_t s;
+        if (pp_xsk_ifname_first_ipv4(c->cfg.io_cfg.xdp.ifname, &s) == PP_OK) {
+            c->src_ip_be = s;
+            char a[INET_ADDRSTRLEN] = "";
+            struct in_addr _ia = { .s_addr = s };
+            inet_ntop(AF_INET, &_ia, a, sizeof a);
+            PP_INFO("udp af_xdp: listen 未设源(0.0.0.0)，使用 %s 上 IPv4 %s 作为发包头源",
+                    c->cfg.io_cfg.xdp.ifname, a);
+        } else {
+            PP_WARN("udp af_xdp: listen 为 0.0.0.0 且无法从 %s 取 IPv4，IP 头源将仍为 0.0.0.0",
+                    c->cfg.io_cfg.xdp.ifname);
+        }
+    }
+    uint32_t arp_nexthop_be = 0;
+    if (c->cfg.mode == PP_TMODE_CLIENT)
+        arp_nexthop_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    pp_xsk_filt_t xf;
+    memset(&xf, 0, sizeof xf);
+    xf.daddr_be = c->src_ip_be;
+    xf.ipproto  = (uint8_t)IPPROTO_UDP;
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        xf.dport_be = htons(c->listen_port);
+    else
+        xf.dport_be = htons(c->src_port);
     int rc = pp_xsk_io_new(&c->xsk,
                            c->cfg.io_cfg.xdp.ifname,
                            c->cfg.io_cfg.xdp.queue_id,
                            c->cfg.io_cfg.xdp.nframes,
                            c->cfg.io_cfg.xdp.zero_copy,
                            c->cfg.io_cfg.xdp.need_wakeup,
-                           NULL /* dst_mac: later */);
+                           NULL,
+                           arp_nexthop_be,
+                           &xf);
     if (rc != PP_OK) return rc;
     c->fd = pp_xsk_io_get_fd(c->xsk);
 
+    /* 与 kernel_socket 一致，供 tests/clab/deploy.sh 等做日志 grep。 */
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        const pp_endpoint_t *ep = &c->cfg.listen;
+        char epstr[64] = "";
+        pp_endpoint_format(ep, epstr, sizeof epstr);
+        PP_INFO("udp tunnel bound on %s (fd=%d), waiting for peer", epstr, c->fd);
+    } else {
+        PP_INFO("udp tunnel connected (fd=%d)", c->fd);
+    }
+
     const char *xif = pp_xsk_io_get_ifname(c->xsk);
     uint32_t    xq  = pp_xsk_io_get_queue(c->xsk);
-    if (c->cfg.mode == PP_TMODE_SERVER) {
-        PP_INFO("udp af_xdp server: iface=%s q=%u listen_port=%u",
-                xif, xq, c->listen_port);
-    } else {
-        char sa[INET_ADDRSTRLEN]="", da[INET_ADDRSTRLEN]="";
-        inet_ntop(AF_INET, &c->src_ip_be, sa, sizeof sa);
-        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
-        PP_INFO("udp af_xdp client: iface=%s q=%u %s:%u -> %s:%u",
-                xif, xq, sa, c->src_port, da, c->dst_port);
-    }
+    udp_af_xdp_tun_log(c, xif, xq);
     return PP_OK;
 }
 
