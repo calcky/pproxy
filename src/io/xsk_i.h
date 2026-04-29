@@ -45,7 +45,9 @@ struct pp_xsk_io {
     /* PPROXY_XDPCAP_BPF=… 时：自载 eBPF、xdpcap hook pin（libbpf 指针） */
     void *xdpcap_obj;
     void *xdpcap_link;
-    char  xdpcap_pin[512];
+    unsigned int xdpcap_ifindex;
+    uint32_t     xdpcap_xdp_flags;
+    char         xdpcap_pin[512];
 };
 
 #endif

@@ -24,6 +24,19 @@
 #define XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD (1U << 1)
 #endif
 
+/* 须与 bpf/xsk_xdpcap.bpf.c 中 xdpcap_hook.max_entries 及 xdpcap HookMapABI 一致（见 xdpcap internal） */
+#ifndef HOOK_MAP_MAX_ENTRIES
+#define HOOK_MAP_MAX_ENTRIES 4
+#endif
+
+static uint32_t xdpcap_env_xdp_flags(void)
+{
+    const char *e = getenv("PPROXY_XDPCAP_SKB");
+    if (e && e[0] == '1' && e[1] == '\0')
+        return XDP_FLAGS_SKB_MODE;
+    return 0;
+}
+
 static void bump_memlock(void)
 {
     struct rlimit l = { RLIM_INFINITY, RLIM_INFINITY };
@@ -53,6 +66,13 @@ void pp_xdpcap_cleanup(struct pp_xsk_io *p)
     }
     p->fd = -1;
 
+    if (p->xdpcap_ifindex) {
+        struct bpf_xdp_attach_opts xo = {};
+        xo.sz = sizeof(xo);
+        (void)bpf_xdp_detach((int)p->xdpcap_ifindex, p->xdpcap_xdp_flags, &xo);
+        p->xdpcap_ifindex = 0;
+    }
+
     if (p->xdpcap_link) {
         struct bpf_link *lk = p->xdpcap_link;
         p->xdpcap_link = NULL;
@@ -77,10 +97,22 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
     if (!p || !bpf_object_path || !bpf_object_path[0]) return PP_ERR_INVAL;
 
     bump_memlock();
+
+    struct bpf_map_create_opts mopts = {};
+    mopts.sz = sizeof(mopts);
+    int hook_fd = bpf_map_create(BPF_MAP_TYPE_PROG_ARRAY, "xdpcap_hook",
+                                (int)sizeof(int), (int)sizeof(int),
+                                HOOK_MAP_MAX_ENTRIES, &mopts);
+    if (hook_fd < 0) {
+        PP_ERROR("xdpcap: bpf_map_create hook map: %s", strerror(-hook_fd));
+        return PP_ERR_IO;
+    }
+
     struct bpf_object *obj = bpf_object__open_file(bpf_object_path, NULL);
     if (!obj) {
         PP_ERROR("xdpcap: bpf_object__open_file(%s) failed: %s",
                  bpf_object_path, strerror(errno));
+        (void)close(hook_fd);
         return PP_ERR_IO;
     }
     p->xdpcap_obj = obj;
@@ -93,6 +125,16 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
                  bpf_object_path);
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
+        (void)close(hook_fd);
+        return PP_ERR_IO;
+    }
+
+    int rfd = bpf_map__reuse_fd(m_hook, hook_fd);
+    if (rfd != 0) {
+        PP_ERROR("xdpcap: bpf_map__reuse_fd: %s", strerror(-rfd));
+        p->xdpcap_obj = NULL;
+        bpf_object__close(obj);
+        (void)close(hook_fd);
         return PP_ERR_IO;
     }
 
@@ -106,7 +148,7 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         PP_ERROR("xdpcap: queue_id %u too large for xsks_map (max %u)", p->queue_id, max);
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
-        return PP_ERR_INVAL;
+        return PP_ERR_IO;
     }
     (void)bpf_map__set_max_entries(m_xsks, max);
 
@@ -117,9 +159,9 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         return PP_ERR_IO;
     }
 
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xsk_def_prog");
+    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_hook");
     if (!prog) {
-        PP_ERROR("xdpcap: no program xsk_def_prog in %s", bpf_object_path);
+        PP_ERROR("xdpcap: no program xdp_hook in %s", bpf_object_path);
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;
@@ -133,25 +175,35 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         return PP_ERR_IO;
     }
 
-    struct bpf_link *link = bpf_program__attach_xdp(prog, (int)ifi);
-    long xerr = libbpf_get_error((void *)link);
-    if (xerr) {
-        PP_ERROR("xdpcap: attach_xdp(%s): %s", p->ifname, strerror((int)(-xerr)));
+    struct bpf_xdp_attach_opts xopts = {};
+    xopts.sz = sizeof(xopts);
+    uint32_t xdp_flags = xdpcap_env_xdp_flags();
+
+    int err = bpf_xdp_attach((int)ifi, bpf_program__fd(prog), xdp_flags, &xopts);
+    if (err) {
+        PP_ERROR("xdpcap: AttachXDP on %s: %s "
+                 "(hint: native/driver XDP may fail on some NICs or VMs)",
+                 p->ifname, strerror(-err));
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;
     }
-    p->xdpcap_link = link;
+    p->xdpcap_ifindex = ifi;
+    p->xdpcap_xdp_flags = xdp_flags;
 
     char safe[IFNAMSIZ];
     sanitize_for_pin(p->ifname, safe, sizeof safe);
     (void)snprintf(p->xdpcap_pin, sizeof p->xdpcap_pin,
                   "/sys/fs/bpf/pproxy_xdpcap_%s", safe);
+
+    (void)unlink(p->xdpcap_pin);
     if (bpf_map__pin(m_hook, p->xdpcap_pin) != 0) {
         PP_ERROR("xdpcap: bpf_map__pin(hook) -> %s: %s (bpffs mounted?)",
                  p->xdpcap_pin, strerror(errno));
-        p->xdpcap_link = NULL;
-        (void)bpf_link__destroy(link);
+        struct bpf_xdp_attach_opts xo = {};
+        xo.sz = sizeof(xo);
+        (void)bpf_xdp_detach((int)ifi, xdp_flags, &xo);
+        p->xdpcap_ifindex = 0;
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;
@@ -173,8 +225,12 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         p->xsk = NULL;
         (void)unlink(p->xdpcap_pin);
         p->xdpcap_pin[0] = '\0';
-        p->xdpcap_link = NULL;
-        (void)bpf_link__destroy(link);
+        {
+            struct bpf_xdp_attach_opts xo = {};
+            xo.sz = sizeof(xo);
+            (void)bpf_xdp_detach((int)ifi, xdp_flags, &xo);
+        }
+        p->xdpcap_ifindex = 0;
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;
@@ -192,8 +248,12 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         p->fd = -1;
         (void)unlink(p->xdpcap_pin);
         p->xdpcap_pin[0] = '\0';
-        p->xdpcap_link = NULL;
-        (void)bpf_link__destroy(link);
+        {
+            struct bpf_xdp_attach_opts xo = {};
+            xo.sz = sizeof(xo);
+            (void)bpf_xdp_detach((int)ifi, xdp_flags, &xo);
+        }
+        p->xdpcap_ifindex = 0;
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;
@@ -208,8 +268,12 @@ int pp_xdpcap_xsk_create(struct pp_xsk_io *p,
         p->fd = -1;
         (void)unlink(p->xdpcap_pin);
         p->xdpcap_pin[0] = '\0';
-        p->xdpcap_link = NULL;
-        (void)bpf_link__destroy(link);
+        {
+            struct bpf_xdp_attach_opts xo = {};
+            xo.sz = sizeof(xo);
+            (void)bpf_xdp_detach((int)ifi, xdp_flags, &xo);
+        }
+        p->xdpcap_ifindex = 0;
         p->xdpcap_obj = NULL;
         bpf_object__close(obj);
         return PP_ERR_IO;

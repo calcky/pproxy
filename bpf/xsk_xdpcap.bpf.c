@@ -34,19 +34,19 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-    __uint(max_entries, 5);
+    __uint(max_entries, 4);
     __type(key, __u32);
     __type(value, __u32);
 } xdpcap_hook SEC(".maps");
 
 static __always_inline int pproxy_match_and_redirect(struct xdp_md *ctx, __u32 k)
 {
-    bpf_tail_call(ctx, &xdpcap_hook, 4U);
+    bpf_tail_call(ctx, &xdpcap_hook, XDP_PASS);
     return bpf_redirect_map(&xsks_map, k, 0);
 }
 
 SEC("xdp")
-int xsk_def_prog(struct xdp_md *ctx)
+int xdp_hook(struct xdp_md *ctx)
 {
     unsigned char *m    = (unsigned char *)(void *)(long)ctx->data;
     void *data_end     = (void *)(long)ctx->data_end;

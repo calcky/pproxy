@@ -1,0 +1,58 @@
+#include <linux/bpf.h>
+
+struct bpf_attr_map {
+    uint32_t map_fd;
+    uint64_t key;
+    uint64_t value;
+    uint32_t flags;
+};
+
+struct bpf_attr_obj {
+    uint64_t pathname;
+    uint32_t bpf_fd;
+};
+
+kprobe:__sys_bpf
+{
+    // 过滤程序名：只看 xdpcap 进程触发的调用
+    if (comm != "xdpcap") { return; }
+
+    $cmd = (uint32)arg0;
+    $attr = arg1;
+    @cmd_map[tid] = $cmd;
+
+    time("%H:%M:%S  ");
+    printf("%-16s  CMD:%d ", comm, $cmd);
+
+    if ($cmd == 2) { 
+        $up = (struct bpf_attr_map *)$attr;
+        printf("[MAP_UPDATE] FD:%d ", $up->map_fd); 
+    }
+    if ($cmd == 17) { 
+        $obj = (struct bpf_attr_obj *)$attr;
+        printf("[OBJ_GET] Path:%s ", str($obj->pathname)); 
+    }
+    if ($cmd == 5) { printf("[PROG_LOAD] "); }
+    
+    printf("\n");
+}
+
+kretprobe:__sys_bpf
+/@cmd_map[tid]/
+{
+    // 同样只处理匹配的进程
+    if (comm != "xdpcap") { return; }
+
+    $ret = (int64)(int32)retval;
+    $cmd = @cmd_map[tid];
+
+    time("%H:%M:%S  ");
+    printf("%-16s  ", comm);
+
+    if ($ret < 0) {
+        printf("[ERROR] CMD:%d, RET:%ld, ERRNO:%ld\n", $cmd, $ret, -$ret);
+    } else {
+        printf("[SUCCESS] CMD:%d, RET:%ld\n", $cmd, $ret);
+    }
+    delete(@cmd_map[tid]);
+}
