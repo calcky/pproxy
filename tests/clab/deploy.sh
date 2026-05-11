@@ -24,6 +24,7 @@
 # pproxy 使用 tests/clab/config/*.json（勿在 deploy.sh 里内嵌大段 JSON）；
 # 选文件：优先 pp{1,2}.<协议>.left-<左手>.right-<右手>.json；否则回退 pp1.json / pp1.udp.json / pp1.icmp.json 等。
 # 远程路径：/opt/pproxy/pproxy、/opt/pproxy/pp{1,2}.json、/opt/pproxy/log/pp.log
+# 各 leaf 另装 cilium/pwru → /usr/bin/pwru（默认 v1.0.11；PWRU_URL= 可改）
 # af_xdp 时 pproxy 使用 libxdp 默认 XDP 即可起服务。若宿主机存在 xsk_xdpcap.bpf.o（自编译，供 cloudflare/xdpcap
 # 抓包 hook），本脚本会额外 scp 并设 PPROXY_XDPCAP_BPF；无该文件则跳过并仅告警，不失败。
 # 宿主机 .o 路径可覆盖：PPROXY_XDPCAP_BPF=/path/…/xsk_xdpcap.bpf.o
@@ -79,6 +80,8 @@ VM_PPROXY_LOG="$VM_PPROXY_ROOT/log/pp.log"
 VM_PPROXY_XDPCAP_BPF="${VM_PPROXY_ROOT}/xsk_xdpcap.bpf.o"
 # 来自 tests/clab/leaf-bin，与 xsk_xdpcap 配套；仅当配置需 xdpcap 时 scp
 VM_XDPCAP_BIN="/usr/local/bin/xdpcap"
+# cilium/pwru：配置 leaf 后装到各 VM /usr/bin/pwru（可 PWRU_URL=… 覆盖）
+: "${PWRU_URL:=https://github.com/cilium/pwru/releases/download/v1.0.11/pwru-linux-amd64.tar.gz}"
 # 1=各 VM 启用 core 到 ${VM_PPROXY_ROOT}/core-*（与 doc/debug.md 一致；默认 1）
 : "${PPROXY_COREDUMP:=1}"
 # 0=nohup 起 pproxy；1=gdbserver 起（等 VSCode/ gdb 连上后进程才跑完初始化，与 gdb-tunnel.sh / launch.json 同端口）
@@ -121,6 +124,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   PPROXY_COREDUMP, PPROXY_GDB, PPROXY_GDB_TUNNEL
   CLAB_SUDO=1              使用 sudo 调用 containerlab
   PPROXY_XDPCAP_BPF=路径   宿主机 xsk_xdpcap.bpf.o（可选；有则随 af_xdp 一起部署到 VM）
+  PWRU_URL=URL              pwru 预编译包（默认 Cilium v1.0.11 linux-amd64）
 
 更完整的说明见本脚本文件头注释。
 EOF
@@ -388,6 +392,35 @@ fi
 echo "OK \${LABEL}: WAN=\$WAN LAN=\$LAN"
 EOF
   echo "  ✓ ${label} done"
+}
+
+# cilium/pwru：宿主机拉 tarball → scp → 各 leaf 解压到 /usr/bin
+leaf_install_pwru() {
+  echo "  pwru: fetching ${PWRU_URL} …"
+  local tmp tgz
+  tmp=$(mktemp -d)
+  tgz="$tmp/pwru.tgz"
+  if ! curl -fsSL "$PWRU_URL" -o "$tgz"; then
+    echo "  ✗ pwru: download failed" >&2
+    rm -rf "$tmp"
+    exit 1
+  fi
+  local rhost
+  for rhost in "$LEAF1_HOST" "$LEAF2_HOST"; do
+    echo "  pwru: ${rhost} → /usr/bin/pwru …"
+    sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$tgz" \
+      "${UBUNTU_USER}@${rhost}:/tmp/pwru-linux-amd64.tgz"
+    sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${rhost}" \
+      bash -s -- "$UBUNTU_PASS" <<'EOW'
+set -euo pipefail
+PASS="$1"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s tar -xzf /tmp/pwru-linux-amd64.tgz -C /usr/bin
+rm -f /tmp/pwru-linux-amd64.tgz
+EOW
+  done
+  rm -rf "$tmp"
+  echo "  ✓ pwru on leaf1 + leaf2 (/usr/bin/pwru)"
 }
 
 # ---------- pproxy: 装动态库、拷二进制、发配置、起进程、简单检查 ----------
@@ -701,6 +734,10 @@ echo ""
 echo "=== [3/5] Applying Ubuntu data-plane configuration ==="
 configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24"
 configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24"
+
+echo ""
+echo "  pwru (eBPF helper): install to /usr/bin on both leaves"
+leaf_install_pwru
 
 if [[ "$SKIP_PPROXY" -eq 0 ]]; then
   pproxy_smoke
