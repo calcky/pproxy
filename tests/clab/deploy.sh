@@ -401,7 +401,7 @@ s() { printf '%s\n' "\$SUDO_PASS" | sudo -S -p '' "\$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
 # 与 build.sh 链接的 libbpf/libxdp/libpcap 匹配；24.04 上部分包名为 *t64
-s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb
+s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils
 if ! command -v gdbserver >/dev/null 2>&1; then
   s apt-get install -y -qq gdbserver
 fi
