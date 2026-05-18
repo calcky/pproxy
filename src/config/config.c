@@ -135,6 +135,7 @@ static pp_io_kind_t parse_io_kind(const char *s, bool *ok)
     if (!strcmp(s, "af_xdp"))      return PP_IO_AF_XDP;
     if (!strcmp(s, "netmap"))      return PP_IO_NETMAP;
     if (!strcmp(s, "pcap"))        return PP_IO_PCAP;
+    if (!strcmp(s, "dpdk"))        return PP_IO_DPDK;
     *ok = false;
     return PP_IO_TUN;
 }
@@ -229,6 +230,28 @@ static int parse_left(yyjson_val *root, pp_runtime_t *rt)
         }
         break;
     }
+    case PP_IO_DPDK: {
+        yyjson_val *o = yyjson_obj_get(left, "dpdk");
+        if (o && yyjson_is_obj(o)) {
+            rt->left_cfg.u.dpdk.port_id  = (uint16_t)jint(o, "port_id", 0);
+            rt->left_cfg.u.dpdk.queue_id = (uint16_t)jint(o, "queue_id", 0);
+            rt->left_cfg.u.dpdk.nframes  = (uint32_t)jint(o, "nframes", 8192);
+            rt->left_cfg.u.dpdk.eal_args = dup_to_rt(rt, jstr(o, "eal_args", NULL));
+            const char *mac = jstr(o, "peer_mac", NULL);
+            if (mac && mac[0]) {
+                unsigned m[6] = {0};
+                if (sscanf(mac, "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    for (int i = 0; i < 6; i++)
+                        rt->left_cfg.u.dpdk.peer_mac[i] = (uint8_t)m[i];
+                    rt->left_cfg.u.dpdk.has_peer_mac = true;
+                } else {
+                    PP_WARN("config: left.dpdk.peer_mac='%s' invalid, ignored", mac);
+                }
+            }
+        }
+        break;
+    }
     }
     return PP_OK;
 }
@@ -258,6 +281,7 @@ static pp_tunnel_io_t parse_tio(const char *s, bool *ok)
     if (!strcmp(s, "netmap"))            return PP_TIO_NETMAP;
     if (!strcmp(s, "pcap"))              return PP_TIO_PCAP;
     if (!strcmp(s, "tun"))               return PP_TIO_TUN;
+    if (!strcmp(s, "dpdk"))              return PP_TIO_DPDK;
     *ok = false;
     return PP_TIO_KERNEL_SOCKET;
 }
@@ -358,6 +382,12 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
             break;
         case PP_TIO_TUN:
             cfg->io_cfg.tun.ifname = dup_to_rt(rt, jstr(ioc, "ifname", "pp-tx0"));
+            break;
+        case PP_TIO_DPDK:
+            cfg->io_cfg.dpdk.port_id  = (uint16_t)jint(ioc, "port_id", 0);
+            cfg->io_cfg.dpdk.queue_id = (uint16_t)jint(ioc, "queue_id", 0);
+            cfg->io_cfg.dpdk.nframes  = (uint32_t)jint(ioc, "nframes", 8192);
+            cfg->io_cfg.dpdk.eal_args = dup_to_rt(rt, jstr(ioc, "eal_args", NULL));
             break;
         case PP_TIO_KERNEL_SOCKET:
         default:

@@ -29,6 +29,7 @@
 #include "io/tun.h"
 #include "io/pcap.h"
 #include "io/xsk.h"
+#include "io/dpdk.h"
 #include "pproxy/xsk_filt.h"
 
 #define UDP_RX_MAX      65535
@@ -58,6 +59,9 @@ struct udp_ctx {
 #endif
 #ifdef PP_HAVE_XDP
     struct pp_xsk_io       *xsk;
+#endif
+#ifdef PP_HAVE_DPDK
+    struct pp_dpdk_io      *dpdk;
 #endif
 };
 
@@ -211,6 +215,13 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         PP_ERROR("udp tunnel: io=af_xdp requires build with -Dxdp=true");
         return PP_ERR_NOSUPPORT;
 #endif
+    case PP_TIO_DPDK:
+#ifdef PP_HAVE_DPDK
+        break;
+#else
+        PP_ERROR("udp tunnel: io=dpdk requires build with -Ddpdk=true");
+        return PP_ERR_NOSUPPORT;
+#endif
     case PP_TIO_NETMAP:
         PP_ERROR("udp tunnel: io=%s not yet implemented", pp_tunnel_io_name(cfg->io));
         return PP_ERR_NOSUPPORT;
@@ -222,7 +233,8 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
     if (cfg->io == PP_TIO_RAW_SOCKET ||
         cfg->io == PP_TIO_TUN ||
         cfg->io == PP_TIO_PCAP ||
-        cfg->io == PP_TIO_AF_XDP) {
+        cfg->io == PP_TIO_AF_XDP ||
+        cfg->io == PP_TIO_DPDK) {
         const pp_endpoint_t *ep =
             (cfg->mode == PP_TMODE_SERVER) ? &cfg->listen : &cfg->server;
         if (ep->addr.af != PP_AF_INET) {
@@ -251,6 +263,9 @@ static void udp_close(void *ctx)
 #endif
 #ifdef PP_HAVE_XDP
     if (c->cfg.io == PP_TIO_AF_XDP) { pp_xsk_io_free(c->xsk); c->xsk = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) { pp_dpdk_io_free(c->dpdk); c->dpdk = NULL; fd_owned_by_helper = true; }
 #endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
@@ -660,11 +675,80 @@ static int xc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif  /* PP_HAVE_XDP */
 
+/* -------------------- dpdk 路径 -------------------- */
+#ifdef PP_HAVE_DPDK
+static int dp_connect(struct udp_ctx *c)
+{
+    l3_init_ports(c);
+    int rc = pp_dpdk_io_new(&c->dpdk,
+                            c->cfg.io_cfg.dpdk.port_id,
+                            c->cfg.io_cfg.dpdk.queue_id,
+                            c->cfg.io_cfg.dpdk.nframes,
+                            c->cfg.io_cfg.dpdk.eal_args,
+                            NULL);
+    if (rc != PP_OK) return rc;
+    /* DPDK 无 fd；c->fd 保持 -1，dispatch 通过 c->cfg.io == PP_TIO_DPDK 早期 case 处理。 */
+
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        const pp_endpoint_t *ep = &c->cfg.listen;
+        char epstr[64] = "";
+        pp_endpoint_format(ep, epstr, sizeof epstr);
+        PP_INFO("udp tunnel bound on %s (dpdk port=%u q=%u), waiting for peer",
+                epstr, pp_dpdk_io_get_port(c->dpdk), pp_dpdk_io_get_queue(c->dpdk));
+    } else {
+        char sa[INET_ADDRSTRLEN] = "", da[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->src_ip_be, sa, sizeof sa);
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
+        PP_INFO("udp tunnel connected (dpdk port=%u q=%u) %s:%u -> %s:%u",
+                pp_dpdk_io_get_port(c->dpdk), pp_dpdk_io_get_queue(c->dpdk),
+                sa, c->src_port, da, c->dst_port);
+    }
+    return PP_OK;
+}
+
+static int dp_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t frame[65535];
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
+                                       c->src_ip_be, dst_ip_be,
+                                       c->src_port, c->dst_port,
+                                       c->ip_id++, buf->data, buf->len);
+    if (!ip_tot) return PP_ERR_INVAL;
+    int r = pp_dpdk_io_inject_ip(c->dpdk, frame, ip_tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int dp_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    size_t n = 0;
+    const uint8_t *ip = pp_dpdk_io_next_ip(c->dpdk, &n);
+    if (!ip) return 0;
+
+    uint16_t sport; uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    int r = parse_ip_udp_frame(ip, n, c, &sport, &saddr_be, &body, &body_len);
+    if (r != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server(c, saddr_be, sport, "dpdk");
+    return (int)body_len;
+}
+#endif  /* PP_HAVE_DPDK */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int udp_connect(void *ctx)
 {
     struct udp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? PP_OK : dp_connect(c);
+#endif
     if (c->fd >= 0) return PP_OK;
     switch (c->cfg.io) {
     case PP_TIO_RAW_SOCKET: return raw_connect(c);
@@ -682,6 +766,9 @@ static int udp_connect(void *ctx)
 static int udp_send(void *ctx, const pp_tun_buf_t *buf)
 {
     struct udp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? dp_send(c, buf) : PP_ERR_CLOSED;
+#endif
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
     case PP_TIO_RAW_SOCKET: return raw_send(c, buf);
@@ -699,6 +786,13 @@ static int udp_send(void *ctx, const pp_tun_buf_t *buf)
 static int udp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
     struct udp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) {
+        if (!c->dpdk) return PP_ERR_CLOSED;
+        (void)timeout_us;  /* busy poll；无 fd 可 poll */
+        return dp_recv(c, out_buf);
+    }
+#endif
     if (c->fd < 0) return PP_ERR_CLOSED;
 
     if (timeout_us > 0) {
@@ -739,7 +833,8 @@ const pp_tunnel_ops_t pp_tunnel_udp = {
                        | PP_TIO_MASK_AF_XDP
                        | PP_TIO_MASK_NETMAP
                        | PP_TIO_MASK_PCAP
-                       | PP_TIO_MASK_TUN,
+                       | PP_TIO_MASK_TUN
+                       | PP_TIO_MASK_DPDK,
     .open = udp_open, .close = udp_close,
     .connect = udp_connect, .send = udp_send, .recv = udp_recv,
     .session_close = udp_session_close,

@@ -37,6 +37,7 @@ const char *pp_tunnel_io_name(pp_tunnel_io_t io)
     case PP_TIO_NETMAP:        return "netmap";
     case PP_TIO_PCAP:          return "pcap";
     case PP_TIO_TUN:           return "tun";
+    case PP_TIO_DPDK:          return "dpdk";
     default:                   return "unknown";
     }
 }

@@ -8,6 +8,7 @@
 #   PPROXY_BIN=/path/to/pproxy ./deploy.sh
 #   ./deploy.sh --tunnel=tcp        # 隧道协议：默认 udp；可选 tcp、icmp
 #   ./deploy.sh --left-io=tun --right-io=kernel_socket   # 左右手 I/O，见 --help
+#   ./deploy.sh --left-io=tun --right-io=dpdk            # 右手 DPDK；需 hugepages + vfio-pci 已绑数据网卡（DPDK 接管后内核不可见）
 #   PPROXY_TUNNEL_MODE=icmp ./deploy.sh   # 同上，环境变量（命令行 --tunnel= 优先）
 #   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
 #   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
@@ -107,9 +108,11 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
 本脚本选项:
   --no-pproxy              只部署拓扑与 leaf 网络，不编译、不装 pproxy
   --tunnel=tcp|udp|icmp    隧道协议（默认 udp；也可 PPROXY_TUNNEL_MODE，命令行优先）
-  --left-io=KIND           左手 I/O: tun, raw_socket, af_xdp, netmap, pcap（默认同环境或 tun）
-  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap
+  --left-io=KIND           左手 I/O: tun, raw_socket, af_xdp, netmap, pcap, dpdk（默认同环境或 tun）
+  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk
                            省略或 auto 时：tcp/udp→kernel_socket，icmp→raw_socket
+                           注意：dpdk 需要 hugepages + vfio-pci 已绑指定数据网卡；DPDK 接管后内核不可见，
+                                 不能与 kernel_socket 共用同一张卡
   --gdb / --no-gdb         是否用 gdbserver 起 pproxy（默认 --no-gdb）
   --gdb-tunnel             部署结束后在本机跑 gdb-tunnel.sh（ssh -L 转发 gdb 端口）
   --no-gdb-tunnel          不建立上述转发
@@ -186,16 +189,16 @@ resolve_tunnel_cfgs() {
   fi
 
   case "$l" in
-    tun|raw_socket|af_xdp|netmap|pcap) ;;
+    tun|raw_socket|af_xdp|netmap|pcap|dpdk) ;;
     *)
-      echo "Invalid --left-io / PPROXY_LEFT_IO: ${PPROXY_LEFT_IO:-tun} (tun, raw_socket, af_xdp, netmap, pcap)" >&2
+      echo "Invalid --left-io / PPROXY_LEFT_IO: ${PPROXY_LEFT_IO:-tun} (tun, raw_socket, af_xdp, netmap, pcap, dpdk)" >&2
       exit 1
       ;;
   esac
   case "$r" in
-    kernel_socket|raw_socket|tun|af_xdp|netmap|pcap) ;;
+    kernel_socket|raw_socket|tun|af_xdp|netmap|pcap|dpdk) ;;
     *)
-      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, auto)" >&2
+      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, auto)" >&2
       exit 1
       ;;
   esac
@@ -426,25 +429,53 @@ EOW
 # ---------- pproxy: 装动态库、拷二进制、发配置、起进程、简单检查 ----------
 pproxy_apt_deps() {
   local host=$1
-  echo "  pproxy: installing runtime libs on ${host} …"
-  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" bash -s <<EOA
+  local need_dpdk="${2:-0}"
+  echo "  pproxy: installing runtime libs on ${host} (dpdk=${need_dpdk}) …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$need_dpdk" <<'EOA'
 set -euo pipefail
-SUDO_PASS='${UBUNTU_PASS}'
-s() { printf '%s\n' "\$SUDO_PASS" | sudo -S -p '' "\$@"; }
+SUDO_PASS="$1"
+NEED_DPDK="$2"
+s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
-# 与 build.sh 链接的 libbpf/libxdp/libpcap 匹配；24.04 上部分包名为 *t64
 s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils
 if ! command -v gdbserver >/dev/null 2>&1; then
   s apt-get install -y -qq gdbserver
 fi
 s apt-get install -y -qq libelf1t64 2>/dev/null || s apt-get install -y -qq libelf1
 s apt-get install -y -qq libpcap0.8t64 2>/dev/null || s apt-get install -y -qq libpcap0.8
-# xdp-loader / xdpdump 等；bpftrace 用于 eBPF 跟踪（部分旧版需启用 universe）
 if ! s apt-get install -y -qq xdp-tools bpftrace; then
-  echo "  … note: xdp-tools/bpftrace install failed on ${host} (optional; check apt sources / release)" >&2
+  echo "  … note: xdp-tools/bpftrace install failed (optional; check apt sources / release)" >&2
+fi
+if [[ "$NEED_DPDK" == "1" ]]; then
+  # DPDK 运行时库 + dpdk-devbind/dpdk-hugepages 工具；24.04 默认即可
+  s apt-get install -y -qq libdpdk23 dpdk dpdk-kmods-dkms 2>/dev/null \
+    || s apt-get install -y -qq libdpdk23 dpdk \
+    || s apt-get install -y -qq dpdk \
+    || echo "  ✗ DPDK 包安装失败（请人工执行 apt install libdpdk23 dpdk）" >&2
 fi
 EOA
+}
+
+# DPDK 运行依赖：hugepages + vfio-pci；不绑定具体网卡（部署里没有真实 SR-IOV NIC，留给用户/CI）
+pproxy_dpdk_runtime_setup() {
+  local host=$1
+  echo "  pproxy: dpdk runtime: 1024 hugepages(2M) + vfio-pci on ${host} …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" <<'EOD'
+set -euo pipefail
+SUDO_PASS="$1"
+s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
+s sh -c 'echo 1024 > /proc/sys/vm/nr_hugepages' 2>/dev/null \
+  || echo "  ✗ 写 nr_hugepages 失败（内核可能未启用 hugetlb 或权限不足）" >&2
+s mkdir -p /mnt/huge 2>/dev/null || true
+s mountpoint -q /mnt/huge || s mount -t hugetlbfs none /mnt/huge 2>/dev/null \
+  || echo "  ⚠ /mnt/huge 挂载失败（DPDK 仍会用 --in-memory 启动）" >&2
+s modprobe vfio-pci 2>/dev/null \
+  || echo "  ⚠ modprobe vfio-pci 失败（容器/受限内核可能不支持；可改用 net_pcap vdev 测试）" >&2
+echo "  pproxy: dpdk runtime ready on $(hostname)"
+EOD
 }
 
 pproxy_remote_prepare() {
@@ -647,12 +678,20 @@ pproxy_smoke() {
   echo "  Tunnel: $TUNNEL_MODE  I/O: left=${DEPLOY_IO_LEFT}  right=${DEPLOY_IO_RIGHT}"
   echo "  Config: $PP1_JSON + $PP2_JSON"
 
-  pproxy_apt_deps "$LEAF1_HOST"
-  pproxy_apt_deps "$LEAF2_HOST"
+  local NEED_DPDK=0
+  if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    NEED_DPDK=1
+  fi
+  pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK"
+  pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK"
   pproxy_remote_prepare "$LEAF1_HOST"
   pproxy_remote_prepare "$LEAF2_HOST"
   pproxy_coredump_setup "$LEAF1_HOST"
   pproxy_coredump_setup "$LEAF2_HOST"
+  if [[ "$NEED_DPDK" -eq 1 ]]; then
+    pproxy_dpdk_runtime_setup "$LEAF1_HOST"
+    pproxy_dpdk_runtime_setup "$LEAF2_HOST"
+  fi
   pproxy_scp_bin "$LEAF1_HOST"
   pproxy_scp_bin "$LEAF2_HOST"
   if [[ "$USE_XDPCAP" -eq 1 ]]; then

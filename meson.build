@@ -58,6 +58,11 @@ if get_option('netmap')
   add_project_arguments('-DPP_HAVE_NETMAP', language: 'c')
 endif
 
+if get_option('dpdk')
+  deps += dependency('libdpdk')
+  add_project_arguments('-DPP_HAVE_DPDK', language: 'c')
+endif
+
 # ---------- 源文件（按目录扫描） ----------
 #
 # Meson 官方不支持 glob，理由是"新增文件时构建系统感知不到"。
@@ -126,8 +131,7 @@ test_ring_bench_nobackoff = executable('test_ring_bench_nobackoff',
 
 # ---------- 测试：tunnel 本机回环（同进程 server↔client） ----------
 # 只链接 tunnel 和 core 的少量 .o，不依赖 main / module / left-I/O，无需 root。
-test_tunnel_loopback = executable('test_tunnel_loopback',
-  [
+_tunnel_loopback_srcs = [
     'tests/test_tunnel_loopback.c',
     'src/tunnel/tcp.c',
     'src/tunnel/udp.c',
@@ -144,7 +148,12 @@ test_tunnel_loopback = executable('test_tunnel_loopback',
     'src/core/log.c',
     'src/core/packet.c',
     'src/core/time.c',
-  ],
+]
+if get_option('dpdk')
+  _tunnel_loopback_srcs += 'src/io/dpdk.c'
+endif
+test_tunnel_loopback = executable('test_tunnel_loopback',
+  _tunnel_loopback_srcs,
   include_directories: inc,
   dependencies: deps,
 )
@@ -246,4 +255,21 @@ if get_option('xdp')
     dependencies: deps,
   )
   test('xsk_io', test_xsk_io)
+endif
+
+# ---------- 测试：DPDK 左手 I/O（仅 -Ddpdk=true） ----------
+# 用 net_null0 vdev：open/tx/rx/close smoke。环境受限（无 EAL/PMD）时 exit 77 skip。
+if get_option('dpdk')
+  test_dpdk_io = executable('test_dpdk_io',
+    [
+      'tests/test_dpdk_io.c',
+      'src/io/dpdk.c',
+      'src/core/log.c',
+      'src/core/packet.c',
+      'src/core/time.c',
+    ],
+    include_directories: inc,
+    dependencies: deps,
+  )
+  test('dpdk_io', test_dpdk_io)
 endif

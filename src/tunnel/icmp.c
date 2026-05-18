@@ -32,6 +32,7 @@
 #include "io/tun.h"
 #include "io/pcap.h"
 #include "io/xsk.h"
+#include "io/dpdk.h"
 #include "pproxy/xsk_filt.h"
 
 #define ICMP_HDR_LEN    8
@@ -64,6 +65,9 @@ struct icmp_ctx {
 #endif
 #ifdef PP_HAVE_XDP
     struct pp_xsk_io       *xsk;
+#endif
+#ifdef PP_HAVE_DPDK
+    struct pp_dpdk_io      *dpdk;
 #endif
 };
 
@@ -206,6 +210,13 @@ static int ic_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         PP_ERROR("icmp tunnel: io=af_xdp requires build with -Dxdp=true");
         return PP_ERR_NOSUPPORT;
 #endif
+    case PP_TIO_DPDK:
+#ifdef PP_HAVE_DPDK
+        break;
+#else
+        PP_ERROR("icmp tunnel: io=dpdk requires build with -Ddpdk=true");
+        return PP_ERR_NOSUPPORT;
+#endif
     case PP_TIO_KERNEL_SOCKET:
         PP_ERROR("icmp tunnel: io=kernel_socket not supported "
                  "(ICMP has no user-space kernel socket path; use raw_socket)");
@@ -246,6 +257,9 @@ static void ic_close(void *ctx)
 #endif
 #ifdef PP_HAVE_XDP
     if (c->cfg.io == PP_TIO_AF_XDP) { pp_xsk_io_free(c->xsk); c->xsk = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) { pp_dpdk_io_free(c->dpdk); c->dpdk = NULL; fd_owned_by_helper = true; }
 #endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
@@ -535,11 +549,80 @@ static int xc_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif /* PP_HAVE_XDP */
 
+/* -------------------- dpdk 路径 -------------------- */
+#ifdef PP_HAVE_DPDK
+static int dp_connect(struct icmp_ctx *c)
+{
+    if (c->cfg.mode == PP_TMODE_CLIENT) client_fix_peer(c);
+    int rc = pp_dpdk_io_new(&c->dpdk,
+                            c->cfg.io_cfg.dpdk.port_id,
+                            c->cfg.io_cfg.dpdk.queue_id,
+                            c->cfg.io_cfg.dpdk.nframes,
+                            c->cfg.io_cfg.dpdk.eal_args,
+                            NULL);
+    if (rc != PP_OK) return rc;
+
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        char a[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.listen.addr.u.v4, a, sizeof a);
+        PP_INFO("icmp tunnel bound on %s (dpdk port=%u q=%u id=0x%04x)",
+                a, pp_dpdk_io_get_port(c->dpdk), pp_dpdk_io_get_queue(c->dpdk),
+                c->identifier);
+    } else {
+        char a[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.server.addr.u.v4, a, sizeof a);
+        PP_INFO("icmp tunnel connected (dpdk port=%u q=%u) -> %s id=0x%04x",
+                pp_dpdk_io_get_port(c->dpdk), pp_dpdk_io_get_queue(c->dpdk),
+                a, c->identifier);
+    }
+    return PP_OK;
+}
+
+static int dp_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t body[IC_FRAME_MAX];
+    uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
+    size_t blen = build_icmp_body(body, sizeof body, type,
+                                  c->identifier, c->seq++,
+                                  buf->data, buf->len);
+    if (!blen) return PP_ERR_INVAL;
+    uint8_t frame[IC_FRAME_MAX];
+    uint32_t src_ip_be = c->cfg.listen.addr.u.v4.s_addr;
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t tot = wrap_ip(frame, sizeof frame, src_ip_be, dst_ip_be,
+                         c->ip_id++, body, blen);
+    if (!tot) return PP_ERR_INVAL;
+    int r = pp_dpdk_io_inject_ip(c->dpdk, frame, tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int dp_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    size_t n = 0;
+    const uint8_t *ip = pp_dpdk_io_next_ip(c->dpdk, &n);
+    if (!ip) return 0;
+    uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    if (parse_icmp_rx(ip, n, c, &saddr_be, &body, &body_len) != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server_ic(c, saddr_be, "dpdk");
+    return (int)body_len;
+}
+#endif /* PP_HAVE_DPDK */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int ic_connect(void *ctx)
 {
     struct icmp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? PP_OK : dp_connect(c);
+#endif
     if (c->fd >= 0) return PP_OK;
     switch (c->cfg.io) {
     case PP_TIO_TUN:        return tun_connect(c);
@@ -556,6 +639,9 @@ static int ic_connect(void *ctx)
 static int ic_send(void *ctx, const pp_tun_buf_t *buf)
 {
     struct icmp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? dp_send(c, buf) : PP_ERR_CLOSED;
+#endif
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
     case PP_TIO_TUN:        return tun_send(c, buf);
@@ -572,6 +658,13 @@ static int ic_send(void *ctx, const pp_tun_buf_t *buf)
 static int ic_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 {
     struct icmp_ctx *c = ctx;
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK) {
+        if (!c->dpdk) return PP_ERR_CLOSED;
+        (void)timeout_us;
+        return dp_recv(c, out_buf);
+    }
+#endif
     if (c->fd < 0) return PP_ERR_CLOSED;
 
     if (timeout_us > 0) {
@@ -610,7 +703,8 @@ const pp_tunnel_ops_t pp_tunnel_icmp = {
                        | PP_TIO_MASK_AF_XDP
                        | PP_TIO_MASK_NETMAP
                        | PP_TIO_MASK_PCAP
-                       | PP_TIO_MASK_TUN,
+                       | PP_TIO_MASK_TUN
+                       | PP_TIO_MASK_DPDK,
     .open = ic_open, .close = ic_close,
     .connect = ic_connect, .send = ic_send, .recv = ic_recv,
     .session_close = ic_session_close,

@@ -57,6 +57,9 @@ static void register_backends(void)
 #ifdef PP_HAVE_PCAP
     pp_pkt_io_register(&pp_io_pcap);
 #endif
+#ifdef PP_HAVE_DPDK
+    pp_pkt_io_register(&pp_io_dpdk);
+#endif
     pp_tunnel_register(&pp_tunnel_tcp);
     pp_tunnel_register(&pp_tunnel_udp);
     pp_tunnel_register(&pp_tunnel_icmp);

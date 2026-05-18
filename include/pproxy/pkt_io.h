@@ -34,6 +34,7 @@ typedef enum pp_io_kind {
     PP_IO_AF_XDP     = 2,
     PP_IO_NETMAP     = 3,
     PP_IO_PCAP       = 4,
+    PP_IO_DPDK       = 5,
 } pp_io_kind_t;
 
 /* 配置（联合体便于不同后端复用） */
@@ -75,6 +76,14 @@ typedef struct pp_io_cfg {
             uint8_t     peer_mac[6];/* 注包时填入 Ethernet dst（DLT_EN10MB 需要） */
             bool        has_peer_mac;
         } pcap;
+        struct {
+            uint16_t    port_id;        /* rte_eth_dev port */
+            uint16_t    queue_id;       /* 单 queue 实现，默认 0 */
+            uint32_t    nframes;        /* rte_mempool nelem；含 rx+tx */
+            uint8_t     peer_mac[6];    /* 注包时 Ethernet dst */
+            bool        has_peer_mac;
+            const char *eal_args;       /* 可选；空串/NULL 时用默认 EAL 参数 */
+        } dpdk;
     } u;
     pp_mempool_t *pool;         /* 用于分配 rx mbuf；可为 NULL（后端自带 UMEM 时） */
 } pp_io_cfg_t;
@@ -115,6 +124,7 @@ extern const pp_pkt_io_ops_t pp_io_raw_socket;
 extern const pp_pkt_io_ops_t pp_io_af_xdp;
 extern const pp_pkt_io_ops_t pp_io_netmap;
 extern const pp_pkt_io_ops_t pp_io_pcap;
+extern const pp_pkt_io_ops_t pp_io_dpdk;
 
 #ifdef __cplusplus
 }

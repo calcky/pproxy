@@ -39,6 +39,7 @@ typedef enum pp_tunnel_io {
     PP_TIO_NETMAP        = 3,   /* netmap，零拷贝 */
     PP_TIO_PCAP          = 4,   /* libpcap，BPF 过滤 + pcap_inject */
     PP_TIO_TUN           = 5,   /* 通过 TUN 设备重注入（让内核路由） */
+    PP_TIO_DPDK          = 6,   /* DPDK PMD，独占网卡、busy poll、当前为拷贝版 */
 } pp_tunnel_io_t;
 
 /* I/O 能力位（用于 ops->supported_io_mask） */
@@ -49,6 +50,7 @@ typedef enum pp_tunnel_io {
 #define PP_TIO_MASK_NETMAP          PP_TIO_BIT(PP_TIO_NETMAP)
 #define PP_TIO_MASK_PCAP            PP_TIO_BIT(PP_TIO_PCAP)
 #define PP_TIO_MASK_TUN             PP_TIO_BIT(PP_TIO_TUN)
+#define PP_TIO_MASK_DPDK            PP_TIO_BIT(PP_TIO_DPDK)
 
 /* 判断/字符串化 */
 const char *pp_tunnel_io_name(pp_tunnel_io_t io);
@@ -109,6 +111,12 @@ typedef struct pp_tunnel_cfg {
         struct {
             const char *ifname;        /* 右手 tun 设备名，通常要另起 */
         } tun;
+        struct {
+            uint16_t    port_id;
+            uint16_t    queue_id;
+            uint32_t    nframes;
+            const char *eal_args;
+        } dpdk;
     } io_cfg;
 
     pp_mempool_t *pool;

@@ -1,4 +1,5 @@
 option('xdp',    type: 'boolean', value: false, description: '启用 AF_XDP I/O 后端 (需 libbpf + libxdp)')
 option('pcap',   type: 'boolean', value: false, description: '启用 pcap I/O 后端 (需 libpcap)')
 option('netmap', type: 'boolean', value: false, description: '启用 netmap I/O 后端')
+option('dpdk',   type: 'boolean', value: false, description: '启用 DPDK I/O 后端 (需 libdpdk pkg-config)')
 option('host_repo_abs', type: 'string', value: '', description: '非空时加入 -fdebug-prefix-map：容器 /workspace -> 本机仓库绝对路径（本机/VSCode 调试、避免路径为 /workspace/...）')

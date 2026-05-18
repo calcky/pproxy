@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libbpf-dev \
         libxdp-dev \
         libpcap-dev \
+        libdpdk-dev \
         clang \
         llvm \
         linux-libc-dev \
