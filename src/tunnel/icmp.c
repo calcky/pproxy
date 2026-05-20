@@ -559,7 +559,8 @@ static int dp_connect(struct icmp_ctx *c)
                             c->cfg.io_cfg.dpdk.queue_id,
                             c->cfg.io_cfg.dpdk.nframes,
                             c->cfg.io_cfg.dpdk.eal_args,
-                            NULL);
+                            c->cfg.io_cfg.dpdk.has_peer_mac
+                                ? c->cfg.io_cfg.dpdk.peer_mac : NULL);
     if (rc != PP_OK) return rc;
 
     if (c->cfg.mode == PP_TMODE_SERVER) {

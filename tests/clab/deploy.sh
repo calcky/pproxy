@@ -299,18 +299,24 @@ require sshpass "sshpass"
 require scp "openssh-client"
 require containerlab "containerlab (https://containerlab.dev)"
 
-# 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap）
+# 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap；左右手任一为 dpdk 时追加 --dpdk）
 if [[ "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
-  echo "=== [0/5] Host: $REPO_ROOT/build.sh --xdp --pcap --debug ==="
-  (cd "$REPO_ROOT" && ./build.sh --xdp --pcap --debug)
+  BUILD_ARGS=(--xdp --pcap --debug)
+  if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    BUILD_ARGS+=(--dpdk)
+  fi
+  echo "=== [0/5] Host: $REPO_ROOT/build.sh ${BUILD_ARGS[*]} ==="
+  (cd "$REPO_ROOT" && ./build.sh "${BUILD_ARGS[@]}")
 fi
 
 echo "=== [1/5] Deploying containerlab topology ==="
 if [[ "${CLAB_SUDO:-0}" == "1" ]]; then
   echo "  (using: sudo containerlab …; set CLAB_SUDO=0 to try without sudo)"
+  sudo containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
   sudo containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
 else
   echo "  (using: containerlab without sudo; need root? set CLAB_SUDO=1)"
+  containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
   containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
 fi
 
@@ -340,8 +346,10 @@ configure_ubuntu_leaf() {
   local gw=$5
   local peer_lan_cidr=${6:-}
   local peer_uplink_cidr=${7:-}
+  # 1=WAN 留给 DPDK：仍 link up 但不配 IP/路由/MASQUERADE（避免与 vfio-pci 接管冲突）
+  local wan_for_dpdk=${8:-0}
 
-  echo "  Configuring ${label} (WAN=${wan_cidr}, LAN=${lan_cidr}, GW=${gw}) …"
+  echo "  Configuring ${label} (WAN=${wan_cidr}, LAN=${lan_cidr}, GW=${gw}, wan_for_dpdk=${wan_for_dpdk}) …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" bash -s <<EOF
 set -euo pipefail
 WAN_CIDR='${wan_cidr}'
@@ -350,6 +358,7 @@ GW='${gw}'
 LABEL='${label}'
 PEER_LAN='${peer_lan_cidr}'
 PEER_UPLINK='${peer_uplink_cidr}'
+WAN_FOR_DPDK='${wan_for_dpdk}'
 SUDO_PASS='${UBUNTU_PASS}'
 s() { printf '%s\n' "\$SUDO_PASS" | sudo -S "\$@"; }
 
@@ -371,28 +380,41 @@ fi
 WAN="\${DATA[0]}"
 LAN="\${DATA[1]}"
 
-s ip addr flush dev "\$WAN" 2>/dev/null || true
-s ip addr add "\$WAN_CIDR" dev "\$WAN"
-s ip link set "\$WAN" up
+if [[ "\$WAN_FOR_DPDK" == "1" ]]; then
+  s ip addr flush dev "\$WAN" 2>/dev/null || true
+  s ip link set "\$WAN" up
+  echo "OK \${LABEL}: WAN=\$WAN (leave for DPDK; no IP/route/MASQ) LAN=\$LAN"
+else
+  s ip addr flush dev "\$WAN" 2>/dev/null || true
+  s ip addr add "\$WAN_CIDR" dev "\$WAN"
+  s ip link set "\$WAN" up
+fi
 
 s ip addr flush dev "\$LAN" 2>/dev/null || true
 s ip addr add "\$LAN_CIDR" dev "\$LAN"
 s ip link set "\$LAN" up
 
-if [[ -n "\$PEER_LAN" ]]; then
-  s ip route replace "\$PEER_LAN" via "\$GW" dev "\$WAN" 2>/dev/null || true
-fi
-if [[ -n "\$PEER_UPLINK" ]]; then
-  s ip route replace "\$PEER_UPLINK" via "\$GW" dev "\$WAN" 2>/dev/null || true
+# ip_forward 与 WAN 无关：left=tun 时 client→LAN→ppclab 也需要它
+s sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+# WAN 留给 DPDK 时，下面的路由/MASQ 都依附在 WAN 上，整段跳过
+if [[ "\$WAN_FOR_DPDK" != "1" ]]; then
+  if [[ -n "\$PEER_LAN" ]]; then
+    s ip route replace "\$PEER_LAN" via "\$GW" dev "\$WAN" 2>/dev/null || true
+  fi
+  if [[ -n "\$PEER_UPLINK" ]]; then
+    s ip route replace "\$PEER_UPLINK" via "\$GW" dev "\$WAN" 2>/dev/null || true
+  fi
+  if s iptables -t nat -C POSTROUTING -o "\$WAN" -j MASQUERADE 2>/dev/null; then
+    :
+  else
+    s iptables -t nat -A POSTROUTING -o "\$WAN" -j MASQUERADE
+  fi
+  echo "OK \${LABEL}: WAN=\$WAN LAN=\$LAN"
 fi
 
-s sysctl -w net.ipv4.ip_forward=1 >/dev/null
-if s iptables -t nat -C POSTROUTING -o "\$WAN" -j MASQUERADE 2>/dev/null; then
-  :
-else
-  s iptables -t nat -A POSTROUTING -o "\$WAN" -j MASQUERADE
-fi
-echo "OK \${LABEL}: WAN=\$WAN LAN=\$LAN"
+# WAN/LAN devname 给宿主侧 capture（PPDEV: 行）；prefix 不变方便 grep
+echo "PPDEV: \${LABEL} WAN=\$WAN LAN=\$LAN"
 EOF
   echo "  ✓ ${label} done"
 }
@@ -404,9 +426,9 @@ leaf_install_pwru() {
   tmp=$(mktemp -d)
   tgz="$tmp/pwru.tgz"
   if ! curl -fsSL "$PWRU_URL" -o "$tgz"; then
-    echo "  ✗ pwru: download failed" >&2
+    echo "  ⚠ pwru: download failed（网络问题，可选 debug 工具，跳过不影响 pproxy）" >&2
     rm -rf "$tmp"
-    exit 1
+    return 0
   fi
   local rhost
   for rhost in "$LEAF1_HOST" "$LEAF2_HOST"; do
@@ -449,33 +471,121 @@ if ! s apt-get install -y -qq xdp-tools bpftrace; then
   echo "  … note: xdp-tools/bpftrace install failed (optional; check apt sources / release)" >&2
 fi
 if [[ "$NEED_DPDK" == "1" ]]; then
-  # DPDK 运行时库 + dpdk-devbind/dpdk-hugepages 工具；24.04 默认即可
-  s apt-get install -y -qq libdpdk23 dpdk dpdk-kmods-dkms 2>/dev/null \
-    || s apt-get install -y -qq libdpdk23 dpdk \
+  # dpdk metapackage 通过 Recommends 拉对应 ABI 的 librte-*（Debian12→.so.23, Ubuntu24.04→.so.24）；
+  # 别再写死 libdpdk23，Ubuntu noble 没这个名字
+  s apt-get install -y -qq dpdk dpdk-kmods-dkms 2>/dev/null \
     || s apt-get install -y -qq dpdk \
-    || echo "  ✗ DPDK 包安装失败（请人工执行 apt install libdpdk23 dpdk）" >&2
+    || echo "  ✗ DPDK 包安装失败（请人工执行 apt install dpdk）" >&2
 fi
 EOA
 }
 
-# DPDK 运行依赖：hugepages + vfio-pci；不绑定具体网卡（部署里没有真实 SR-IOV NIC，留给用户/CI）
+# DPDK 运行依赖：hugepages + vfio + vfio-pci（含 QEMU virtio 用的 no-IOMMU 模式）；不绑定具体网卡
 pproxy_dpdk_runtime_setup() {
   local host=$1
-  echo "  pproxy: dpdk runtime: 1024 hugepages(2M) + vfio-pci on ${host} …"
+  echo "  pproxy: dpdk runtime: 1024 hugepages(2M) + vfio (no-IOMMU) + vfio-pci on ${host} …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
     bash -s -- "$UBUNTU_PASS" <<'EOD'
 set -euo pipefail
 SUDO_PASS="$1"
 s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
-s sh -c 'echo 1024 > /proc/sys/vm/nr_hugepages' 2>/dev/null \
+# 先把之前残留的 pproxy 干掉释放 hugepage，再 reset 一下 nr_hugepages（避免碎片）
+s pkill -9 -f '/opt/pproxy/pproxy' 2>/dev/null || true
+s pkill -9 -f gdbserver 2>/dev/null || true
+sleep 0.3
+# 64 个 2M hugepage = 128MB，刚好覆盖 nframes=2048 (~5MB)+EAL 内部开销，留够 RAM 给 apt/pproxy
+s sh -c 'echo 0 > /proc/sys/vm/nr_hugepages' 2>/dev/null || true
+s sh -c 'echo 64 > /proc/sys/vm/nr_hugepages' 2>/dev/null \
   || echo "  ✗ 写 nr_hugepages 失败（内核可能未启用 hugetlb 或权限不足）" >&2
+GOT=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo 0)
+if [[ "$GOT" -lt 16 ]]; then
+  echo "  ⚠ nr_hugepages 实际仅 $GOT 个 (2M)；VM RAM 太小，DPDK mempool 可能 ENOMEM" >&2
+fi
 s mkdir -p /mnt/huge 2>/dev/null || true
 s mountpoint -q /mnt/huge || s mount -t hugetlbfs none /mnt/huge 2>/dev/null \
   || echo "  ⚠ /mnt/huge 挂载失败（DPDK 仍会用 --in-memory 启动）" >&2
+# QEMU virtio guest 没有 IOMMU；vfio 必须开 unsafe no-iommu 才能绑 PCI 设备
+s modprobe vfio enable_unsafe_noiommu_mode=1 2>/dev/null \
+  || s sh -c 'echo Y > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode' 2>/dev/null \
+  || echo "  ⚠ 无法启用 vfio no-IOMMU 模式（VFIO 绑卡可能失败）" >&2
 s modprobe vfio-pci 2>/dev/null \
-  || echo "  ⚠ modprobe vfio-pci 失败（容器/受限内核可能不支持；可改用 net_pcap vdev 测试）" >&2
+  || echo "  ⚠ modprobe vfio-pci 失败（容器/受限内核可能不支持）" >&2
 echo "  pproxy: dpdk runtime ready on $(hostname)"
 EOD
+}
+
+# 探测 leaf 上的 WAN devname / WAN MAC / WAN PCI；DPDK 接管前调；输出到调用方 stdout 由调用方 capture
+# 格式: "WAN_DEV WAN_MAC PCI_ADDR"
+probe_leaf_wan_info() {
+  local host=$1
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" bash -s <<'EOI'
+set -euo pipefail
+MGT_DEV=$(ip -4 route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
+readarray -t ALL < <(ip -br link | awk '$1 != "lo" { print $1 }' | sort)
+DATA=()
+for i in "${ALL[@]}"; do
+  [[ -n "$MGT_DEV" && "$i" == "$MGT_DEV" ]] && continue
+  DATA+=("$i")
+done
+[[ ${#DATA[@]} -lt 2 && ${#ALL[@]} -ge 3 ]] && DATA=("${ALL[1]}" "${ALL[2]}")
+WAN="${DATA[0]}"
+MAC=$(cat "/sys/class/net/$WAN/address")
+# /sys/class/net/<if>/device 对 virtio 来说是 virtio<N>（不是 PCI 地址）；向上走找第一个 PCI 节点
+P=$(readlink -f "/sys/class/net/$WAN/device" 2>/dev/null || echo "")
+PCI=""
+while [[ -n "$P" && "$P" != "/" ]]; do
+  B=$(basename "$P")
+  if [[ "$B" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
+    PCI="$B"
+    break
+  fi
+  P=$(dirname "$P")
+done
+echo "$WAN $MAC $PCI"
+EOI
+}
+
+# 把 leaf 上指定 PCI 设备从 virtio-net 解绑、绑到 vfio-pci。需先调用 pproxy_dpdk_runtime_setup。
+pproxy_dpdk_bind_wan() {
+  local host=$1
+  local wan_dev=$2
+  local pci=$3
+  echo "  pproxy: bind ${host}:${wan_dev} (${pci}) → vfio-pci …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$wan_dev" "$pci" <<'EOB'
+set -euo pipefail
+PASS="$1"; WAN="$2"; PCI="$3"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s ip link set "$WAN" down 2>/dev/null || true
+DEVBIND=""
+for p in /usr/share/dpdk/usertools/dpdk-devbind.py /usr/bin/dpdk-devbind.py /usr/local/bin/dpdk-devbind.py; do
+  [[ -x "$p" || -f "$p" ]] && DEVBIND="$p" && break
+done
+if [[ -z "$DEVBIND" ]]; then
+  echo "  ✗ dpdk-devbind.py 未找到（请确认 apt install dpdk 成功）" >&2
+  exit 1
+fi
+s python3 "$DEVBIND" --bind=vfio-pci "$PCI"
+s python3 "$DEVBIND" --status-dev net | head -40
+EOB
+}
+
+# router 容器写两条静态 ARP：leaf{1,2} 的 WAN IP → 各自 WAN MAC（DPDK 接管后内核 ARP 学不到）
+# 同时返回 router 在 eth1/eth2 上的 MAC，给 leaf 侧 pproxy 配 peer_mac
+router_set_static_arp() {
+  local leaf1_ip=$1
+  local leaf1_mac=$2
+  local leaf2_ip=$3
+  local leaf2_mac=$4
+  echo "  pproxy: router 静态 ARP: ${leaf1_ip}→${leaf1_mac} (eth1), ${leaf2_ip}→${leaf2_mac} (eth2) …"
+  docker exec router sh -c "ip neigh replace ${leaf1_ip} lladdr ${leaf1_mac} nud permanent dev eth1 \
+                         && ip neigh replace ${leaf2_ip} lladdr ${leaf2_mac} nud permanent dev eth2" >/dev/null
+}
+
+# 取 router 容器内 eth1/eth2 的 MAC，作为 leaf1/leaf2 pproxy 的 peer_mac（next-hop）
+router_iface_mac() {
+  local ifname=$1
+  docker exec router cat "/sys/class/net/${ifname}/address"
 }
 
 pproxy_remote_prepare() {
@@ -545,6 +655,30 @@ rm -f /tmp/pproxy-xdpcap
 EOD
 }
 
+# DPDK：基于 pp{1,2}.udp.left-tun.right-dpdk.json 模板渲染：填入 PCI / peer_mac / 显式 listen
+# 输出: dst 路径覆盖写入
+dpdk_render_cfg() {
+  local src=$1
+  local dst=$2
+  local pci=$3
+  local peer_mac=$4
+  local listen=$5
+  python3 - "$src" "$dst" "$pci" "$peer_mac" "$listen" <<'PY'
+import json, sys
+src, dst, pci, mac, listen = sys.argv[1:6]
+with open(src, encoding='utf-8') as f:
+    d = json.load(f)
+t = d['tunnels'][0]
+io = t.setdefault('io_cfg', {})
+io['eal_args'] = f"pproxy -l 0,1 -a {pci} --proc-type=primary --in-memory"
+io['peer_mac'] = mac
+if listen:
+    t['listen'] = listen
+with open(dst, 'w', encoding='utf-8') as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
 pproxy_push_cfgs() {
   if [[ ! -f "$PP1_JSON" ]] || [[ ! -f "$PP2_JSON" ]]; then
     echo "  ✗ 缺少配置: $PP1_JSON 或 $PP2_JSON" >&2
@@ -558,12 +692,37 @@ pproxy_push_cfgs() {
     python3 -c "import json,sys; [json.load(open(f,encoding='utf-8')) for f in sys.argv[1:]]" \
       "$PP1_JSON" "$PP2_JSON" || { echo "  ✗ JSON 校验失败: $PP1_JSON / $PP2_JSON" >&2; exit 1; }
   fi
-  echo "  pproxy: scp 配置 $PP1_JSON → ${LEAF1_HOST}:${VM_PP1_CFG} …"
-  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$PP1_JSON" \
+
+  local pp1_src=$PP1_JSON
+  local pp2_src=$PP2_JSON
+  # right=dpdk: 渲染一份带 PCI/peer_mac/显式 listen 的 JSON 到 /tmp 再 scp。
+  # 依赖全局: DPDK_LEAF1_PCI, DPDK_LEAF2_PCI, DPDK_LEAF1_PEER_MAC, DPDK_LEAF2_PEER_MAC
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    : "${DPDK_LEAF1_PCI:?dpdk push: DPDK_LEAF1_PCI 未设置 (probe 漏了?)}"
+    : "${DPDK_LEAF2_PCI:?dpdk push: DPDK_LEAF2_PCI 未设置}"
+    : "${DPDK_LEAF1_PEER_MAC:?dpdk push: DPDK_LEAF1_PEER_MAC 未设置}"
+    : "${DPDK_LEAF2_PEER_MAC:?dpdk push: DPDK_LEAF2_PEER_MAC 未设置}"
+    local tmp1=$(mktemp --suffix=.json)
+    local tmp2=$(mktemp --suffix=.json)
+    dpdk_render_cfg "$PP1_JSON" "$tmp1" "$DPDK_LEAF1_PCI" "$DPDK_LEAF1_PEER_MAC" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    # leaf2 client: listen 显式给 leaf2 WAN IP，端口 0 让 pproxy 随机
+    dpdk_render_cfg "$PP2_JSON" "$tmp2" "$DPDK_LEAF2_PCI" "$DPDK_LEAF2_PEER_MAC" "172.16.1.2:0"
+    pp1_src=$tmp1
+    pp2_src=$tmp2
+    echo "  pproxy: DPDK 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("listen"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
+    echo "  pproxy: DPDK 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("listen"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
+  fi
+
+  echo "  pproxy: scp 配置 $pp1_src → ${LEAF1_HOST}:${VM_PP1_CFG} …"
+  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$pp1_src" \
     "${UBUNTU_USER}@${LEAF1_HOST}:${VM_PP1_CFG}"
-  echo "  pproxy: scp 配置 $PP2_JSON → ${LEAF2_HOST}:${VM_PP2_CFG} …"
-  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$PP2_JSON" \
+  echo "  pproxy: scp 配置 $pp2_src → ${LEAF2_HOST}:${VM_PP2_CFG} …"
+  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$pp2_src" \
     "${UBUNTU_USER}@${LEAF2_HOST}:${VM_PP2_CFG}"
+
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    rm -f "${pp1_src}" "${pp2_src}"
+  fi
 }
 
 pproxy_start() {
@@ -771,8 +930,49 @@ wait_for_ssh leaf2 "$LEAF2_HOST"
 
 echo ""
 echo "=== [3/5] Applying Ubuntu data-plane configuration ==="
-configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24"
-configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24"
+WAN_FOR_DPDK=0
+if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+  WAN_FOR_DPDK=1
+fi
+configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24" "$WAN_FOR_DPDK"
+configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24" "$WAN_FOR_DPDK"
+
+if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+  echo ""
+  echo "=== [3.5/5] DPDK: probe → runtime → bind vfio-pci → router static ARP ==="
+  # 探测两端 WAN devname/MAC/PCI（DPDK 接管前内核 sysfs 还可见）
+  read -r LEAF1_WAN_DEV DPDK_LEAF1_WAN_MAC DPDK_LEAF1_PCI < <(probe_leaf_wan_info "$LEAF1_HOST")
+  read -r LEAF2_WAN_DEV DPDK_LEAF2_WAN_MAC DPDK_LEAF2_PCI < <(probe_leaf_wan_info "$LEAF2_HOST")
+  echo "  leaf1: WAN=${LEAF1_WAN_DEV} MAC=${DPDK_LEAF1_WAN_MAC} PCI=${DPDK_LEAF1_PCI}"
+  echo "  leaf2: WAN=${LEAF2_WAN_DEV} MAC=${DPDK_LEAF2_WAN_MAC} PCI=${DPDK_LEAF2_PCI}"
+  if [[ -z "$DPDK_LEAF1_PCI" || -z "$DPDK_LEAF2_PCI" ]]; then
+    echo "  ✗ probe 未拿到 PCI 地址（leaf 上 /sys/class/net/<wan>/device readlink 失败？）" >&2
+    exit 1
+  fi
+
+  # 用 router 容器内 eth1/eth2 的 MAC 作为各 leaf 的 next-hop peer_mac
+  DPDK_LEAF1_PEER_MAC=$(router_iface_mac eth1)
+  DPDK_LEAF2_PEER_MAC=$(router_iface_mac eth2)
+  echo "  router: eth1 MAC=${DPDK_LEAF1_PEER_MAC} (leaf1 next-hop); eth2 MAC=${DPDK_LEAF2_PEER_MAC} (leaf2 next-hop)"
+  if [[ -z "$DPDK_LEAF1_PEER_MAC" || -z "$DPDK_LEAF2_PEER_MAC" ]]; then
+    echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2
+    exit 1
+  fi
+
+  # dpdk-devbind.py 来自 apt install dpdk；提前装好，pproxy_smoke 里会再走一遍也无害
+  pproxy_apt_deps "$LEAF1_HOST" 1
+  pproxy_apt_deps "$LEAF2_HOST" 1
+  pproxy_dpdk_runtime_setup "$LEAF1_HOST"
+  pproxy_dpdk_runtime_setup "$LEAF2_HOST"
+  pproxy_dpdk_bind_wan "$LEAF1_HOST" "$LEAF1_WAN_DEV" "$DPDK_LEAF1_PCI"
+  pproxy_dpdk_bind_wan "$LEAF2_HOST" "$LEAF2_WAN_DEV" "$DPDK_LEAF2_PCI"
+
+  # DPDK 接管后 leaf 不再回应 ARP；router 必须有静态 ARP 才能往 leaf WAN 转发包
+  router_set_static_arp "172.16.0.2" "$DPDK_LEAF1_WAN_MAC" \
+                        "172.16.1.2" "$DPDK_LEAF2_WAN_MAC"
+
+  export DPDK_LEAF1_PCI DPDK_LEAF2_PCI DPDK_LEAF1_PEER_MAC DPDK_LEAF2_PEER_MAC
+fi
 
 echo ""
 echo "  pwru (eBPF helper): install to /usr/bin on both leaves"

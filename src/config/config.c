@@ -383,12 +383,25 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
         case PP_TIO_TUN:
             cfg->io_cfg.tun.ifname = dup_to_rt(rt, jstr(ioc, "ifname", "pp-tx0"));
             break;
-        case PP_TIO_DPDK:
+        case PP_TIO_DPDK: {
             cfg->io_cfg.dpdk.port_id  = (uint16_t)jint(ioc, "port_id", 0);
             cfg->io_cfg.dpdk.queue_id = (uint16_t)jint(ioc, "queue_id", 0);
             cfg->io_cfg.dpdk.nframes  = (uint32_t)jint(ioc, "nframes", 8192);
             cfg->io_cfg.dpdk.eal_args = dup_to_rt(rt, jstr(ioc, "eal_args", NULL));
+            const char *mac = jstr(ioc, "peer_mac", NULL);
+            if (mac && mac[0]) {
+                unsigned m[6] = {0};
+                if (sscanf(mac, "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    for (int i = 0; i < 6; i++)
+                        cfg->io_cfg.dpdk.peer_mac[i] = (uint8_t)m[i];
+                    cfg->io_cfg.dpdk.has_peer_mac = true;
+                } else {
+                    PP_WARN("config: tunnel.io_cfg.peer_mac='%s' invalid, ignored", mac);
+                }
+            }
             break;
+        }
         case PP_TIO_KERNEL_SOCKET:
         default:
             break;

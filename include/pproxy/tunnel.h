@@ -116,6 +116,8 @@ typedef struct pp_tunnel_cfg {
             uint16_t    queue_id;
             uint32_t    nframes;
             const char *eal_args;
+            uint8_t     peer_mac[6];
+            bool        has_peer_mac;     /* 静态 next-hop MAC：DPDK 接管 NIC 后无内核 ARP，必须显式给 */
         } dpdk;
     } io_cfg;
 

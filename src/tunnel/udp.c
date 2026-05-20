@@ -685,7 +685,8 @@ static int dp_connect(struct udp_ctx *c)
                             c->cfg.io_cfg.dpdk.queue_id,
                             c->cfg.io_cfg.dpdk.nframes,
                             c->cfg.io_cfg.dpdk.eal_args,
-                            NULL);
+                            c->cfg.io_cfg.dpdk.has_peer_mac
+                                ? c->cfg.io_cfg.dpdk.peer_mac : NULL);
     if (rc != PP_OK) return rc;
     /* DPDK 无 fd；c->fd 保持 -1，dispatch 通过 c->cfg.io == PP_TIO_DPDK 早期 case 处理。 */
 

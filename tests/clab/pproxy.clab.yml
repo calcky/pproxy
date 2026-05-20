@@ -30,11 +30,13 @@ topology:
       image: vrnetlab/canonical_ubuntu:noble
       env:
         QEMU_SMP: 4
+        QEMU_MEMORY: 1024
     leaf2:
       kind: generic_vm
       image: vrnetlab/canonical_ubuntu:noble
       env:
         QEMU_SMP: 4
+        QEMU_MEMORY: 1024
     router:
       kind: linux
       exec:
