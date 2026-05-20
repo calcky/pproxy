@@ -102,7 +102,26 @@ ensure_image() {
         err "docker not found; use --native or install docker"
         exit 1
     fi
-    if [[ $REBUILD_IMG -eq 1 ]] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    local need_build=0
+    if [[ $REBUILD_IMG -eq 1 ]]; then
+        need_build=1
+    elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        need_build=1
+    else
+        # Dockerfile 比镜像新（apt 包变动）→ 自动重建，避免容器内缺 clang/libxdp 等
+        local img_created
+        img_created=$(docker image inspect -f '{{.Created}}' "$IMAGE" 2>/dev/null || echo "")
+        if [[ -n "$img_created" ]]; then
+            local img_epoch dockerfile_epoch
+            img_epoch=$(date -d "$img_created" +%s 2>/dev/null || echo 0)
+            dockerfile_epoch=$(stat -c %Y Dockerfile 2>/dev/null || echo 0)
+            if [[ "$dockerfile_epoch" -gt "$img_epoch" ]]; then
+                log "Dockerfile newer than image → rebuilding $IMAGE"
+                need_build=1
+            fi
+        fi
+    fi
+    if [[ $need_build -eq 1 ]]; then
         log "building docker image $IMAGE"
         docker build -t "$IMAGE" -f Dockerfile .
     fi

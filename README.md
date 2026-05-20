@@ -95,7 +95,7 @@ pproxy/
 │   │   ├── raw_sock.c / raw_sock.h# 左手 AF_PACKET (stub) + 右手 AF_INET SOCK_RAW
 │   │   ├── ks_sock.c / ks_sock.h  # 右手 kernel socket (UDP/TCP)
 │   │   ├── xsk.c / xsk.h          # AF_XDP
-│   │   ├── netmap.c               # netmap (stub)
+│   │   ├── netmap.c / netmap.h    # netmap（vendored 头，nm_open API）
 │   │   └── pcap.c / pcap.h        # libpcap
 │   ├── tunnel/                    # 右手 transport（被 right_rx/right_tx 调用）
 │   │   ├── tcp.c
@@ -180,20 +180,22 @@ typedef struct tunnel_ops {
 `tunnel_ops_t` 只负责 **proto 编码**（怎么把 `sid + payload` 装成 TCP/UDP/ICMP 报文）；
 具体怎么把字节发出去由 `cfg.io` 决定，proto 实现内部按 `io` 派发到下面这层：
 
-| proto \ io  | kernel_socket | raw_socket   | tun            | pcap            | af_xdp           | netmap | dpdk            |
-|-------------|:-------------:|:------------:|:--------------:|:---------------:|:----------------:|:------:|:---------------:|
-| `tcp`       | ✓ 已实现       | —            | —              | —               | —                | —      | —               |
-| `udp`       | ✓ 已实现       | ✓ 已实现      | ✓ 已实现        | ✓ 已实现\*       | ✓ 已实现\*\*      | ○ 计划中 | ✓ 已实现\*\*\* (拷贝版) |
-| `icmp`      | —             | ✓ 已实现      | ✓ 已实现        | ✓ 已实现\*       | ✓ 已实现\*\*      | ○ 计划中 | ✓ 已实现\*\*\* (拷贝版) |
+| proto \ io  | kernel_socket | raw_socket | tun       | pcap        | af_xdp       | netmap        | dpdk            |
+|-------------|:-------------:|:----------:|:---------:|:-----------:|:------------:|:-------------:|:---------------:|
+| `tcp`       | ✓ 已实现       | —          | —         | —           | —            | —             | —               |
+| `udp`       | ✓ 已实现       | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) |
+| `icmp`      | —             | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) |
 
 图例：`✓` 已落地（带回环测试或冒烟测试）；`○` `supported_io_mask` 里挂了位，但 `open()` 会
 返回 `PP_ERR_NOSUPPORT` 直到具体实现补上；`—` 架构上不支持。
-`*`     = 需要 `./build.sh --pcap`（启用 libpcap 链接）。
-`**`    = 需要 `./build.sh --xdp`（启用 libxdp + libbpf 链接），且运行环境需 `CAP_NET_ADMIN + CAP_BPF`
-        且接口支持 XDP（`lo` 一般不行，veth/真实网卡可）。
-`***`   = 需要 `./build.sh --dpdk`（启用 libdpdk pkg-config 链接）+ 运行时 hugepages + 已 vfio-pci 绑定的数据网卡。
-          当前是「拷贝版」（rx 把 rte_mbuf memcpy 进 pp_pkt_t，tx 反向），未实现零拷贝。
-          DPDK 接管网卡后内核不可见，不能与 `kernel_socket` 共用同一张卡。
+`*`       = 需要 `./build.sh --pcap`（启用 libpcap 链接）。
+`**`      = 需要 `./build.sh --xdp`（启用 libxdp + libbpf 链接），且运行环境需 `CAP_NET_ADMIN + CAP_BPF`
+            且接口支持 XDP（`lo` 一般不行，veth/真实网卡可）。
+`***`     = 需要 `./build.sh --netmap`（启用 vendored 头文件，无需系统库），且运行环境需内核加载
+            `netmap` 模块、提供 `/dev/netmap`，以及 `CAP_NET_ADMIN`。
+`****`    = 需要 `./build.sh --dpdk`（启用 libdpdk pkg-config 链接）+ 运行时 hugepages + 已 vfio-pci 绑定的数据网卡。
+            当前是「拷贝版」（rx 把 rte_mbuf memcpy 进 pp_pkt_t，tx 反向），未实现零拷贝。
+            DPDK 接管网卡后内核不可见，不能与 `kernel_socket` 共用同一张卡。
 
 > - `tcp` 只能走 `kernel_socket`：TCP 状态机在内核里，除非自带用户态 TCP 栈。
 > - `udp` / `icmp` 的 `kernel_socket` 省事、`raw_socket` 绕过 UDP socket 缓存且可自定义端口/IP 头；
@@ -432,12 +434,15 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 镜像内（`Dockerfile` 自动安装）：
 - `gcc` + `libc6-dev` + `meson` + `ninja-build` + `pkg-config`
 - `libbpf-dev` + `libxdp-dev` + `libpcap-dev` + `libdpdk-dev`（可选后端用）
+- netmap 不依赖系统包：`./build.sh --netmap` 直接复用 `third_party/netmap/` 下 vendored
+  的 `<net/netmap_user.h>` (BSD-2-Clause)，无 `-lnetmap`。
 
 #### 运行时权限
 
 - 默认（tun）：`CAP_NET_ADMIN`
 - raw_socket：`CAP_NET_RAW`
 - AF_XDP：`CAP_BPF`（5.8+）或 root
+- netmap：`CAP_NET_ADMIN` + 内核加载 `netmap` 模块（提供 `/dev/netmap`）
 - DPDK：root（或 vfio-pci 配好 + 用户在 vfio 设备组）；运行时需 hugepages（`echo N > /proc/sys/vm/nr_hugepages`）和已绑定到 `vfio-pci` 的网卡。`./build.sh --dpdk` 启用编译
 
 #### 构建文件说明
@@ -460,19 +465,21 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 - [x] DPI 插件框架（`dns` / `tls` / `http` 占位，可通过 config 热启停/改优先级）
 - [x] `right_*` 后端：
   - TCP：`kernel_socket`
-  - UDP：`kernel_socket` / `raw_socket` / `tun` / `pcap` / `af_xdp`
-  - ICMP：`raw_socket` / `tun` / `pcap` / `af_xdp`
-  - 三者都有 client + server 模式；`pcap` 需 `./build.sh --pcap`，`af_xdp` 需 `./build.sh --xdp`
+  - UDP：`kernel_socket` / `raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap`
+  - ICMP：`raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap`
+  - 三者都有 client + server 模式；`pcap` 需 `./build.sh --pcap`，`af_xdp` 需 `./build.sh --xdp`，`netmap` 需 `./build.sh --netmap`
 - [x] timer wheel + 会话老化（简化版）
 - [x] mgmt：Unix socket 文本接口（`help` / `stat` / `sessions` / `reload [path]` / `quit`）
 - [x] JSON 配置加载（yyjson）+ CPU 亲和性
 - [x] 配置热重载（log.level / session.\*\_ttl\_ms / dpi.plugins[].enable）
 - [ ] DPI 插件实体化：TLS SNI 真正解析、HTTP Host、DNS QNAME / 返回 IP
-- [ ] 右手侧剩余 io：netmap（enum + supported\_io\_mask 已就位，等实现）；
-      AF\_XDP 当前实现是 copy-mode 单 queue + libxdp 默认 redirect 程序，
-      后续优化：多 queue 聚合、真实 peer MAC 学习、zero-copy 状态反馈
+- [x] 右手侧剩余 io：netmap（vendored header-only，nm\_open API；UDP/ICMP client+server）
 - [x] 左/右手 DPDK 后端（拷贝版、单 queue；`./build.sh --dpdk`）；
       待办：零拷贝（让 `pp_pkt_t` 挂载 `rte_mbuf`）、多 queue / RSS、用户态 ARP（当前需 `peer_mac` 静态配置）
+- [ ] netmap / AF\_XDP 优化：多 ring 聚合、zero-copy 直通（当前左手 rx 仍拷贝到 mempool）、
+      真实 peer MAC 学习改进
+- [x] 左手侧 I/O 后端 vtable：`tun` / `raw_socket` / `af_xdp` / `pcap` / `netmap` 均已注册
+- [ ] 左手侧 left_rx/left_tx 端到端打通剩余后端的 e2e 测试
 - [ ] 左手侧 I/O 后端：raw\_socket（AF\_PACKET）完整实现 → AF\_XDP → netmap → pcap
 - [ ] tunnel 协议：KCP / QUIC 封装（目前只有 TCP/UDP/ICMP 的 `proto`）
 - [x] mgmt：Prometheus exporter（`mgmt.metrics.enable`，HTTP `/metrics`）

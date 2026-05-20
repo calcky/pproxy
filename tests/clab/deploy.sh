@@ -299,11 +299,15 @@ require sshpass "sshpass"
 require scp "openssh-client"
 require containerlab "containerlab (https://containerlab.dev)"
 
-# 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap；左右手任一为 dpdk 时追加 --dpdk）
+# 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap；
+# 左右手任一为 dpdk/netmap 时分别追加 --dpdk / --netmap）
 if [[ "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
   BUILD_ARGS=(--xdp --pcap --debug)
   if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
     BUILD_ARGS+=(--dpdk)
+  fi
+  if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+    BUILD_ARGS+=(--netmap)
   fi
   echo "=== [0/5] Host: $REPO_ROOT/build.sh ${BUILD_ARGS[*]} ==="
   (cd "$REPO_ROOT" && ./build.sh "${BUILD_ARGS[@]}")
@@ -588,6 +592,75 @@ router_iface_mac() {
   docker exec router cat "/sys/class/net/${ifname}/address"
 }
 
+# netmap 内核模块编译/加载（左右手任一为 netmap 时调）
+pproxy_install_netmap() {
+  local host=$1
+  # netmap 上游最近一次 release tag (v13.0 / 2019) 在 Linux 6.x 内核会因为
+  #   `struct timeval` / `do_gettimeofday()` 已被移除而编不过；master 分支的
+  #   LINUX/bsd_glue.h 里有 ktime_get_real_ts64 兼容 shim。
+  # 把 commit hash pin 死，与 third_party/netmap/ 里 vendoring 的头文件保持
+  # 同一 commit（NETMAP_API=14），避免 NIOCREGIF 的 nr_version 不匹配。
+  # 如要更新 netmap 版本：同步修改本变量与 third_party/netmap/README.md。
+  local NM_SHA="10986ec1479b54552333d4cef913bef3dd159727"
+  echo "  pproxy: ensuring netmap kernel module (commit ${NM_SHA:0:12}, --no-drivers) on ${host} …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$NM_SHA" <<'EON'
+set -euo pipefail
+PASS="$1"
+NM_SHA="$2"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+export DEBIAN_FRONTEND=noninteractive
+
+# 已加载就直接走人（幂等）
+if lsmod 2>/dev/null | grep -q '^netmap\b' && [ -e /dev/netmap ]; then
+  echo "  ✓ netmap module already loaded; /dev/netmap present"
+  exit 0
+fi
+
+KREL="$(uname -r)"
+KBUILD="/lib/modules/${KREL}/build"
+
+s apt-get update -qq
+s apt-get install -y -qq build-essential git "linux-headers-${KREL}"
+
+# 双保险：linux-headers-<rel> 偶发未拉到 build 链接，再装一次 generic
+if [ ! -d "$KBUILD" ]; then
+  s apt-get install -y -qq linux-headers-generic || true
+fi
+if [ ! -d "$KBUILD" ]; then
+  echo "  ✗ kernel headers missing at $KBUILD; cannot build netmap.ko" >&2
+  exit 1
+fi
+
+SRC=/usr/local/src/netmap
+# 已存在但 commit 不对（之前装过 v13.0）→ 删掉重 clone
+if [ -d "$SRC" ]; then
+  cur=$(s git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "")
+  if [ "$cur" != "$NM_SHA" ]; then
+    echo "  removing stale $SRC (cur=${cur:0:12} want=${NM_SHA:0:12})"
+    s rm -rf "$SRC"
+  fi
+fi
+if [ ! -d "$SRC" ]; then
+  # 浅 clone master 再 reset 到固定 commit；避免直接 fetch 单 commit 在某些 git 版本上不稳
+  s git clone --depth=200 https://github.com/luigirizzo/netmap.git "$SRC"
+  s git -C "$SRC" -c advice.detachedHead=false checkout "$NM_SHA"
+fi
+
+cd "$SRC/LINUX"
+s ./configure --no-drivers --kernel-dir="$KBUILD"
+s make -j"$(nproc)"
+s make install
+s depmod -a
+s modprobe netmap
+
+# 校验
+ls -l /dev/netmap
+lsmod | grep '^netmap\b' || { echo "  ✗ netmap not in lsmod" >&2; exit 1; }
+echo "  ✓ netmap kernel module loaded"
+EON
+}
+
 pproxy_remote_prepare() {
   local host=$1
   echo "  pproxy: mkdir $VM_PPROXY_ROOT on ${host} …"
@@ -843,6 +916,10 @@ pproxy_smoke() {
   fi
   pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK"
   pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK"
+  if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+    pproxy_install_netmap "$LEAF1_HOST"
+    pproxy_install_netmap "$LEAF2_HOST"
+  fi
   pproxy_remote_prepare "$LEAF1_HOST"
   pproxy_remote_prepare "$LEAF2_HOST"
   pproxy_coredump_setup "$LEAF1_HOST"

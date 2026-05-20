@@ -6,7 +6,7 @@
  *   - tun        ✓   src/io/tun_io
  *   - pcap       ✓   src/io/pcap         （-Dpcap=true）
  *   - af_xdp     ✓   src/io/xsk          （-Dxdp=true）
- *   - netmap     留作未来
+ *   - netmap     ✓   src/io/netmap       （-Dnetmap=true）
  *
  * Wire format（在 ICMP Echo 数据区中）:
  *   仅 payload 字节（标准 8B ICMP 头之后），线路上不携带 sid。
@@ -33,6 +33,7 @@
 #include "io/pcap.h"
 #include "io/xsk.h"
 #include "io/dpdk.h"
+#include "io/netmap.h"
 #include "pproxy/xsk_filt.h"
 
 #define ICMP_HDR_LEN    8
@@ -68,6 +69,9 @@ struct icmp_ctx {
 #endif
 #ifdef PP_HAVE_DPDK
     struct pp_dpdk_io      *dpdk;
+#endif
+#ifdef PP_HAVE_NETMAP
+    struct pp_netmap_io    *nm;
 #endif
 };
 
@@ -174,6 +178,13 @@ static void learn_peer_server_ic(struct icmp_ctx *c, uint32_t saddr_be, const ch
             PP_WARN("icmp %s: xsk refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
     }
 #endif
+#ifdef PP_HAVE_NETMAP
+    if (c->cfg.io == PP_TIO_NETMAP && c->nm) {
+        int r = pp_netmap_io_refresh_arp(c->nm, saddr_be);
+        if (r != PP_OK)
+            PP_WARN("icmp %s: netmap refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
+    }
+#endif
 }
 
 static void client_fix_peer(struct icmp_ctx *c)
@@ -222,8 +233,12 @@ static int ic_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
                  "(ICMP has no user-space kernel socket path; use raw_socket)");
         return PP_ERR_NOSUPPORT;
     case PP_TIO_NETMAP:
-        PP_ERROR("icmp tunnel: io=%s not yet implemented", pp_tunnel_io_name(cfg->io));
+#ifdef PP_HAVE_NETMAP
+        break;
+#else
+        PP_ERROR("icmp tunnel: io=netmap requires build with -Dnetmap=true");
         return PP_ERR_NOSUPPORT;
+#endif
     default:
         PP_ERROR("icmp tunnel: unknown io=%d", cfg->io);
         return PP_ERR_INVAL;
@@ -260,6 +275,9 @@ static void ic_close(void *ctx)
 #endif
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) { pp_dpdk_io_free(c->dpdk); c->dpdk = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_NETMAP
+    if (c->cfg.io == PP_TIO_NETMAP) { pp_netmap_io_free(c->nm); c->nm = NULL; fd_owned_by_helper = true; }
 #endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
@@ -616,6 +634,90 @@ static int dp_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif /* PP_HAVE_DPDK */
 
+/* -------------------- netmap 路径 -------------------- */
+#ifdef PP_HAVE_NETMAP
+static int nm_connect(struct icmp_ctx *c)
+{
+    if (c->cfg.mode == PP_TMODE_CLIENT) client_fix_peer(c);
+    if (c->cfg.listen.addr.u.v4.s_addr == 0 && c->cfg.io_cfg.netmap.ifname
+        && c->cfg.io_cfg.netmap.ifname[0]) {
+        uint32_t s;
+        if (pp_netmap_ifname_first_ipv4(c->cfg.io_cfg.netmap.ifname, &s) == PP_OK) {
+            c->cfg.listen.addr.u.v4.s_addr = s;
+            c->cfg.listen.addr.af          = PP_AF_INET;
+            char a[INET_ADDRSTRLEN] = "";
+            struct in_addr _ia = { .s_addr = s };
+            inet_ntop(AF_INET, &_ia, a, sizeof a);
+            PP_INFO("icmp netmap: 未配 listen 源，使用 %s 上 IPv4 %s 为 IP 头源",
+                    c->cfg.io_cfg.netmap.ifname, a);
+        } else
+            PP_WARN("icmp netmap: listen 为 0.0.0.0 且无法从 %s 取 IPv4，IP 头源仍为 0.0.0.0",
+                    c->cfg.io_cfg.netmap.ifname);
+    }
+    uint32_t arp_nexthop_be = 0;
+    if (c->cfg.mode == PP_TMODE_CLIENT)
+        arp_nexthop_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+
+    int rc = pp_netmap_io_new(&c->nm,
+                              c->cfg.io_cfg.netmap.ifname,
+                              c->cfg.io_cfg.netmap.nrings,
+                              NULL,
+                              arp_nexthop_be);
+    if (rc != PP_OK) return rc;
+    c->fd = pp_netmap_io_get_fd(c->nm);
+
+    char sa[INET_ADDRSTRLEN] = "";
+    inet_ntop(AF_INET, &c->cfg.listen.addr.u.v4, sa, sizeof sa);
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        PP_INFO("icmp netmap server: iface=%s listen=%s id=0x%04x fd=%d",
+                pp_netmap_io_get_ifname(c->nm), sa, c->identifier, c->fd);
+    } else {
+        char da[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr,
+                  da, sizeof da);
+        PP_INFO("icmp netmap client: iface=%s %s -> %s id=0x%04x fd=%d",
+                pp_netmap_io_get_ifname(c->nm), sa, da, c->identifier, c->fd);
+    }
+    return PP_OK;
+}
+
+static int nm_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t body[IC_FRAME_MAX];
+    uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
+    size_t blen = build_icmp_body(body, sizeof body, type,
+                                  c->identifier, c->seq++,
+                                  buf->data, buf->len);
+    if (!blen) return PP_ERR_INVAL;
+    uint8_t frame[IC_FRAME_MAX];
+    uint32_t src_ip_be = c->cfg.listen.addr.u.v4.s_addr;
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t tot = wrap_ip(frame, sizeof frame, src_ip_be, dst_ip_be,
+                         c->ip_id++, body, blen);
+    if (!tot) return PP_ERR_INVAL;
+    int r = pp_netmap_io_inject_ip(c->nm, frame, tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int nm_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    size_t n = 0;
+    const uint8_t *ip = pp_netmap_io_next_ip(c->nm, &n);
+    if (!ip) return 0;
+    uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    if (parse_icmp_rx(ip, n, c, &saddr_be, &body, &body_len) != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server_ic(c, saddr_be, "netmap");
+    return (int)body_len;
+}
+#endif /* PP_HAVE_NETMAP */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int ic_connect(void *ctx)
@@ -632,6 +734,9 @@ static int ic_connect(void *ctx)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_connect(c);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_connect(c);
 #endif
     default:                return raw_connect(c);
     }
@@ -651,6 +756,9 @@ static int ic_send(void *ctx, const pp_tun_buf_t *buf)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_send(c, buf);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_send(c, buf);
 #endif
     default:                return raw_send(c, buf);
     }
@@ -680,6 +788,9 @@ static int ic_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_recv(c, out_buf);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_recv(c, out_buf);
 #endif
     default:                return raw_recv(c, out_buf);
     }

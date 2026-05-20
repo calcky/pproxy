@@ -56,6 +56,10 @@ endif
 
 if get_option('netmap')
   add_project_arguments('-DPP_HAVE_NETMAP', language: 'c')
+  # vendored header-only userspace API（third_party/netmap/net/netmap_user.h）
+  # 这里通过额外 -I 加入到全局，避免再创建一个 include_directories 句柄
+  add_project_arguments('-I' + meson.current_source_dir() / 'third_party/netmap',
+                        language: 'c')
 endif
 
 if get_option('dpdk')
@@ -143,6 +147,7 @@ _tunnel_loopback_srcs = [
     'src/io/pcap.c',
     'src/io/xsk.c',
     'src/io/xsk_xdpcap.c',
+    'src/io/netmap.c',
     'src/core/endpoint.c',
     'src/core/error.c',
     'src/core/log.c',
@@ -241,6 +246,24 @@ endif
 # ---------- 测试：AF_XDP 左手 I/O（仅 -Dxdp=true） ----------
 # veth pair + XSK open + tx_burst + 对端 AF_PACKET 验证收到。
 # 需要 CAP_NET_ADMIN + CAP_BPF + /sbin/ip；不满足时 exit 77 skip。
+# ---------- 测试：netmap 左手 I/O（仅 -Dnetmap=true） ----------
+# vale 虚拟交换机 self-loopback：a 端注入 IP/UDP，b 端 rx_burst 取回校验。
+# 需要内核加载 netmap 模块（/dev/netmap）+ CAP_NET_ADMIN；不满足时 exit 77 skip。
+if get_option('netmap')
+  test_netmap_io = executable('test_netmap_io',
+    [
+      'tests/test_netmap_io.c',
+      'src/io/netmap.c',
+      'src/core/log.c',
+      'src/core/packet.c',
+      'src/core/time.c',
+    ],
+    include_directories: inc,
+    dependencies: deps,
+  )
+  test('netmap_io', test_netmap_io)
+endif
+
 if get_option('xdp')
   test_xsk_io = executable('test_xsk_io',
     [

@@ -30,6 +30,7 @@
 #include "io/pcap.h"
 #include "io/xsk.h"
 #include "io/dpdk.h"
+#include "io/netmap.h"
 #include "pproxy/xsk_filt.h"
 
 #define UDP_RX_MAX      65535
@@ -62,6 +63,9 @@ struct udp_ctx {
 #endif
 #ifdef PP_HAVE_DPDK
     struct pp_dpdk_io      *dpdk;
+#endif
+#ifdef PP_HAVE_NETMAP
+    struct pp_netmap_io    *nm;
 #endif
 };
 
@@ -188,6 +192,13 @@ static void learn_peer_server(struct udp_ctx *c, uint32_t saddr_be, uint16_t spo
             PP_WARN("udp %s: xsk refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
     }
 #endif
+#ifdef PP_HAVE_NETMAP
+    if (c->cfg.io == PP_TIO_NETMAP && c->nm) {
+        int r = pp_netmap_io_refresh_arp(c->nm, saddr_be);
+        if (r != PP_OK)
+            PP_WARN("udp %s: netmap refresh dst_mac failed (rc=%d) peer %s", tag, r, a);
+    }
+#endif
 }
 
 /* -------------------- open / close -------------------- */
@@ -223,8 +234,12 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         return PP_ERR_NOSUPPORT;
 #endif
     case PP_TIO_NETMAP:
-        PP_ERROR("udp tunnel: io=%s not yet implemented", pp_tunnel_io_name(cfg->io));
+#ifdef PP_HAVE_NETMAP
+        break;
+#else
+        PP_ERROR("udp tunnel: io=netmap requires build with -Dnetmap=true");
         return PP_ERR_NOSUPPORT;
+#endif
     default:
         PP_ERROR("udp tunnel: unknown io=%d", cfg->io);
         return PP_ERR_INVAL;
@@ -234,7 +249,8 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         cfg->io == PP_TIO_TUN ||
         cfg->io == PP_TIO_PCAP ||
         cfg->io == PP_TIO_AF_XDP ||
-        cfg->io == PP_TIO_DPDK) {
+        cfg->io == PP_TIO_DPDK ||
+        cfg->io == PP_TIO_NETMAP) {
         const pp_endpoint_t *ep =
             (cfg->mode == PP_TMODE_SERVER) ? &cfg->listen : &cfg->server;
         if (ep->addr.af != PP_AF_INET) {
@@ -266,6 +282,9 @@ static void udp_close(void *ctx)
 #endif
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) { pp_dpdk_io_free(c->dpdk); c->dpdk = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_NETMAP
+    if (c->cfg.io == PP_TIO_NETMAP) { pp_netmap_io_free(c->nm); c->nm = NULL; fd_owned_by_helper = true; }
 #endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
@@ -742,6 +761,92 @@ static int dp_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif  /* PP_HAVE_DPDK */
 
+/* -------------------- netmap 路径 -------------------- */
+#ifdef PP_HAVE_NETMAP
+static int nm_connect(struct udp_ctx *c)
+{
+    l3_init_ports(c);
+    /* 与 af_xdp 一致：listen 源为 0 时，从 ifname 上取主 IPv4 当 IP 头源 */
+    if (c->src_ip_be == 0 && c->cfg.io_cfg.netmap.ifname
+        && c->cfg.io_cfg.netmap.ifname[0]) {
+        uint32_t s;
+        if (pp_netmap_ifname_first_ipv4(c->cfg.io_cfg.netmap.ifname, &s) == PP_OK) {
+            c->src_ip_be = s;
+            char a[INET_ADDRSTRLEN] = "";
+            struct in_addr _ia = { .s_addr = s };
+            inet_ntop(AF_INET, &_ia, a, sizeof a);
+            PP_INFO("udp netmap: listen 未设源(0.0.0.0)，使用 %s 上 IPv4 %s 作为发包头源",
+                    c->cfg.io_cfg.netmap.ifname, a);
+        } else {
+            PP_WARN("udp netmap: listen 为 0.0.0.0 且无法从 %s 取 IPv4，IP 头源仍为 0.0.0.0",
+                    c->cfg.io_cfg.netmap.ifname);
+        }
+    }
+    uint32_t arp_nexthop_be = 0;
+    if (c->cfg.mode == PP_TMODE_CLIENT)
+        arp_nexthop_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+
+    int rc = pp_netmap_io_new(&c->nm,
+                              c->cfg.io_cfg.netmap.ifname,
+                              c->cfg.io_cfg.netmap.nrings,
+                              NULL,
+                              arp_nexthop_be);
+    if (rc != PP_OK) return rc;
+    c->fd = pp_netmap_io_get_fd(c->nm);
+
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        const pp_endpoint_t *ep = &c->cfg.listen;
+        char epstr[64] = "";
+        pp_endpoint_format(ep, epstr, sizeof epstr);
+        PP_INFO("udp tunnel bound on %s (fd=%d), waiting for peer", epstr, c->fd);
+        PP_INFO("udp netmap server: iface=%s listen_port=%u",
+                pp_netmap_io_get_ifname(c->nm), c->listen_port);
+    } else {
+        char sa[INET_ADDRSTRLEN]="", da[INET_ADDRSTRLEN]="";
+        inet_ntop(AF_INET, &c->src_ip_be, sa, sizeof sa);
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
+        PP_INFO("udp tunnel connected (fd=%d)", c->fd);
+        PP_INFO("udp netmap client: iface=%s %s:%u -> %s:%u",
+                pp_netmap_io_get_ifname(c->nm), sa, c->src_port, da, c->dst_port);
+    }
+    return PP_OK;
+}
+
+static int nm_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t frame[65535];
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
+                                       c->src_ip_be, dst_ip_be,
+                                       c->src_port, c->dst_port,
+                                       c->ip_id++, buf->data, buf->len);
+    if (!ip_tot) return PP_ERR_INVAL;
+    int r = pp_netmap_io_inject_ip(c->nm, frame, ip_tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int nm_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    size_t n = 0;
+    const uint8_t *ip = pp_netmap_io_next_ip(c->nm, &n);
+    if (!ip) return 0;
+
+    uint16_t sport; uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    int r = parse_ip_udp_frame(ip, n, c, &sport, &saddr_be, &body, &body_len);
+    if (r != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server(c, saddr_be, sport, "netmap");
+    return (int)body_len;
+}
+#endif  /* PP_HAVE_NETMAP */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int udp_connect(void *ctx)
@@ -759,6 +864,9 @@ static int udp_connect(void *ctx)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_connect(c);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_connect(c);
 #endif
     default:                return ks_connect(c);
     }
@@ -779,6 +887,9 @@ static int udp_send(void *ctx, const pp_tun_buf_t *buf)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_send(c, buf);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_send(c, buf);
 #endif
     default:                return ks_send (c, buf);
     }
@@ -809,6 +920,9 @@ static int udp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 #endif
 #ifdef PP_HAVE_XDP
     case PP_TIO_AF_XDP:     return xc_recv(c, out_buf);
+#endif
+#ifdef PP_HAVE_NETMAP
+    case PP_TIO_NETMAP:     return nm_recv(c, out_buf);
 #endif
     default:                return ks_recv (c, out_buf);
     }
