@@ -367,11 +367,17 @@ static void l3_init_ports(struct udp_ctx *c)
         c->src_port    = c->cfg.listen.port;
         c->src_ip_be   = c->cfg.listen.addr.u.v4.s_addr;
     } else {
+        /* client 本地源：tunnel.h 约定用 bind；兼容误把 listen 写在 client 上的旧配置 */
+        const pp_endpoint_t *local = &c->cfg.bind;
+        if (local->addr.u.v4.s_addr == 0 && local->port == 0
+            && c->cfg.listen.addr.u.v4.s_addr != 0)
+            local = &c->cfg.listen;
+
         c->dst_port    = c->cfg.server.port;
-        c->src_port    = c->cfg.listen.port
-                           ? c->cfg.listen.port
+        c->src_port    = local->port
+                           ? local->port
                            : (uint16_t)(32768 + ((uint16_t)getpid() & 0x7FFF));
-        c->src_ip_be   = c->cfg.listen.addr.u.v4.s_addr;    /* 0=内核按路由选 */
+        c->src_ip_be   = local->addr.u.v4.s_addr;
 
         struct sockaddr_in *sin = (struct sockaddr_in *)&c->peer_sa;
         sin->sin_family      = AF_INET;
@@ -699,6 +705,9 @@ static int xc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 static int dp_connect(struct udp_ctx *c)
 {
     l3_init_ports(c);
+    if (c->cfg.mode == PP_TMODE_CLIENT && c->src_ip_be == 0)
+        PP_WARN("udp dpdk client: bind/listen 源 IP 为 0.0.0.0；"
+                "DPDK 自拼 IP 头需显式 bind（如 172.16.1.2:0）");
     int rc = pp_dpdk_io_new(&c->dpdk,
                             c->cfg.io_cfg.dpdk.port_id,
                             c->cfg.io_cfg.dpdk.queue_id,

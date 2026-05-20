@@ -51,6 +51,7 @@ UBUNTU_USER="clab"
 UBUNTU_PASS='clab@123'
 # 与 deploy 中 configure_ubuntu_leaf 的地址一致（见 generic_vm 拓扑 + 路由）
 LEAF1_WAN_IP="172.16.0.2"
+LEAF2_WAN_IP="172.16.1.2"
 TUNNEL_PORT=19900
 PP1_METRICS=19991
 PP2_METRICS=19992
@@ -465,7 +466,7 @@ NEED_DPDK="$2"
 s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
-s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils
+s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils netcat-openbsd
 if ! command -v gdbserver >/dev/null 2>&1; then
   s apt-get install -y -qq gdbserver
 fi
@@ -706,6 +707,27 @@ pproxy_scp_xdpcap_bpf() {
     "chmod 644 ${VM_PPROXY_XDPCAP_BPF}"
 }
 
+# mgmt 文本命令客户端；与 leaf-bin/xdpcap 同目录
+pproxy_scp_pproxy_ctl() {
+  local host=$1
+  local src="${CLAB_DIR}/leaf-bin/pproxy-ctl"
+  if [[ ! -s "$src" ]]; then
+    echo "  pproxy: 无 $src（或为空），跳过 pproxy-ctl" >&2
+    return 0
+  fi
+  echo "  pproxy: scp leaf-bin/pproxy-ctl → ${host}:/usr/local/bin/pproxy-ctl …"
+  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$src" \
+    "${UBUNTU_USER}@${host}:/tmp/pproxy-ctl"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" <<'EOP'
+set -euo pipefail
+PASS="$1"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s install -m 0755 /tmp/pproxy-ctl /usr/local/bin/pproxy-ctl
+rm -f /tmp/pproxy-ctl
+EOP
+}
+
 # cloudflare 用户态 xdpcap；与仓库中 leaf-bin 同目录，勿与 pproxy 加载的 eBPF 混淆
 pproxy_scp_xdpcap() {
   local host=$1
@@ -728,25 +750,28 @@ rm -f /tmp/pproxy-xdpcap
 EOD
 }
 
-# DPDK：基于 pp{1,2}.udp.left-tun.right-dpdk.json 模板渲染：填入 PCI / peer_mac / 显式 listen
+# DPDK：基于 pp{1,2}.udp.left-tun.right-dpdk.json 模板渲染：填入 PCI / peer_mac / 显式 bind/listen
 # 输出: dst 路径覆盖写入
 dpdk_render_cfg() {
   local src=$1
   local dst=$2
   local pci=$3
   local peer_mac=$4
-  local listen=$5
-  python3 - "$src" "$dst" "$pci" "$peer_mac" "$listen" <<'PY'
+  local local_ep=$5
+  python3 - "$src" "$dst" "$pci" "$peer_mac" "$local_ep" <<'PY'
 import json, sys
-src, dst, pci, mac, listen = sys.argv[1:6]
+src, dst, pci, mac, local_ep = sys.argv[1:6]
 with open(src, encoding='utf-8') as f:
     d = json.load(f)
 t = d['tunnels'][0]
 io = t.setdefault('io_cfg', {})
 io['eal_args'] = f"pproxy -l 0,1 -a {pci} --proc-type=primary --in-memory"
 io['peer_mac'] = mac
-if listen:
-    t['listen'] = listen
+if local_ep:
+    if t.get('mode', 'client') == 'server':
+        t['listen'] = local_ep
+    else:
+        t['bind'] = local_ep
 with open(dst, 'w', encoding='utf-8') as f:
     json.dump(d, f, indent=2)
 PY
@@ -778,12 +803,12 @@ pproxy_push_cfgs() {
     local tmp1=$(mktemp --suffix=.json)
     local tmp2=$(mktemp --suffix=.json)
     dpdk_render_cfg "$PP1_JSON" "$tmp1" "$DPDK_LEAF1_PCI" "$DPDK_LEAF1_PEER_MAC" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
-    # leaf2 client: listen 显式给 leaf2 WAN IP，端口 0 让 pproxy 随机
-    dpdk_render_cfg "$PP2_JSON" "$tmp2" "$DPDK_LEAF2_PCI" "$DPDK_LEAF2_PEER_MAC" "172.16.1.2:0"
+    # leaf2 client: bind 显式给 leaf2 WAN IP；端口 0 让 pproxy 随机源端口
+    dpdk_render_cfg "$PP2_JSON" "$tmp2" "$DPDK_LEAF2_PCI" "$DPDK_LEAF2_PEER_MAC" "${LEAF2_WAN_IP}:0"
     pp1_src=$tmp1
     pp2_src=$tmp2
     echo "  pproxy: DPDK 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("listen"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
-    echo "  pproxy: DPDK 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("listen"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
+    echo "  pproxy: DPDK 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("bind"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
   fi
 
   echo "  pproxy: scp 配置 $pp1_src → ${LEAF1_HOST}:${VM_PP1_CFG} …"
@@ -930,6 +955,8 @@ pproxy_smoke() {
   fi
   pproxy_scp_bin "$LEAF1_HOST"
   pproxy_scp_bin "$LEAF2_HOST"
+  pproxy_scp_pproxy_ctl "$LEAF1_HOST"
+  pproxy_scp_pproxy_ctl "$LEAF2_HOST"
   if [[ "$USE_XDPCAP" -eq 1 ]]; then
     pproxy_scp_xdpcap_bpf "$LEAF1_HOST" "$PPROXY_XDPCAP_BPF_HOST"
     pproxy_scp_xdpcap_bpf "$LEAF2_HOST" "$PPROXY_XDPCAP_BPF_HOST"

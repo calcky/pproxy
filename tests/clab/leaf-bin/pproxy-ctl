@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# 向 pproxy mgmt unix socket 发一条文本命令（help / stat / sessions / drops / reload / quit）
+set -euo pipefail
+
+DEFAULT_SOCK="/opt/pproxy/run/pp.sock"
+sock="${PPROXY_SOCK:-$DEFAULT_SOCK}"
+
+usage() {
+  cat <<'EOF'
+usage: pproxy-ctl [-s sock] <command> [args...]
+
+commands (see also: pproxy-ctl help):
+  help                   this message (via mgmt)
+  stat | stats           module statistics
+  sessions               session snapshot
+  drops                  orphan + session drop breakdown
+  reload [path]          hot-reload JSON config
+  quit                   shut down pproxy (debug only)
+
+environment:
+  PPROXY_SOCK            default /opt/pproxy/run/pp.sock
+
+examples:
+  pproxy-ctl stat
+  pproxy-ctl sessions
+  pproxy-ctl 'reload /opt/pproxy/pp1.json'
+  PPROXY_SOCK=/path/to.sock pproxy-ctl stat
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s)
+      [[ $# -ge 2 ]] || { echo "pproxy-ctl: -s requires path" >&2; exit 1; }
+      sock="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "pproxy-ctl: unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+if [[ ! -e "$sock" ]]; then
+  echo "pproxy-ctl: no socket: $sock" >&2
+  exit 1
+fi
+
+if ! command -v nc >/dev/null 2>&1; then
+  echo "pproxy-ctl: need 'nc' (apt install netcat-openbsd)" >&2
+  exit 1
+fi
+
+SUDO=()
+if [[ ! -w "$sock" ]]; then
+  SUDO=(sudo)
+fi
+
+resp="$(printf '%s\n' "$*" | "${SUDO[@]}" nc -U -q 1 "$sock" 2>/dev/null || true)"
+if [[ -z "$resp" ]]; then
+  echo "pproxy-ctl: empty response from $sock (is pproxy running?)" >&2
+  exit 1
+fi
+printf '%s\n' "$resp"

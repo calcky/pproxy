@@ -35,12 +35,23 @@ watch -n1 'curl -s http://127.0.0.1:19992/metrics | grep pp_module_'
 
 ## Unix 管理套接字（文本命令）
 
-配置项 `mgmt.unix_socket`，例：`/opt/pproxy/run/pp1.sock`。
+配置项 `mgmt.unix_socket`，clab 默认：`/opt/pproxy/run/pp.sock`。
+
+`deploy.sh` 会把 `pproxy-ctl` 装到 leaf VM 的 `/usr/local/bin/pproxy-ctl`，比手写 `nc` 方便：
 
 ```bash
-echo stat     | sudo nc -U /opt/pproxy/run/pp1.sock
-echo sessions | sudo nc -U /opt/pproxy/run/pp1.sock
-echo help     | sudo nc -U /opt/pproxy/run/pp1.sock
+pproxy-ctl stat
+pproxy-ctl sessions
+pproxy-ctl help
+# 自定义 sock：PPROXY_SOCK=/path/to.sock pproxy-ctl stat
+```
+
+等价于：
+
+```bash
+echo stat     | sudo nc -U /opt/pproxy/run/pp.sock
+echo sessions | sudo nc -U /opt/pproxy/run/pp.sock
+echo help     | sudo nc -U /opt/pproxy/run/pp.sock
 ```
 
 ## 路由与 TUN（导流是否进 ppclab*）
