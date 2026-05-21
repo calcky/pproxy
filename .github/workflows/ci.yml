@@ -1,0 +1,51 @@
+# pproxy CI：Meson 构建 + 单元测试（与 Dockerfile / build.sh 工具链对齐）
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            meson_opts: ""
+            extra_packages: ""
+          - name: io_uring
+            meson_opts: "-Dio_uring=true"
+            extra_packages: liburing-dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc \
+            libc6-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            iproute2 \
+            ${{ matrix.extra_packages }}
+
+      - name: Meson setup
+        run: meson setup build --buildtype=release ${{ matrix.meson_opts }}
+
+      - name: Build
+        run: ninja -C build -j"$(nproc)"
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
