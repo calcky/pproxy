@@ -67,6 +67,12 @@ typedef enum pp_tunnel_mode {
     PP_TMODE_SERVER = 1,    /* listen()/bind()，peer 由对端首包决定 */
 } pp_tunnel_mode_t;
 
+/* kernel_socket 的 io_cfg.backend */
+typedef enum pp_ks_backend {
+    PP_KS_BACKEND_SYSCALL  = 0,
+    PP_KS_BACKEND_IO_URING = 1,
+} pp_ks_backend_t;
+
 /* ---------- 配置 ---------- */
 typedef struct pp_tunnel_cfg {
     pp_tunnel_proto_t proto;        /* 协议编码 */
@@ -86,8 +92,13 @@ typedef struct pp_tunnel_cfg {
         struct { uint16_t identifier_base; bool reply_only; } icmp;
     } u;
 
-    /* I/O 特定字段（仅当 io != KERNEL_SOCKET 时才用到） */
+    /* I/O 特定字段（io_cfg JSON 块） */
     union {
+        struct {
+            pp_ks_backend_t backend;
+            uint32_t        sq_entries;
+            const char     *ifname;
+        } ks;
         struct {
             /* 可选：仅 bind(SO_BINDTODEVICE) 限定出口。不填走路由表。 */
             const char *ifname;

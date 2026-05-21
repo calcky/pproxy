@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxdp-dev \
         libpcap-dev \
         libdpdk-dev \
+        liburing-dev \
         clang \
         llvm \
         linux-libc-dev \

@@ -6,7 +6,8 @@
 #   ./build.sh                 # 默认 release 构建
 #   ./build.sh --debug         # buildtype=debug
 #   ./build.sh --xdp --pcap    # 启用可选 I/O 后端
-#   ./build.sh --dpdk          # 启用 DPDK I/O 后端 (libdpdk pkg-config)
+#   ./build.sh --dpdk
+#   ./build.sh --io-uring          # 启用 DPDK I/O 后端 (libdpdk pkg-config)
 #   ./build.sh -j 8            # 并行 8 任务
 #   ./build.sh clean           # 删除 build/
 #   ./build.sh --native        # 不进 docker，直接用宿主机工具链
@@ -27,6 +28,7 @@ XDP=0
 PCAP=0
 NETMAP=0
 DPDK=0
+IO_URING=0
 CLEAN=0
 NATIVE=0
 SHELL_MODE=0
@@ -47,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --pcap)          PCAP=1 ;;
         --netmap)        NETMAP=1 ;;
         --dpdk)          DPDK=1 ;;
+        --io-uring)      IO_URING=1 ;;
         --clean|clean)   CLEAN=1 ;;
         --native)        NATIVE=1 ;;
         --shell)         SHELL_MODE=1 ;;
@@ -78,6 +81,7 @@ MESON_OPTS=(
     "-Dpcap=$([[ $PCAP   -eq 1 ]] && echo true || echo false)"
     "-Dnetmap=$([[ $NETMAP -eq 1 ]] && echo true || echo false)"
     "-Ddpdk=$([[ $DPDK   -eq 1 ]] && echo true || echo false)"
+    "-Dio_uring=$([[ $IO_URING -eq 1 ]] && echo true || echo false)"
     "--buildtype=$([[ $DEBUG -eq 1 ]] && echo debug || echo release)"
 )
 

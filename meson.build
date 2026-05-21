@@ -67,6 +67,11 @@ if get_option('dpdk')
   add_project_arguments('-DPP_HAVE_DPDK', language: 'c')
 endif
 
+if get_option('io_uring')
+  deps += dependency('liburing')
+  add_project_arguments('-DPP_HAVE_IO_URING', language: 'c')
+endif
+
 # ---------- 源文件（按目录扫描） ----------
 #
 # Meson 官方不支持 glob，理由是"新增文件时构建系统感知不到"。
@@ -142,6 +147,7 @@ _tunnel_loopback_srcs = [
     'src/tunnel/icmp.c',
     'src/tunnel/registry.c',
     'src/io/ks_sock.c',
+    'src/io/uring_sock.c',
     'src/io/raw_sock.c',
     'src/io/tun.c',
     'src/io/pcap.c',
@@ -216,6 +222,7 @@ test_af_packet_io = executable('test_af_packet_io',
     'tests/test_af_packet_io.c',
     'src/io/raw_sock.c',
     'src/io/ks_sock.c',
+    'src/io/uring_sock.c',
     'src/core/log.c',
     'src/core/packet.c',
     'src/core/time.c',
@@ -295,4 +302,17 @@ if get_option('dpdk')
     dependencies: deps,
   )
   test('dpdk_io', test_dpdk_io)
+endif
+if get_option('io_uring')
+  test_uring_sock = executable('test_uring_sock',
+    [
+      'tests/test_uring_sock.c',
+      'src/io/uring_sock.c',
+      'src/io/ks_sock.c',
+      'src/core/log.c',
+    ],
+    include_directories: inc,
+    dependencies: deps,
+  )
+  test('uring_sock', test_uring_sock)
 endif

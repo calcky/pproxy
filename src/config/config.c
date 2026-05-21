@@ -357,7 +357,7 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
         PP_WARN("config: proto=%d (kcp/quic) not yet implemented", cfg->proto);
     }
 
-    /* io 字段（仅 non-kernel_socket 用到） */
+    /* io 字段（io_cfg JSON） */
     yyjson_val *ioc = yyjson_obj_get(t, "io_cfg");
     if (ioc && yyjson_is_obj(ioc)) {
         switch (cfg->io) {
@@ -402,7 +402,25 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
             }
             break;
         }
-        case PP_TIO_KERNEL_SOCKET:
+        case PP_TIO_KERNEL_SOCKET: {
+            const char *be = jstr(ioc, "backend", "syscall");
+            if (!strcmp(be, "syscall")) {
+                cfg->io_cfg.ks.backend = PP_KS_BACKEND_SYSCALL;
+            } else if (!strcmp(be, "io_uring")) {
+#ifndef PP_HAVE_IO_URING
+                PP_ERROR("config: io_cfg.backend=io_uring requires build with -Dio_uring=true");
+                return PP_ERR_NOSUPPORT;
+#else
+                cfg->io_cfg.ks.backend = PP_KS_BACKEND_IO_URING;
+#endif
+            } else {
+                PP_ERROR("config: unknown io_cfg.backend '%s' (want syscall|io_uring)", be);
+                return PP_ERR_INVAL;
+            }
+            cfg->io_cfg.ks.sq_entries = (uint32_t)jint(ioc, "sq_entries", 256);
+            cfg->io_cfg.ks.ifname = dup_to_rt(rt, jstr(ioc, "ifname", ""));
+            break;
+        }
         default:
             break;
         }

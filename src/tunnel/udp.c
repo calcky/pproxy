@@ -25,6 +25,7 @@
 #include "pproxy/tunnel.h"
 #include "pproxy/log.h"
 #include "io/ks_sock.h"
+#include "io/uring_sock.h"
 #include "io/raw_sock.h"
 #include "io/tun.h"
 #include "io/pcap.h"
@@ -66,6 +67,9 @@ struct udp_ctx {
 #endif
 #ifdef PP_HAVE_NETMAP
     struct pp_netmap_io    *nm;
+#endif
+#ifdef PP_HAVE_IO_URING
+    pp_uring_sock_t        *uring;
 #endif
 };
 
@@ -260,6 +264,14 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         }
     }
 
+    if (cfg->io == PP_TIO_KERNEL_SOCKET &&
+        cfg->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING) {
+#ifndef PP_HAVE_IO_URING
+        PP_ERROR("udp tunnel: io_cfg.backend=io_uring requires build with -Dio_uring=true");
+        return PP_ERR_NOSUPPORT;
+#endif
+    }
+
     struct udp_ctx *c = calloc(1, sizeof *c);
     if (!c) return PP_ERR_NOMEM;
     c->cfg = *cfg;
@@ -286,8 +298,24 @@ static void udp_close(void *ctx)
 #ifdef PP_HAVE_NETMAP
     if (c->cfg.io == PP_TIO_NETMAP) { pp_netmap_io_free(c->nm); c->nm = NULL; fd_owned_by_helper = true; }
 #endif
+#ifdef PP_HAVE_IO_URING
+    if (c->uring) { pp_uring_sock_free(c->uring); c->uring = NULL; }
+#endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
+}
+
+
+static bool udp_ks_use_uring(const struct udp_ctx *c)
+{
+    return c->cfg.io == PP_TIO_KERNEL_SOCKET
+        && c->cfg.io_cfg.ks.backend == PP_KS_BACKEND_IO_URING;
+}
+
+static unsigned udp_ks_sq_entries(const struct udp_ctx *c)
+{
+    unsigned n = c->cfg.io_cfg.ks.sq_entries;
+    return n ? n : 256u;
 }
 
 /* -------------------- kernel_socket 路径 -------------------- */
@@ -314,6 +342,21 @@ static int ks_connect(struct udp_ctx *c)
         if (rc != PP_OK) { close(c->fd); c->fd = -1; return rc; }
         PP_INFO("udp tunnel connected (fd=%d)", c->fd);
     }
+
+    if (c->cfg.io_cfg.ks.ifname && c->cfg.io_cfg.ks.ifname[0])
+        pp_ks_bind_to_device(c->fd, c->cfg.io_cfg.ks.ifname);
+
+#ifdef PP_HAVE_IO_URING
+    if (udp_ks_use_uring(c)) {
+        rc = pp_uring_sock_new(c->fd, udp_ks_sq_entries(c), &c->uring);
+        if (rc != PP_OK) {
+            close(c->fd);
+            c->fd = -1;
+            return rc;
+        }
+        PP_INFO("udp tunnel io_uring backend (sq=%u, fd=%d)", udp_ks_sq_entries(c), c->fd);
+    }
+#endif
     return PP_OK;
 }
 
@@ -322,6 +365,17 @@ static int ks_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
     if (buf->len > UDP_RX_MAX) return PP_ERR_INVAL;
 
     int w;
+#ifdef PP_HAVE_IO_URING
+    if (c->uring) {
+        if (c->cfg.mode == PP_TMODE_SERVER) {
+            if (!c->peer_known) return PP_ERR_AGAIN;
+            w = pp_uring_udp_send(c->uring, c->fd, buf->data, buf->len,
+                                  (struct sockaddr *)&c->peer_sa, c->peer_sl);
+        } else {
+            w = pp_uring_udp_send(c->uring, c->fd, buf->data, buf->len, NULL, 0);
+        }
+    } else
+#endif
     if (c->cfg.mode == PP_TMODE_SERVER) {
         if (!c->peer_known) return PP_ERR_AGAIN;
         w = pp_ks_udp_send(c->fd, buf->data, buf->len,
@@ -337,7 +391,14 @@ static int ks_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {
     struct sockaddr_storage src;
     socklen_t sl = sizeof src;
-    int n = pp_ks_udp_recv(c->fd, out_buf->data, out_buf->cap,
+    int n;
+#ifdef PP_HAVE_IO_URING
+    if (c->uring)
+        n = pp_uring_udp_recv(c->uring, c->fd, out_buf->data, out_buf->cap,
+                              (struct sockaddr *)&src, &sl);
+    else
+#endif
+        n = pp_ks_udp_recv(c->fd, out_buf->data, out_buf->cap,
                            (struct sockaddr *)&src, &sl);
     if (n <= 0) return n;
 

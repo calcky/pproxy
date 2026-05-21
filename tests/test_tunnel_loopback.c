@@ -391,11 +391,94 @@ static int smoke_udp_xdp(void)
 }
 #endif  /* PP_HAVE_XDP */
 
+
+#ifdef PP_HAVE_IO_URING
+static int test_tcp_uring(void)
+{
+    printf("=== TCP loopback io_uring backend ===\n");
+    pp_tunnel_cfg_t scfg = {0}, ccfg = {0};
+    scfg.proto = PP_PROTO_TCP; scfg.io = PP_TIO_KERNEL_SOCKET;
+    scfg.io_cfg.ks.backend = PP_KS_BACKEND_IO_URING;
+    scfg.mode  = PP_TMODE_SERVER;
+    scfg.u.tcp.nodelay = true;
+    if (ep(&scfg.listen, "127.0.0.1", PORT_TCP + 10) != PP_OK) return 1;
+
+    ccfg = scfg; ccfg.mode = PP_TMODE_CLIENT;
+    if (ep(&ccfg.server, "127.0.0.1", PORT_TCP + 10) != PP_OK) return 1;
+
+    void *sctx = NULL, *cctx = NULL;
+    if (pp_tunnel_tcp.open(&scfg, &sctx) != PP_OK) return 1;
+    if (pp_tunnel_tcp.connect(sctx) != PP_OK) return 1;
+    struct timespec ts = {0, 50 * 1000 * 1000}; nanosleep(&ts, NULL);
+    if (pp_tunnel_tcp.open(&ccfg, &cctx) != PP_OK) return 1;
+    if (pp_tunnel_tcp.connect(cctx) != PP_OK) return 1;
+
+    const char *msg = "uring-tcp";
+    pp_tun_buf_t buf = { .data = (const uint8_t *)msg, .len = strlen(msg) };
+    if (pp_tunnel_tcp.send(cctx, &buf) <= 0) return 1;
+
+    uint8_t rx[256]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
+    int r = 0;
+    for (int i = 0; i < 100 && r == 0; i++) {
+        r = pp_tunnel_tcp.recv(sctx, &mb, 0);
+        if (r == 0) { struct timespec t = {0, 10 * 1000 * 1000}; nanosleep(&t, NULL); }
+    }
+    if (r <= 0 || mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) return 1;
+
+    pp_tunnel_tcp.close(cctx);
+    pp_tunnel_tcp.close(sctx);
+    printf("=== TCP io_uring OK ===\n\n");
+    return 0;
+}
+
+static int test_udp_uring(void)
+{
+    printf("=== UDP loopback io_uring backend ===\n");
+    pp_tunnel_cfg_t scfg = {0}, ccfg = {0};
+    scfg.proto = PP_PROTO_UDP; scfg.io = PP_TIO_KERNEL_SOCKET;
+    scfg.io_cfg.ks.backend = PP_KS_BACKEND_IO_URING;
+    scfg.mode  = PP_TMODE_SERVER;
+    if (ep(&scfg.listen, "127.0.0.1", PORT_UDP + 10) != PP_OK) return 1;
+
+    ccfg = scfg; ccfg.mode = PP_TMODE_CLIENT;
+    if (ep(&ccfg.server, "127.0.0.1", PORT_UDP + 10) != PP_OK) return 1;
+
+    void *sctx = NULL, *cctx = NULL;
+    if (pp_tunnel_udp.open(&scfg, &sctx) != PP_OK) return 1;
+    if (pp_tunnel_udp.connect(sctx) != PP_OK) return 1;
+    if (pp_tunnel_udp.open(&ccfg, &cctx) != PP_OK) return 1;
+    if (pp_tunnel_udp.connect(cctx) != PP_OK) return 1;
+
+    const char *msg = "uring-udp";
+    pp_tun_buf_t buf = { .data = (const uint8_t *)msg, .len = strlen(msg) };
+    if (pp_tunnel_udp.send(cctx, &buf) <= 0) return 1;
+
+    uint8_t rx[256]; pp_tun_mbuf_t mb = { .data = rx, .cap = sizeof rx };
+    int r = 0;
+    for (int i = 0; i < 100 && r == 0; i++) {
+        r = pp_tunnel_udp.recv(sctx, &mb, 0);
+        if (r == 0) { struct timespec t = {0, 10 * 1000 * 1000}; nanosleep(&t, NULL); }
+    }
+    if (r <= 0 || mb.len != strlen(msg) || memcmp(mb.data, msg, mb.len) != 0) return 1;
+
+    pp_tunnel_udp.close(cctx);
+    pp_tunnel_udp.close(sctx);
+    printf("=== UDP io_uring OK ===\n\n");
+    return 0;
+}
+#endif
+
 int main(void)
 {
     pp_log_init(PP_LOG_INFO, NULL);
     if (test_tcp() != 0) return 1;
+#ifdef PP_HAVE_IO_URING
+    if (test_tcp_uring() != 0) return 1;
+#endif
     if (test_udp() != 0) return 1;
+#ifdef PP_HAVE_IO_URING
+    if (test_udp_uring() != 0) return 1;
+#endif
     if (!can_raw_udp()) {
         printf("=== UDP raw_socket: SKIP (no CAP_NET_RAW) ===\n\n");
     } else if (test_udp_raw() != 0) {

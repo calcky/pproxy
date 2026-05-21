@@ -18,6 +18,7 @@
 #include "pproxy/tunnel.h"
 #include "pproxy/log.h"
 #include "io/ks_sock.h"
+#include "io/uring_sock.h"
 
 #define TCP_FRAME_MAGIC0 0x55
 #define TCP_FRAME_MAGIC1 0xAA
@@ -35,7 +36,48 @@ struct tcp_ctx {
     int              conn_fd;       /* 当前业务 fd；<0 表示未建立 */
     uint8_t          rxbuf[TCP_RX_BUF];
     size_t           rxlen;
+#ifdef PP_HAVE_IO_URING
+    pp_uring_sock_t *uring;
+#endif
 };
+
+static bool tcp_ks_use_uring(const struct tcp_ctx *c)
+{
+    return c->cfg.io_cfg.ks.backend == PP_KS_BACKEND_IO_URING;
+}
+
+static unsigned tcp_ks_sq_entries(const struct tcp_ctx *c)
+{
+    unsigned n = c->cfg.io_cfg.ks.sq_entries;
+    return n ? n : 256u;
+}
+
+static void tcp_uring_drop(struct tcp_ctx *c)
+{
+#ifdef PP_HAVE_IO_URING
+    if (c->uring) {
+        pp_uring_sock_free(c->uring);
+        c->uring = NULL;
+    }
+#else
+    (void)c;
+#endif
+}
+
+static int tcp_uring_attach(struct tcp_ctx *c)
+{
+#ifdef PP_HAVE_IO_URING
+    if (!tcp_ks_use_uring(c) || c->conn_fd < 0)
+        return PP_OK;
+    if (c->uring)
+        return PP_OK;
+    return pp_uring_sock_new(c->conn_fd, tcp_ks_sq_entries(c), &c->uring);
+#else
+    (void)c;
+    return PP_OK;
+#endif
+}
+
 
 static int tcp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
 {
@@ -44,6 +86,14 @@ static int tcp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         PP_ERROR("tcp tunnel: only io=kernel_socket is supported, got io=%d", cfg->io);
         return PP_ERR_NOSUPPORT;
     }
+#ifdef PP_HAVE_IO_URING
+    if (cfg->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING) { /* ok */ }
+#else
+    if (cfg->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING) {
+        PP_ERROR("tcp tunnel: io_cfg.backend=io_uring requires build with -Dio_uring=true");
+        return PP_ERR_NOSUPPORT;
+    }
+#endif
     struct tcp_ctx *c = calloc(1, sizeof *c);
     if (!c) return PP_ERR_NOMEM;
     c->cfg       = *cfg;
@@ -57,6 +107,7 @@ static void tcp_close(void *ctx)
 {
     struct tcp_ctx *c = ctx;
     if (!c) return;
+    tcp_uring_drop(c);
     if (c->conn_fd   >= 0) close(c->conn_fd);
     if (c->listen_fd >= 0) close(c->listen_fd);
     free(c);
@@ -75,6 +126,8 @@ static int tcp_connect(void *ctx)
         int rc = pp_ks_tcp_listen(af, (struct sockaddr *)&ss, sl, 16, &c->listen_fd);
         if (rc != PP_OK) return rc;
         char ep[64] = ""; pp_endpoint_format(&c->cfg.listen, ep, sizeof ep);
+        if (c->cfg.io_cfg.ks.ifname && c->cfg.io_cfg.ks.ifname[0])
+            pp_ks_bind_to_device(c->listen_fd, c->cfg.io_cfg.ks.ifname);
         PP_INFO("tcp tunnel listening on %s (fd=%d)", ep, c->listen_fd);
         return PP_OK;
     }
@@ -87,6 +140,9 @@ static int tcp_connect(void *ctx)
     int rc = pp_ks_tcp_connect(af, (struct sockaddr *)&ss, sl, &c->conn_fd);
     if (rc != PP_OK) return rc;
     pp_ks_set_tcp_nodelay(c->conn_fd, c->cfg.u.tcp.nodelay);
+    if (c->cfg.io_cfg.ks.ifname && c->cfg.io_cfg.ks.ifname[0])
+        pp_ks_bind_to_device(c->conn_fd, c->cfg.io_cfg.ks.ifname);
+    (void)tcp_uring_attach(c);
     PP_INFO("tcp tunnel connected (fd=%d)", c->conn_fd);
     return PP_OK;
 }
@@ -105,6 +161,7 @@ static bool server_try_accept(struct tcp_ctx *c)
     pp_ks_set_tcp_nodelay(fd, c->cfg.u.tcp.nodelay);
     c->conn_fd = fd;
     c->rxlen   = 0;
+    (void)tcp_uring_attach(c);
 
     char ep[64] = "";
     pp_sockaddr_format((struct sockaddr *)&ss, sl, ep, sizeof ep);
@@ -123,6 +180,7 @@ static void drop_conn_e(struct tcp_ctx *c, const char *why, int err)
             PP_WARN("tcp tunnel: conn lost (%s); fd=%d closed", why, c->conn_fd);
         close(c->conn_fd);
         c->conn_fd = -1;
+        tcp_uring_drop(c);
     }
     c->rxlen = 0;
 }
@@ -219,7 +277,13 @@ static int tcp_conn_recv(struct tcp_ctx *c, pp_tun_mbuf_t *out_buf, int tmo_ms)
         }
 
         size_t room = sizeof(c->rxbuf) - c->rxlen;
-        int n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
+        int n;
+#ifdef PP_HAVE_IO_URING
+        if (c->uring)
+            n = pp_uring_tcp_read(c->uring, c->conn_fd, c->rxbuf + c->rxlen, room);
+        else
+#endif
+            n = pp_ks_tcp_recv(c->conn_fd, c->rxbuf + c->rxlen, room);
 
         if (n > 0) {
             c->rxlen += (size_t)n;
@@ -316,7 +380,17 @@ static int tcp_send(void *ctx, const pp_tun_buf_t *buf)
         if (c->conn_fd < 0) return PP_ERR_CLOSED;
 
         while (off < tot) {
-            ssize_t n = write(c->conn_fd, frame + off, tot - off);
+            ssize_t n;
+#ifdef PP_HAVE_IO_URING
+            if (c->uring) {
+                int wr = pp_uring_tcp_write(c->uring, c->conn_fd, frame + off, tot - off);
+                n = (wr >= 0) ? wr : -1;
+                if (wr == PP_ERR_AGAIN) { errno = EAGAIN; n = -1; }
+                else if (wr == PP_ERR_IO) { errno = EIO; n = -1; }
+                else if (wr == PP_ERR_CLOSED) { n = 0; }
+            } else
+#endif
+                n = write(c->conn_fd, frame + off, tot - off);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     struct pollfd p = { .fd = c->conn_fd, .events = POLLOUT };

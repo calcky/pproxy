@@ -10,6 +10,7 @@
 #   ./deploy.sh --left-io=tun --right-io=kernel_socket   # 左右手 I/O，见 --help
 #   ./deploy.sh --left-io=tun --right-io=dpdk            # 右手 DPDK；需 hugepages + vfio-pci 已绑数据网卡（DPDK 接管后内核不可见）
 #   ./deploy.sh --left-io=tun --right-io=netmap          # 右手 netmap；pproxy 用户态 ARP 学习/应答（勿依赖 leaf 内核 ARP）
+#   ./deploy.sh --left-io=tun --right-io=io_uring        # 右手 kernel_socket + io_cfg.backend=io_uring（仍走内核协议栈）
 #   PPROXY_TUNNEL_MODE=icmp ./deploy.sh   # 同上，环境变量（命令行 --tunnel= 优先）
 #   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
 #   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
@@ -38,7 +39,7 @@
 #   关闭: PPROXY_COREDUMP=0 ./deploy.sh
 #
 # 未设 PPROXY_SKIP_BUILD=1 且非 --no-pproxy 时，本脚本会在「[1/5]」前自动在仓库根执行
-#   ./build.sh --xdp --pcap [--dpdk] [--netmap]（随 --left-io / --right-io 追加）
+#   ./build.sh --xdp --pcap [--dpdk] [--netmap] [--io-uring]（随 --left-io / --right-io / --ks-backend 追加）
 # 以生成与 leaf 上依赖一致的 build/pproxy。
 #
 # 命令行帮助:  ./deploy.sh --help
@@ -111,12 +112,14 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   --no-pproxy              只部署拓扑与 leaf 网络，不编译、不装 pproxy
   --tunnel=tcp|udp|icmp    隧道协议（默认 udp；也可 PPROXY_TUNNEL_MODE，命令行优先）
   --left-io=KIND           左手 I/O: tun, raw_socket, af_xdp, netmap, pcap, dpdk（默认同环境或 tun）
-  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk
+  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, io_uring
                            省略或 auto 时：tcp/udp→kernel_socket，icmp→raw_socket
+                           io_uring：等价 kernel_socket + io_cfg.backend=io_uring（需 ./build.sh --io-uring）
                            注意：dpdk 需要 hugepages + vfio-pci 已绑指定数据网卡；DPDK 接管后内核不可见，
                                  不能与 kernel_socket 共用同一张卡；router 需静态 ARP
                            netmap 需内核 netmap 模块；入向 ARP 由 pproxy 用户态处理，router 可动态 ARP
                            （netmap.ko 在宿主机 Docker 编一次，见 tests/clab/build-netmap-ko.sh）
+  --ks-backend=BACKEND     kernel_socket 热路径：syscall（默认）或 io_uring（与 --right-io=io_uring 等价）
   --gdb / --no-gdb         是否用 gdbserver 起 pproxy（默认 --no-gdb）
   --gdb-tunnel             部署结束后在本机跑 gdb-tunnel.sh（ssh -L 转发 gdb 端口）
   --no-gdb-tunnel          不建立上述转发
@@ -128,6 +131,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   PPROXY_CFG_DIR=路径      配置文件目录（默认 tests/clab/config）
   PPROXY_TUNNEL_MODE       同 --tunnel（命令行优先）
   PPROXY_LEFT_IO, PPROXY_RIGHT_IO  同 --left-io / --right-io（命令行优先）
+  PPROXY_KS_BACKEND                同 --ks-backend（syscall|io_uring；命令行优先）
   PPROXY_COREDUMP, PPROXY_GDB, PPROXY_GDB_TUNNEL
   CLAB_SUDO=1              使用 sudo 调用 containerlab
   PPROXY_XDPCAP_BPF=路径   宿主机 xsk_xdpcap.bpf.o（可选；有则随 af_xdp 一起部署到 VM）
@@ -160,6 +164,8 @@ for a in "$@"; do
     PPROXY_LEFT_IO="${a#--left-io=}"
   elif [[ "$a" == --right-io=* ]]; then
     PPROXY_RIGHT_IO="${a#--right-io=}"
+  elif [[ "$a" == --ks-backend=* ]]; then
+    PPROXY_KS_BACKEND="${a#--ks-backend=}"
   else
     CLAB_ARGS+=("$a")
   fi
@@ -182,15 +188,36 @@ resolve_tunnel_cfgs() {
       ;;
   esac
 
-  local l r
+  local l r cfg_r ks_be
   l=$(printf '%s' "${PPROXY_LEFT_IO:-tun}" | tr '[:upper:]' '[:lower:]')
   r="${PPROXY_RIGHT_IO:-}"
   r=$(printf '%s' "$r" | tr '[:upper:]' '[:lower:]')
+  ks_be=$(printf '%s' "${PPROXY_KS_BACKEND:-syscall}" | tr '[:upper:]' '[:lower:]')
   if [[ -z "$r" || "$r" == "auto" ]]; then
     case "$TUNNEL_MODE" in
       tcp|udp) r=kernel_socket ;;
       icmp) r=raw_socket ;;
     esac
+  fi
+  if [[ "$r" == "io_uring" ]]; then
+    ks_be=io_uring
+    r=kernel_socket
+  fi
+  case "$ks_be" in
+    syscall|io_uring) ;;
+    *)
+      echo "Invalid --ks-backend / PPROXY_KS_BACKEND: ${PPROXY_KS_BACKEND:-syscall} (syscall, io_uring)" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$ks_be" == "io_uring" && "$r" != "kernel_socket" ]]; then
+    echo "io_cfg.backend=io_uring 仅适用于 right-io=kernel_socket（或 --right-io=io_uring）" >&2
+    exit 1
+  fi
+  DEPLOY_KS_BACKEND=$ks_be
+  cfg_r=$r
+  if [[ "$DEPLOY_KS_BACKEND" == "io_uring" ]]; then
+    cfg_r=io_uring
   fi
 
   case "$l" in
@@ -203,7 +230,7 @@ resolve_tunnel_cfgs() {
   case "$r" in
     kernel_socket|raw_socket|tun|af_xdp|netmap|pcap|dpdk) ;;
     *)
-      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, auto)" >&2
+      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, io_uring, auto)" >&2
       exit 1
       ;;
   esac
@@ -212,8 +239,8 @@ resolve_tunnel_cfgs() {
   DEPLOY_IO_RIGHT=$r
 
   local c1_1 c2_1 c1_2 c2_2
-  c1_1="${PPROXY_CFG_DIR}/pp1.${TUNNEL_MODE}.left-${l}.right-${r}.json"
-  c2_1="${PPROXY_CFG_DIR}/pp2.${TUNNEL_MODE}.left-${l}.right-${r}.json"
+  c1_1="${PPROXY_CFG_DIR}/pp1.${TUNNEL_MODE}.left-${l}.right-${cfg_r}.json"
+  c2_1="${PPROXY_CFG_DIR}/pp2.${TUNNEL_MODE}.left-${l}.right-${cfg_r}.json"
   case "$TUNNEL_MODE" in
     tcp)
       c1_2="${PPROXY_CFG_DIR}/pp1.json"
@@ -236,7 +263,7 @@ resolve_tunnel_cfgs() {
     PP1_JSON=$c1_2
     PP2_JSON=$c2_2
   else
-    echo "  ✗ 未找到与 tunnel=${TUNNEL_MODE} left=${l} right=${r} 匹配的配置" >&2
+    echo "  ✗ 未找到与 tunnel=${TUNNEL_MODE} left=${l} right=${cfg_r} 匹配的配置" >&2
     echo "     优先: $c1_1" >&2
     echo "         $c2_1" >&2
     echo "     或回退: $c1_2  +  $c2_2" >&2
@@ -313,6 +340,9 @@ if [[ "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
   fi
   if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
     BUILD_ARGS+=(--netmap)
+  fi
+  if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+    BUILD_ARGS+=(--io-uring)
   fi
   echo "=== [0/5] Host: $REPO_ROOT/build.sh ${BUILD_ARGS[*]} ==="
   (cd "$REPO_ROOT" && ./build.sh "${BUILD_ARGS[@]}")
@@ -461,12 +491,14 @@ EOW
 pproxy_apt_deps() {
   local host=$1
   local need_dpdk="${2:-0}"
-  echo "  pproxy: installing runtime libs on ${host} (dpdk=${need_dpdk}) …"
+  local need_uring="${3:-0}"
+  echo "  pproxy: installing runtime libs on ${host} (dpdk=${need_dpdk}, io_uring=${need_uring}) …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" "$need_dpdk" <<'EOA'
+    bash -s -- "$UBUNTU_PASS" "$need_dpdk" "$need_uring" <<'EOA'
 set -euo pipefail
 SUDO_PASS="$1"
 NEED_DPDK="$2"
+NEED_IO_URING="$3"
 s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
@@ -478,6 +510,11 @@ s apt-get install -y -qq libelf1t64 2>/dev/null || s apt-get install -y -qq libe
 s apt-get install -y -qq libpcap0.8t64 2>/dev/null || s apt-get install -y -qq libpcap0.8
 if ! s apt-get install -y -qq xdp-tools bpftrace; then
   echo "  … note: xdp-tools/bpftrace install failed (optional; check apt sources / release)" >&2
+fi
+if [[ "$NEED_IO_URING" == "1" ]]; then
+  s apt-get install -y -qq liburing2 2>/dev/null \
+    || s apt-get install -y -qq liburing2t64 2>/dev/null \
+    || echo "  ✗ liburing2 安装失败（请人工 apt install liburing2）" >&2
 fi
 if [[ "$NEED_DPDK" == "1" ]]; then
   # dpdk metapackage 通过 Recommends 拉对应 ABI 的 librte-*（Debian12→.so.23, Ubuntu24.04→.so.24）；
@@ -811,6 +848,34 @@ with open(dst, 'w', encoding='utf-8') as f:
 PY
 }
 
+# io_uring：io 仍为 kernel_socket；注入 io_cfg.backend + SO_BINDTODEVICE(WAN)；显式 listen/bind
+uring_render_cfg() {
+  local src=$1
+  local dst=$2
+  local wan_dev=$3
+  local local_ep=${4:-}
+  local sq_entries=${5:-256}
+  python3 - "$src" "$dst" "$wan_dev" "$local_ep" "$sq_entries" <<'PY'
+import json, sys
+src, dst, wan, local_ep, sq = sys.argv[1:6]
+with open(src, encoding='utf-8') as f:
+    d = json.load(f)
+t = d['tunnels'][0]
+io = t.setdefault('io_cfg', {})
+io['backend'] = 'io_uring'
+io['sq_entries'] = int(sq)
+if wan:
+    io['ifname'] = wan
+if local_ep:
+    if t.get('mode', 'client') == 'server':
+        t['listen'] = local_ep
+    else:
+        t['bind'] = local_ep
+with open(dst, 'w', encoding='utf-8') as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
 pproxy_push_cfgs() {
   if [[ ! -f "$PP1_JSON" ]] || [[ ! -f "$PP2_JSON" ]]; then
     echo "  ✗ 缺少配置: $PP1_JSON 或 $PP2_JSON" >&2
@@ -867,6 +932,17 @@ PY
     pp2_src=$tmp2
     echo "  pproxy: netmap 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t["io_cfg"]["ifname"])')"
     echo "  pproxy: netmap 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t.get("bind"), t["io_cfg"]["ifname"])')"
+  elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+    : "${LEAF1_WAN_DEV:?io_uring push: LEAF1_WAN_DEV 未设置 (先跑 [3.5/5] probe?)}"
+    : "${LEAF2_WAN_DEV:?io_uring push: LEAF2_WAN_DEV 未设置}"
+    local tmp1=$(mktemp --suffix=.json)
+    local tmp2=$(mktemp --suffix=.json)
+    uring_render_cfg "$PP1_JSON" "$tmp1" "$LEAF1_WAN_DEV" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    uring_render_cfg "$PP2_JSON" "$tmp2" "$LEAF2_WAN_DEV" "${LEAF2_WAN_IP}:0"
+    pp1_src=$tmp1
+    pp2_src=$tmp2
+    echo "  pproxy: io_uring 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("listen"), ic.get("backend"), ic.get("ifname"))')"
+    echo "  pproxy: io_uring 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("bind"), ic.get("backend"), ic.get("ifname"))')"
   fi
 
   echo "  pproxy: scp 配置 $pp1_src → ${LEAF1_HOST}:${VM_PP1_CFG} …"
@@ -876,7 +952,7 @@ PY
   sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$pp2_src" \
     "${UBUNTU_USER}@${LEAF2_HOST}:${VM_PP2_CFG}"
 
-  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "netmap" || "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     rm -f "${pp1_src}" "${pp2_src}"
   fi
 }
@@ -990,15 +1066,19 @@ pproxy_smoke() {
     echo "     需要 xdpcap 抓包 hook 时自编译 .o 并设 PPROXY_XDPCAP_BPF=… 或放入 build/xsk_xdpcap.bpf.o" >&2
   fi
   echo "  Using: $PPROXY_BIN"
-  echo "  Tunnel: $TUNNEL_MODE  I/O: left=${DEPLOY_IO_LEFT}  right=${DEPLOY_IO_RIGHT}"
+  echo "  Tunnel: $TUNNEL_MODE  I/O: left=${DEPLOY_IO_LEFT}  right=${DEPLOY_IO_RIGHT}  ks_backend=${DEPLOY_KS_BACKEND:-syscall}"
   echo "  Config: $PP1_JSON + $PP2_JSON"
 
   local NEED_DPDK=0
+  local NEED_IO_URING=0
   if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
     NEED_DPDK=1
   fi
-  pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK"
-  pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK"
+  if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+    NEED_IO_URING=1
+  fi
+  pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK" "$NEED_IO_URING"
+  pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK" "$NEED_IO_URING"
   if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
     pproxy_install_netmap
   fi
@@ -1117,6 +1197,18 @@ if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
 elif [[ "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
   echo ""
   echo "=== [3.5/5] netmap: probe WAN ifname for io_cfg ==="
+  read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+  read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+  echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
+  echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+  if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
+    echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+    exit 1
+  fi
+  export LEAF1_WAN_DEV LEAF2_WAN_DEV
+elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+  echo ""
+  echo "=== [3.5/5] io_uring: probe WAN ifname for io_cfg.ifname (SO_BINDTODEVICE) ==="
   read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
   read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
   echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
