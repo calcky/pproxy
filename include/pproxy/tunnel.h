@@ -73,6 +73,8 @@ typedef enum pp_ks_backend {
     PP_KS_BACKEND_IO_URING = 1,
 } pp_ks_backend_t;
 
+#define PP_KS_TX_ZC_MIN_BYTES_DEFAULT 8192u
+
 /* ---------- 配置 ---------- */
 typedef struct pp_tunnel_cfg {
     pp_tunnel_proto_t proto;        /* 协议编码 */
@@ -98,6 +100,9 @@ typedef struct pp_tunnel_cfg {
             pp_ks_backend_t backend;
             uint32_t        sq_entries;
             const char     *ifname;
+            bool            tx_zc;
+            uint32_t        tx_zc_min_bytes; /* 低于此长度不用 SEND_ZC，默认 8192 */
+            uint32_t        batch_tx;        /* io_uring TX burst 上限；0/1=逐包 */
         } ks;
         struct {
             /* 可选：仅 bind(SO_BINDTODEVICE) 限定出口。不填走路由表。 */
@@ -176,6 +181,11 @@ int                    pp_tunnel_register(const pp_tunnel_ops_t *ops);
 extern const pp_tunnel_ops_t pp_tunnel_tcp;
 extern const pp_tunnel_ops_t pp_tunnel_udp;
 extern const pp_tunnel_ops_t pp_tunnel_icmp;
+
+#ifdef PP_HAVE_IO_URING
+/* UDP kernel_socket 专用 burst 发送（不扩 vtable）；非 uring 回退逐包 send */
+int pp_udp_ks_send_burst(void *ctx, const pp_tun_buf_t *bufs, int n, int *results);
+#endif
 
 #ifdef __cplusplus
 }

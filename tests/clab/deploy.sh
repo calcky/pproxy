@@ -11,6 +11,7 @@
 #   ./deploy.sh --left-io=tun --right-io=dpdk            # 右手 DPDK；需 hugepages + vfio-pci 已绑数据网卡（DPDK 接管后内核不可见）
 #   ./deploy.sh --left-io=tun --right-io=netmap          # 右手 netmap；pproxy 用户态 ARP 学习/应答（勿依赖 leaf 内核 ARP）
 #   ./deploy.sh --left-io=tun --right-io=io_uring        # 右手 kernel_socket + io_cfg.backend=io_uring（仍走内核协议栈）
+#   ./deploy.sh --left-io=tun --right-io=io_uring --io-uring-zc   # 同上 + io_cfg.tx_zc（SEND_ZC）
 #   PPROXY_TUNNEL_MODE=icmp ./deploy.sh   # 同上，环境变量（命令行 --tunnel= 优先）
 #   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
 #   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
@@ -115,6 +116,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, io_uring
                            省略或 auto 时：tcp/udp→kernel_socket，icmp→raw_socket
                            io_uring：等价 kernel_socket + io_cfg.backend=io_uring（需 ./build.sh --io-uring）
+                           --io-uring-zc / --no-io-uring-zc  强制开启/关闭 io_cfg.tx_zc（SEND_ZC；默认沿用 JSON 模板）
                            注意：dpdk 需要 hugepages + vfio-pci 已绑指定数据网卡；DPDK 接管后内核不可见，
                                  不能与 kernel_socket 共用同一张卡；router 需静态 ARP
                            netmap 需内核 netmap 模块；入向 ARP 由 pproxy 用户态处理，router 可动态 ARP
@@ -132,6 +134,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   PPROXY_TUNNEL_MODE       同 --tunnel（命令行优先）
   PPROXY_LEFT_IO, PPROXY_RIGHT_IO  同 --left-io / --right-io（命令行优先）
   PPROXY_KS_BACKEND                同 --ks-backend（syscall|io_uring；命令行优先）
+  PPROXY_IO_URING_ZC=0|1             同 --no-io-uring-zc / --io-uring-zc（未设则沿用 JSON 模板）
   PPROXY_COREDUMP, PPROXY_GDB, PPROXY_GDB_TUNNEL
   CLAB_SUDO=1              使用 sudo 调用 containerlab
   PPROXY_XDPCAP_BPF=路径   宿主机 xsk_xdpcap.bpf.o（可选；有则随 af_xdp 一起部署到 VM）
@@ -166,12 +169,29 @@ for a in "$@"; do
     PPROXY_RIGHT_IO="${a#--right-io=}"
   elif [[ "$a" == --ks-backend=* ]]; then
     PPROXY_KS_BACKEND="${a#--ks-backend=}"
+  elif [[ "$a" == --io-uring-zc ]]; then
+    PPROXY_IO_URING_ZC=1
+  elif [[ "$a" == --no-io-uring-zc ]]; then
+    PPROXY_IO_URING_ZC=0
   else
     CLAB_ARGS+=("$a")
   fi
 done
 # set -u：未设时为空串；可由 --gdb-tunnel / --no-gdb-tunnel 或环境变量覆盖
 : "${PPROXY_GDB_TUNNEL:=}"
+# io_uring TX ZC：空=沿用模板；0=关；1=开（--io-uring-zc / --no-io-uring-zc / PPROXY_IO_URING_ZC）
+if [[ -n "${PPROXY_IO_URING_ZC:-}" ]]; then
+  case "$(printf '%s' "$PPROXY_IO_URING_ZC" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)  DEPLOY_IO_URING_ZC=1 ;;
+    0|false|no|off) DEPLOY_IO_URING_ZC=0 ;;
+    *)
+      echo "Invalid PPROXY_IO_URING_ZC=${PPROXY_IO_URING_ZC} (use 0, 1, or --io-uring-zc / --no-io-uring-zc)" >&2
+      exit 1
+      ;;
+  esac
+else
+  DEPLOY_IO_URING_ZC=""
+fi
 
 if [[ "$DEPLOY_HELP" -eq 1 ]]; then
   deploy_print_help
@@ -848,16 +868,18 @@ with open(dst, 'w', encoding='utf-8') as f:
 PY
 }
 
-# io_uring：io 仍为 kernel_socket；注入 io_cfg.backend + SO_BINDTODEVICE(WAN)；显式 listen/bind
+# io_uring：io 仍为 kernel_socket；注入 backend/ifname/listen|bind；可选 tx_zc
+# 第 6 参 tx_zc：空=沿用模板；1=强制 zerocopy；0=强制关闭
 uring_render_cfg() {
   local src=$1
   local dst=$2
   local wan_dev=$3
   local local_ep=${4:-}
   local sq_entries=${5:-256}
-  python3 - "$src" "$dst" "$wan_dev" "$local_ep" "$sq_entries" <<'PY'
+  local tx_zc=${6:-}
+  python3 - "$src" "$dst" "$wan_dev" "$local_ep" "$sq_entries" "$tx_zc" <<'PY'
 import json, sys
-src, dst, wan, local_ep, sq = sys.argv[1:6]
+src, dst, wan, local_ep, sq, tx_zc = sys.argv[1:7]
 with open(src, encoding='utf-8') as f:
     d = json.load(f)
 t = d['tunnels'][0]
@@ -866,6 +888,12 @@ io['backend'] = 'io_uring'
 io['sq_entries'] = int(sq)
 if wan:
     io['ifname'] = wan
+if tx_zc == '1':
+    io['zerocopy'] = True
+    io['tx_zc'] = True
+elif tx_zc == '0':
+    io['zerocopy'] = False
+    io['tx_zc'] = False
 if local_ep:
     if t.get('mode', 'client') == 'server':
         t['listen'] = local_ep
@@ -937,12 +965,12 @@ PY
     : "${LEAF2_WAN_DEV:?io_uring push: LEAF2_WAN_DEV 未设置}"
     local tmp1=$(mktemp --suffix=.json)
     local tmp2=$(mktemp --suffix=.json)
-    uring_render_cfg "$PP1_JSON" "$tmp1" "$LEAF1_WAN_DEV" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
-    uring_render_cfg "$PP2_JSON" "$tmp2" "$LEAF2_WAN_DEV" "${LEAF2_WAN_IP}:0"
+    uring_render_cfg "$PP1_JSON" "$tmp1" "$LEAF1_WAN_DEV" "${LEAF1_WAN_IP}:${TUNNEL_PORT}" 256 "${DEPLOY_IO_URING_ZC:-}"
+    uring_render_cfg "$PP2_JSON" "$tmp2" "$LEAF2_WAN_DEV" "${LEAF2_WAN_IP}:0" 256 "${DEPLOY_IO_URING_ZC:-}"
     pp1_src=$tmp1
     pp2_src=$tmp2
-    echo "  pproxy: io_uring 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("listen"), ic.get("backend"), ic.get("ifname"))')"
-    echo "  pproxy: io_uring 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("bind"), ic.get("backend"), ic.get("ifname"))')"
+    echo "  pproxy: io_uring 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("listen"), ic.get("backend"), ic.get("ifname"), "tx_zc="+str(ic.get("tx_zc", ic.get("zerocopy"))))')"
+    echo "  pproxy: io_uring 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t.get("io_cfg",{}); print(t.get("bind"), ic.get("backend"), ic.get("ifname"), "tx_zc="+str(ic.get("tx_zc", ic.get("zerocopy"))))')"
   fi
 
   echo "  pproxy: scp 配置 $pp1_src → ${LEAF1_HOST}:${VM_PP1_CFG} …"
@@ -1066,7 +1094,7 @@ pproxy_smoke() {
     echo "     需要 xdpcap 抓包 hook 时自编译 .o 并设 PPROXY_XDPCAP_BPF=… 或放入 build/xsk_xdpcap.bpf.o" >&2
   fi
   echo "  Using: $PPROXY_BIN"
-  echo "  Tunnel: $TUNNEL_MODE  I/O: left=${DEPLOY_IO_LEFT}  right=${DEPLOY_IO_RIGHT}  ks_backend=${DEPLOY_KS_BACKEND:-syscall}"
+  echo "  Tunnel: $TUNNEL_MODE  I/O: left=${DEPLOY_IO_LEFT}  right=${DEPLOY_IO_RIGHT}  ks_backend=${DEPLOY_KS_BACKEND:-syscall}  io_uring_zc=${DEPLOY_IO_URING_ZC:-template}"
   echo "  Config: $PP1_JSON + $PP2_JSON"
 
   local NEED_DPDK=0

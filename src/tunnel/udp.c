@@ -318,6 +318,16 @@ static unsigned udp_ks_sq_entries(const struct udp_ctx *c)
     return n ? n : 256u;
 }
 
+#ifdef PP_HAVE_IO_URING
+static void udp_ks_uring_opts(const struct udp_ctx *c, pp_uring_opts_t *o)
+{
+    pp_uring_opts_defaults(o, udp_ks_sq_entries(c));
+    o->tx_zc       = c->cfg.io_cfg.ks.tx_zc;
+    o->tx_zc_min_bytes = c->cfg.io_cfg.ks.tx_zc_min_bytes
+        ? c->cfg.io_cfg.ks.tx_zc_min_bytes : PP_URING_TX_ZC_MIN_DEFAULT;
+}
+#endif
+
 /* -------------------- kernel_socket 路径 -------------------- */
 
 static int ks_connect(struct udp_ctx *c)
@@ -348,13 +358,16 @@ static int ks_connect(struct udp_ctx *c)
 
 #ifdef PP_HAVE_IO_URING
     if (udp_ks_use_uring(c)) {
-        rc = pp_uring_sock_new(c->fd, udp_ks_sq_entries(c), &c->uring);
+        pp_uring_opts_t uopt;
+        udp_ks_uring_opts(c, &uopt);
+        rc = pp_uring_sock_new(c->fd, &uopt, &c->uring);
         if (rc != PP_OK) {
             close(c->fd);
             c->fd = -1;
             return rc;
         }
-        PP_INFO("udp tunnel io_uring backend (sq=%u, fd=%d)", udp_ks_sq_entries(c), c->fd);
+        PP_INFO("udp tunnel io_uring (sq=%u tx_zc=%d min=%u fd=%d)",
+                uopt.sq_entries, uopt.tx_zc, uopt.tx_zc_min_bytes, c->fd);
     }
 #endif
     return PP_OK;
@@ -386,6 +399,57 @@ static int ks_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
     if (w < 0) return w;
     return (int)buf->len;
 }
+
+static int ks_send_burst(struct udp_ctx *c, const pp_tun_buf_t *bufs, int n, int *results)
+{
+    if (!bufs || !results || n <= 0) return PP_ERR_INVAL;
+    if (n > PP_PKT_BURST_MAX) return PP_ERR_INVAL;
+
+#ifdef PP_HAVE_IO_URING
+    if (c->uring) {
+        if (c->cfg.mode == PP_TMODE_SERVER && !c->peer_known) {
+            for (int i = 0; i < n; i++)
+                results[i] = PP_ERR_AGAIN;
+            return PP_OK;
+        }
+        pp_uring_send_item_t items[PP_PKT_BURST_MAX];
+        for (int i = 0; i < n; i++) {
+            if (bufs[i].len > UDP_RX_MAX) {
+                results[i] = PP_ERR_INVAL;
+                continue;
+            }
+            items[i].buf     = bufs[i].data;
+            items[i].len     = bufs[i].len;
+            if (c->cfg.mode == PP_TMODE_SERVER) {
+                items[i].peer    = (const struct sockaddr *)&c->peer_sa;
+                items[i].peer_sl = c->peer_sl;
+            } else {
+                items[i].peer    = NULL;
+                items[i].peer_sl = 0;
+            }
+        }
+        int rc = pp_uring_udp_send_burst(c->uring, c->fd, items, n, results);
+        for (int i = 0; i < n; i++) {
+            if (results[i] > 0 && (size_t)results[i] == bufs[i].len)
+                results[i] = (int)bufs[i].len;
+        }
+        return rc;
+    }
+#endif
+    for (int i = 0; i < n; i++)
+        results[i] = ks_send(c, &bufs[i]);
+    return PP_OK;
+}
+
+#ifdef PP_HAVE_IO_URING
+int pp_udp_ks_send_burst(void *ctx, const pp_tun_buf_t *bufs, int n, int *results)
+{
+    struct udp_ctx *c = ctx;
+    if (!c || c->cfg.io != PP_TIO_KERNEL_SOCKET)
+        return PP_ERR_INVAL;
+    return ks_send_burst(c, bufs, n, results);
+}
+#endif
 
 static int ks_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 {

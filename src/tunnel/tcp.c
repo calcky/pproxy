@@ -52,6 +52,16 @@ static unsigned tcp_ks_sq_entries(const struct tcp_ctx *c)
     return n ? n : 256u;
 }
 
+#ifdef PP_HAVE_IO_URING
+static void tcp_ks_uring_opts(const struct tcp_ctx *c, pp_uring_opts_t *o)
+{
+    pp_uring_opts_defaults(o, tcp_ks_sq_entries(c));
+    o->tx_zc       = c->cfg.io_cfg.ks.tx_zc;
+    o->tx_zc_min_bytes = c->cfg.io_cfg.ks.tx_zc_min_bytes
+        ? c->cfg.io_cfg.ks.tx_zc_min_bytes : PP_URING_TX_ZC_MIN_DEFAULT;
+}
+#endif
+
 static void tcp_uring_drop(struct tcp_ctx *c)
 {
 #ifdef PP_HAVE_IO_URING
@@ -71,7 +81,9 @@ static int tcp_uring_attach(struct tcp_ctx *c)
         return PP_OK;
     if (c->uring)
         return PP_OK;
-    return pp_uring_sock_new(c->conn_fd, tcp_ks_sq_entries(c), &c->uring);
+    pp_uring_opts_t uopt;
+    tcp_ks_uring_opts(c, &uopt);
+    return pp_uring_sock_new(c->conn_fd, &uopt, &c->uring);
 #else
     (void)c;
     return PP_OK;

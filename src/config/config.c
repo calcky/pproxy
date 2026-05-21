@@ -419,6 +419,30 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
             }
             cfg->io_cfg.ks.sq_entries = (uint32_t)jint(ioc, "sq_entries", 256);
             cfg->io_cfg.ks.ifname = dup_to_rt(rt, jstr(ioc, "ifname", ""));
+            cfg->io_cfg.ks.tx_zc = jbool(ioc, "tx_zc", jbool(ioc, "zerocopy", false));
+            cfg->io_cfg.ks.tx_zc_min_bytes =
+                (uint32_t)jint(ioc, "tx_zc_min_bytes", (int64_t)PP_KS_TX_ZC_MIN_BYTES_DEFAULT);
+            cfg->io_cfg.ks.batch_tx = (uint32_t)jint(ioc, "batch_tx", 0);
+            if (cfg->io_cfg.ks.batch_tx > PP_PKT_BURST_MAX) {
+                PP_WARN("config: batch_tx=%u capped to %d",
+                        cfg->io_cfg.ks.batch_tx, PP_PKT_BURST_MAX);
+                cfg->io_cfg.ks.batch_tx = PP_PKT_BURST_MAX;
+            }
+            if (cfg->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING) {
+                if (cfg->io_cfg.ks.batch_tx > 1 && cfg->io_cfg.ks.tx_zc) {
+                    PP_WARN("config: batch_tx=%u disables tx_zc (incompatible)",
+                            cfg->io_cfg.ks.batch_tx);
+                    cfg->io_cfg.ks.tx_zc = false;
+                }
+                if (cfg->io_cfg.ks.batch_tx > 1) {
+                    uint32_t need = cfg->io_cfg.ks.batch_tx * 2u;
+                    if (cfg->io_cfg.ks.sq_entries < need) {
+                        PP_WARN("config: sq_entries=%u < 2*batch_tx (%u); raising to %u",
+                                cfg->io_cfg.ks.sq_entries, cfg->io_cfg.ks.batch_tx, need);
+                        cfg->io_cfg.ks.sq_entries = need;
+                    }
+                }
+            }
             break;
         }
         default:

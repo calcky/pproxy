@@ -36,6 +36,101 @@ static int rtx_init(pp_module_t *m, void *cfg)
     return PP_OK;
 }
 
+static void rtx_nanosleep_again(void)
+{
+    struct timespec ts = {0, RTX_SEND_AGAIN_NS};
+    nanosleep(&ts, NULL);
+}
+
+static int rtx_send_one(int idx, const pp_tun_buf_t *b)
+{
+    int r;
+    for (int a = 0; ; a++) {
+        r = g_rt->tun_ops[idx]->send(g_rt->tun_ctx[idx], b);
+        if (r != PP_ERR_AGAIN) break;
+        if (a >= RTX_SEND_AGAIN_MAX) break;
+        rtx_nanosleep_again();
+    }
+    return r;
+}
+
+#ifdef PP_HAVE_IO_URING
+static bool rtx_use_uring_burst(int idx)
+{
+    const pp_tunnel_cfg_t *tc = &g_rt->tun_cfg[idx];
+    return tc->io == PP_TIO_KERNEL_SOCKET
+        && tc->proto == PP_PROTO_UDP
+        && tc->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING
+        && tc->io_cfg.ks.batch_tx > 1;
+}
+
+static void rtx_handle_send_result(rtx_priv_t *p, pp_pkt_t *pkt, uint64_t sid, int r)
+{
+    if (r < 0) {
+        PP_TRACE("right_tx: tunnel send failed: %s (r=%d)", pp_strerror(r), r);
+        pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
+        p->drops++;
+    } else {
+        p->out++;
+    }
+    pp_pkt_put_ref(pkt);
+}
+
+static void rtx_burst_send(rtx_priv_t *p, pp_pkt_t **batch, int n)
+{
+    pp_tun_buf_t bufs[PP_PKT_BURST_MAX];
+    pp_pkt_t    *valid[PP_PKT_BURST_MAX];
+    uint64_t     sids[PP_PKT_BURST_MAX];
+    int          results[PP_PKT_BURST_MAX];
+    int          nv = 0;
+
+    for (int i = 0; i < n; i++) {
+        pp_pkt_t *pkt = batch[i];
+        if (!PP_TUN_TX_PAYLOAD_LEN_OK(pkt->data_len)) {
+            pp_drop_orphan_pkt(0, PP_ORPHAN_RTX_BAD_PKT, "right_tx",
+                               "bad pkt length", pkt);
+            pp_pkt_put_ref(pkt);
+            p->drops++;
+            continue;
+        }
+        bufs[nv].data = pkt->data;
+        bufs[nv].len  = pkt->data_len;
+        valid[nv]     = pkt;
+        sids[nv]      = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
+        nv++;
+    }
+    if (nv <= 0)
+        return;
+
+    unsigned btx = g_rt->tun_cfg[p->idx].io_cfg.ks.batch_tx;
+    if (btx > PP_PKT_BURST_MAX)
+        btx = PP_PKT_BURST_MAX;
+
+    for (int off = 0; off < nv; off += (int)btx) {
+        int chunk = nv - off;
+        if (chunk > (int)btx)
+            chunk = (int)btx;
+
+        int brc = pp_udp_ks_send_burst(g_rt->tun_ctx[p->idx],
+                                       bufs + off, chunk, results + off);
+        if (brc < 0) {
+            for (int i = off; i < off + chunk; i++) {
+                int r = rtx_send_one(p->idx, &bufs[i]);
+                rtx_handle_send_result(p, valid[i], sids[i], r);
+            }
+            continue;
+        }
+
+        for (int i = off; i < off + chunk; i++) {
+            int r = results[i];
+            if (r == PP_ERR_AGAIN)
+                r = rtx_send_one(p->idx, &bufs[i]);
+            rtx_handle_send_result(p, valid[i], sids[i], r);
+        }
+    }
+}
+#endif
+
 static void *rtx_loop(void *arg)
 {
     pp_module_t *m = arg;
@@ -53,6 +148,15 @@ static void *rtx_loop(void *arg)
             p->loops++; continue;
         }
         p->in += n;
+
+#ifdef PP_HAVE_IO_URING
+        if (rtx_use_uring_burst(p->idx)) {
+            rtx_burst_send(p, batch, n);
+            p->loops++;
+            continue;
+        }
+#endif
+
         for (int i = 0; i < n; i++) {
             pp_pkt_t *pkt = batch[i];
             if (!PP_TUN_TX_PAYLOAD_LEN_OK(pkt->data_len)) {
@@ -64,14 +168,10 @@ static void *rtx_loop(void *arg)
             }
             uint64_t sid = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
             pp_tun_buf_t b = { .data = pkt->data, .len = pkt->data_len };
-            int r;
-            for (int a = 0; ; a++) {
-                r = g_rt->tun_ops[p->idx]->send(g_rt->tun_ctx[p->idx], &b);
-                if (r != PP_ERR_AGAIN) break;
-                if (a >= RTX_SEND_AGAIN_MAX) break;
-                struct timespec ts = {0, RTX_SEND_AGAIN_NS};
-                nanosleep(&ts, NULL);
-            }
+            int r = rtx_send_one(p->idx, &b);
+#ifdef PP_HAVE_IO_URING
+            rtx_handle_send_result(p, pkt, sid, r);
+#else
             if (r < 0) {
                 PP_TRACE("right_tx: tunnel send failed: %s (r=%d)", pp_strerror(r), r);
                 pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
@@ -79,6 +179,7 @@ static void *rtx_loop(void *arg)
             } else
                 p->out++;
             pp_pkt_put_ref(pkt);
+#endif
         }
         p->loops++;
     }
