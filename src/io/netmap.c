@@ -18,9 +18,9 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <poll.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -44,6 +44,10 @@ struct pp_netmap_io {
     char            phyif[IFNAMSIZ];    /* 去前缀的纯接口名，仅用于 ARP/MAC 查询 */
     uint8_t         src_mac[6];
     uint8_t         dst_mac[6];
+    uint32_t        local_ip_be;        /* phyif 上主 IPv4，用于答 ARP */
+    bool            has_local_ip;
+#define PP_NM_ARP_CACHE 32
+    struct { uint32_t ip_be; uint8_t mac[6]; bool valid; } arp_cache[PP_NM_ARP_CACHE];
     uint8_t         rx_stash[PP_NM_RX_STASH];
     size_t          rx_stash_len;
 };
@@ -297,6 +301,149 @@ static void nm_mac_fmt(const uint8_t m[6], char *buf, size_t cap)
              m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
+static void nm_arp_cache_put(struct pp_netmap_io *p, uint32_t ip_be,
+                             const uint8_t mac[6])
+{
+    if (!ip_be || nm_mac_is_zero(mac)) return;
+    for (int i = 0; i < PP_NM_ARP_CACHE; i++) {
+        if (p->arp_cache[i].valid && p->arp_cache[i].ip_be == ip_be) {
+            memcpy(p->arp_cache[i].mac, mac, 6);
+            return;
+        }
+    }
+    for (int i = 0; i < PP_NM_ARP_CACHE; i++) {
+        if (!p->arp_cache[i].valid) {
+            p->arp_cache[i].ip_be = ip_be;
+            memcpy(p->arp_cache[i].mac, mac, 6);
+            p->arp_cache[i].valid = true;
+            return;
+        }
+    }
+    /* 满则覆盖最旧（slot 0） */
+    p->arp_cache[0].ip_be = ip_be;
+    memcpy(p->arp_cache[0].mac, mac, 6);
+    p->arp_cache[0].valid = true;
+}
+
+static int nm_arp_cache_lookup(struct pp_netmap_io *p, uint32_t ip_be,
+                               uint8_t mac[6])
+{
+    for (int i = 0; i < PP_NM_ARP_CACHE; i++) {
+        if (p->arp_cache[i].valid && p->arp_cache[i].ip_be == ip_be) {
+            memcpy(mac, p->arp_cache[i].mac, 6);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* RX ring 开 NR_FORWARD，非 IP/已处理 ARP 以外的帧可 NS_FORWARD 交还 host */
+static void nm_rx_enable_forward(struct nm_desc *d)
+{
+    if (!d || !d->nifp) return;
+    for (uint32_t ri = d->first_rx_ring; ri <= d->last_rx_ring; ri++) {
+        struct netmap_ring *ring = NETMAP_RXRING(d->nifp, ri);
+        ring->flags = (uint32_t)(ring->flags | NR_FORWARD);
+    }
+}
+
+/* netmap TX 只写 userspace ring；必须 NIOCTXSYNC 才交给 host/NIC 并回收 slot */
+static void nm_tx_sync(int fd)
+{
+    if (fd < 0) return;
+    if (ioctl(fd, NIOCTXSYNC, NULL) < 0 && errno != EINTR)
+        PP_TRACE("netmap: NIOCTXSYNC: %s", strerror(errno));
+}
+
+static void nm_rx_sync(int fd)
+{
+    if (fd < 0) return;
+    if (ioctl(fd, NIOCRXSYNC, NULL) < 0 && errno != EINTR)
+        PP_TRACE("netmap: NIOCRXSYNC: %s", strerror(errno));
+}
+
+/* 用户态 ARP 应答 + 学习；netmap 模式下入向 ARP 不进内核，须在此处理 */
+static void nm_handle_arp(struct pp_netmap_io *p, const uint8_t *frame, size_t len)
+{
+    /* eth(14) + arphdr(8) + 2*(6+4) = 42 for IPv4/Ethernet ARP */
+    if (len < 42) return;
+    const struct arphdr *ah = (const struct arphdr *)(frame + PP_NM_ETH_HDR);
+    if (ntohs(ah->ar_hrd) != ARPHRD_ETHER || ntohs(ah->ar_pro) != ETH_P_IP
+        || ah->ar_hln != 6 || ah->ar_pln != 4)
+        return;
+
+    const uint8_t *sha = frame + PP_NM_ETH_HDR + sizeof(struct arphdr);
+    const uint8_t *spa = sha + 6;
+    const uint8_t *tpa = spa + 4 + 6;
+    uint16_t op = ntohs(ah->ar_op);
+
+    uint32_t sip_be; memcpy(&sip_be, spa, 4);
+    nm_arp_cache_put(p, sip_be, sha);
+
+    if (op != ARPOP_REQUEST || !p->has_local_ip) return;
+
+    uint32_t tip_be; memcpy(&tip_be, tpa, 4);
+    if (tip_be != p->local_ip_be) return;
+
+    uint8_t reply[42];
+    memcpy(reply,       sha, 6);             /* eth dst = 请求方 MAC */
+    memcpy(reply + 6,   p->src_mac, 6);
+    reply[12] = 0x08; reply[13] = 0x06;
+
+    struct arphdr *rh = (struct arphdr *)(reply + PP_NM_ETH_HDR);
+    rh->ar_hrd = htons(ARPHRD_ETHER);
+    rh->ar_pro = htons(ETH_P_IP);
+    rh->ar_hln = 6;
+    rh->ar_pln = 4;
+    rh->ar_op  = htons(ARPOP_REPLY);
+
+    uint8_t *rsha = reply + PP_NM_ETH_HDR + sizeof(struct arphdr);
+    memcpy(rsha,       p->src_mac, 6);
+    memcpy(rsha + 6,   &p->local_ip_be, 4);
+    memcpy(rsha + 10,  sha, 6);
+    memcpy(rsha + 16,  spa, 4);
+
+    if (nm_inject(p->nmd, reply, sizeof reply) > 0) {
+        nm_tx_sync(p->fd);
+        char ipstr[INET_ADDRSTRLEN], sm[24];
+        struct in_addr ia = { .s_addr = sip_be };
+        inet_ntop(AF_INET, &ia, ipstr, sizeof ipstr);
+        nm_mac_fmt(sha, sm, sizeof sm);
+        PP_INFO("netmap: ARP reply %s is-at %s (requester %s)",
+                ipstr, sm, p->phyif);
+    }
+}
+
+static int nm_rx_peek(struct nm_desc *d, u_char **buf, size_t *len, uint32_t *out_ri)
+{
+    int ri = (int)d->cur_rx_ring;
+    int start = ri;
+    do {
+        struct netmap_ring *ring = NETMAP_RXRING(d->nifp, (uint32_t)ri);
+        if (!nm_ring_empty(ring)) {
+            u_int i = ring->cur;
+            *buf = (u_char *)NETMAP_BUF(ring, ring->slot[i].buf_idx);
+            *len = ring->slot[i].len;
+            *out_ri = (uint32_t)ri;
+            return (int)i;
+        }
+        ri++;
+        if (ri > (int)d->last_rx_ring)
+            ri = (int)d->first_rx_ring;
+    } while (ri != start);
+    return -1;
+}
+
+static void nm_rx_release(struct nm_desc *d, uint32_t ri, int slot_i, bool forward)
+{
+    struct netmap_ring *ring = NETMAP_RXRING(d->nifp, ri);
+    if (forward)
+        ring->slot[(u_int)slot_i].flags = NS_FORWARD;
+    ring->cur = nm_ring_next(ring, (u_int)slot_i);
+    ring->head = ring->cur;
+    d->cur_rx_ring = ri;
+}
+
 static int nm_fill_dst_mac(struct pp_netmap_io *p, uint32_t l3_dst_be,
                            const uint8_t *peer_mac_opt)
 {
@@ -316,6 +463,15 @@ static int nm_fill_dst_mac(struct pp_netmap_io *p, uint32_t l3_dst_be,
         inet_ntop(AF_INET, &aa, pa, sizeof pa);
         inet_ntop(AF_INET, &ab, pb, sizeof pb);
         PP_INFO("netmap: L3 目的 %s -> 按路由邻居/ARP 目标 %s", pa, pb);
+    }
+    if (nm_arp_cache_lookup(p, arp_for, p->dst_mac) == 0) {
+        char dm[24], ipe[INET_ADDRSTRLEN];
+        struct in_addr ia = { .s_addr = arp_for };
+        inet_ntop(AF_INET, &ia, ipe, sizeof ipe);
+        nm_mac_fmt(p->dst_mac, dm, sizeof dm);
+        PP_INFO("netmap: %s dst_mac from ARP cache (%s) -> %s",
+                p->phyif, ipe, dm);
+        return PP_OK;
     }
     if (nm_arp_from_proc(p->phyif, arp_for, p->dst_mac, 2000) == 0) {
         char dm[24], ipe[INET_ADDRSTRLEN];
@@ -374,6 +530,11 @@ int pp_netmap_io_new(struct pp_netmap_io **out,
             char sm[24]; nm_mac_fmt(p->src_mac, sm, sizeof sm);
             PP_INFO("netmap: %s src_mac=%s", p->phyif, sm);
         }
+        struct in_addr la;
+        if (nm_get_ifaddr_v4(p->phyif, &la) == 0) {
+            p->local_ip_be = la.s_addr;
+            p->has_local_ip = true;
+        }
     }
 
     if (arp_nexthop_be) {
@@ -396,6 +557,7 @@ int pp_netmap_io_new(struct pp_netmap_io **out,
         free(p);
         return PP_ERR_IO;
     }
+    nm_rx_enable_forward(p->nmd);
     p->fd = NETMAP_FD(p->nmd);
     PP_INFO("netmap: opened %s fd=%d tx_rings=[%u..%u] rx_rings=[%u..%u]",
             p->ifname, p->fd,
@@ -443,42 +605,60 @@ int pp_netmap_io_inject_ip(struct pp_netmap_io *p, const uint8_t *ip, size_t len
     memcpy(frame + PP_NM_ETH_HDR, ip, len);
     size_t tot = PP_NM_ETH_HDR + len;
 
-    int r = nm_inject(p->nmd, frame, tot);
-    if (r == 0) return PP_ERR_AGAIN;        /* TX ring 满 */
-
-    /* nm_inject 只填 ring，没 NIOCTXSYNC；用 poll(0) kick 内核发包 */
-    struct pollfd pf = { .fd = p->fd, .events = POLLOUT };
-    (void)poll(&pf, 1, 0);
-    return (int)len;
+    /* ring 满时 sync 后重试；高带宽(iperf)下不 kick 会迅速耗尽 TX slot */
+    enum { NM_INJECT_RETRIES = 64 };
+    for (int t = 0; t < NM_INJECT_RETRIES; t++) {
+        int r = nm_inject(p->nmd, frame, tot);
+        if (r > 0) {
+            nm_tx_sync(p->fd);
+            return (int)len;
+        }
+        nm_tx_sync(p->fd);
+    }
+    return PP_ERR_AGAIN;
 }
 
 const uint8_t *pp_netmap_io_next_ip(struct pp_netmap_io *p, size_t *out_len)
 {
     if (!p || !p->nmd) return NULL;
 
-    /* 触发 NIOCRXSYNC：让内核把新到包 push 进 ring；超时 0 = 不阻塞 */
-    struct pollfd pf = { .fd = p->fd, .events = POLLIN };
-    (void)poll(&pf, 1, 0);
+    nm_rx_sync(p->fd);
 
-    struct nm_pkthdr hdr;
-    u_char *frame = nm_nextpkt(p->nmd, &hdr);
-    if (!frame) return NULL;
+    for (;;) {
+        u_char *frame = NULL;
+        size_t flen = 0;
+        uint32_t ri = 0;
+        int slot_i = nm_rx_peek(p->nmd, &frame, &flen, &ri);
+        if (slot_i < 0 || !frame)
+            return NULL;
 
-    size_t flen = hdr.caplen;
-    size_t off = 0;
-    if (flen >= PP_NM_ETH_HDR) {
+        uint16_t eth_type = (flen >= PP_NM_ETH_HDR)
+            ? (uint16_t)((frame[12] << 8) | frame[13]) : 0;
+
+        if (eth_type == ETH_P_ARP) {
+            nm_handle_arp(p, frame, flen);
+            nm_rx_release(p->nmd, ri, slot_i, false);
+            continue;
+        }
+
+        if (eth_type != ETH_P_IP) {
+            /* 非 IP/ARP：NS_FORWARD 交还 host（需 NR_FORWARD） */
+            nm_rx_release(p->nmd, ri, slot_i, true);
+            continue;
+        }
+
+        size_t off = PP_NM_ETH_HDR;
         if (flen >= PP_NM_ETH_HDR + 4 && frame[12] == 0x81 && frame[13] == 0x00)
             off = PP_NM_ETH_HDR + 4;
-        else
-            off = PP_NM_ETH_HDR;
-    }
-    size_t ip_len = (flen > off) ? (size_t)(flen - off) : 0;
-    if (ip_len > sizeof p->rx_stash) ip_len = sizeof p->rx_stash;
-    memcpy(p->rx_stash, frame + off, ip_len);
-    p->rx_stash_len = ip_len;
+        size_t ip_len = (flen > off) ? (size_t)(flen - off) : 0;
+        if (ip_len > sizeof p->rx_stash) ip_len = sizeof p->rx_stash;
+        memcpy(p->rx_stash, frame + off, ip_len);
+        p->rx_stash_len = ip_len;
+        nm_rx_release(p->nmd, ri, slot_i, false);
 
-    if (out_len) *out_len = ip_len;
-    return p->rx_stash;
+        if (out_len) *out_len = ip_len;
+        return p->rx_stash;
+    }
 }
 
 /* ====================================================================

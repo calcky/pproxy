@@ -9,6 +9,7 @@
 #   ./deploy.sh --tunnel=tcp        # 隧道协议：默认 udp；可选 tcp、icmp
 #   ./deploy.sh --left-io=tun --right-io=kernel_socket   # 左右手 I/O，见 --help
 #   ./deploy.sh --left-io=tun --right-io=dpdk            # 右手 DPDK；需 hugepages + vfio-pci 已绑数据网卡（DPDK 接管后内核不可见）
+#   ./deploy.sh --left-io=tun --right-io=netmap          # 右手 netmap；pproxy 用户态 ARP 学习/应答（勿依赖 leaf 内核 ARP）
 #   PPROXY_TUNNEL_MODE=icmp ./deploy.sh   # 同上，环境变量（命令行 --tunnel= 优先）
 #   ./deploy.sh --gdb              # 各 leaf 用 gdbserver 起 pproxy（与 .vscode/launch.json 端口 2345/2346 一致，便于 VSCode 联调；metrics smoke 会跳过）
 #   与 --gdb 时默认在本机起 ssh -L（tests/clab/gdb-tunnel.sh）把 localhost:2345/2346 转到各 VM 上 gdbserver；勿开: --no-gdb-tunnel 或 PPROXY_GDB_TUNNEL=0
@@ -37,8 +38,8 @@
 #   关闭: PPROXY_COREDUMP=0 ./deploy.sh
 #
 # 未设 PPROXY_SKIP_BUILD=1 且非 --no-pproxy 时，本脚本会在「[1/5]」前自动在仓库根执行
-#   ./build.sh --xdp --pcap
-# 以生成与 leaf 上 libbpf/libxdp/libpcap 依赖一致的 build/pproxy。宿主机缺依赖则先装或跳过编译。
+#   ./build.sh --xdp --pcap [--dpdk] [--netmap]（随 --left-io / --right-io 追加）
+# 以生成与 leaf 上依赖一致的 build/pproxy。
 #
 # 命令行帮助:  ./deploy.sh --help
 #
@@ -113,7 +114,9 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk
                            省略或 auto 时：tcp/udp→kernel_socket，icmp→raw_socket
                            注意：dpdk 需要 hugepages + vfio-pci 已绑指定数据网卡；DPDK 接管后内核不可见，
-                                 不能与 kernel_socket 共用同一张卡
+                                 不能与 kernel_socket 共用同一张卡；router 需静态 ARP
+                           netmap 需内核 netmap 模块；入向 ARP 由 pproxy 用户态处理，router 可动态 ARP
+                           （netmap.ko 在宿主机 Docker 编一次，见 tests/clab/build-netmap-ko.sh）
   --gdb / --no-gdb         是否用 gdbserver 起 pproxy（默认 --no-gdb）
   --gdb-tunnel             部署结束后在本机跑 gdb-tunnel.sh（ssh -L 转发 gdb 端口）
   --no-gdb-tunnel          不建立上述转发
@@ -129,6 +132,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   CLAB_SUDO=1              使用 sudo 调用 containerlab
   PPROXY_XDPCAP_BPF=路径   宿主机 xsk_xdpcap.bpf.o（可选；有则随 af_xdp 一起部署到 VM）
   PWRU_URL=URL              pwru 预编译包（默认 Cilium v1.0.11 linux-amd64）
+  PPROXY_NETMAP_KO=路径     跳过宿主机 docker 编译，直接使用已有 netmap.ko
 
 更完整的说明见本脚本文件头注释。
 EOF
@@ -593,73 +597,79 @@ router_iface_mac() {
   docker exec router cat "/sys/class/net/${ifname}/address"
 }
 
-# netmap 内核模块编译/加载（左右手任一为 netmap 时调）
-pproxy_install_netmap() {
+# netmap 内核模块 commit（与 third_party/netmap/ vendored 头、build-netmap-ko.sh 一致）
+NETMAP_MODULE_SHA="10986ec1479b54552333d4cef913bef3dd159727"
+
+# 读 leaf VM 内核版本（generic_vm 上 uname -r）
+pproxy_leaf_kernel_release() {
   local host=$1
-  # netmap 上游最近一次 release tag (v13.0 / 2019) 在 Linux 6.x 内核会因为
-  #   `struct timeval` / `do_gettimeofday()` 已被移除而编不过；master 分支的
-  #   LINUX/bsd_glue.h 里有 ktime_get_real_ts64 兼容 shim。
-  # 把 commit hash pin 死，与 third_party/netmap/ 里 vendoring 的头文件保持
-  # 同一 commit（NETMAP_API=14），避免 NIOCREGIF 的 nr_version 不匹配。
-  # 如要更新 netmap 版本：同步修改本变量与 third_party/netmap/README.md。
-  local NM_SHA="10986ec1479b54552333d4cef913bef3dd159727"
-  echo "  pproxy: ensuring netmap kernel module (commit ${NM_SHA:0:12}, --no-drivers) on ${host} …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" "uname -r"
+}
+
+# 宿主机 Docker 编译 netmap.ko（按 kver 缓存）；结果写入 NETMAP_KO_BUILT
+pproxy_build_netmap_ko_host() {
+  local kver=$1
+  if [[ -n "${PPROXY_NETMAP_KO:-}" && -f "$PPROXY_NETMAP_KO" ]]; then
+    NETMAP_KO_BUILT=$PPROXY_NETMAP_KO
+    echo "  pproxy: 使用 PPROXY_NETMAP_KO=${NETMAP_KO_BUILT}"
+    return 0
+  fi
+  local ko="${CLAB_DIR}/.cache/netmap/${kver}/netmap.ko"
+  if [[ ! -x "${CLAB_DIR}/build-netmap-ko.sh" ]]; then
+    echo "  ✗ 缺少 ${CLAB_DIR}/build-netmap-ko.sh" >&2
+    exit 1
+  fi
+  NETMAP_MODULE_SHA="$NETMAP_MODULE_SHA" "${CLAB_DIR}/build-netmap-ko.sh" "$kver"
+  if [[ ! -f "$ko" ]]; then
+    echo "  ✗ netmap.ko 未生成: $ko" >&2
+    exit 1
+  fi
+  NETMAP_KO_BUILT=$ko
+}
+
+# 把宿主机编好的 netmap.ko 装到单台 leaf 并 modprobe（不在 leaf 上编译）
+pproxy_install_netmap_on_leaf() {
+  local host=$1
+  local ko="${NETMAP_KO_BUILT:?netmap.ko 未构建}"
+  echo "  pproxy: install netmap.ko on ${host} (from ${ko}) …"
+  if sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    "lsmod 2>/dev/null | grep -q '^netmap\b' && test -e /dev/netmap"; then
+    echo "  ✓ ${host}: netmap module already loaded; /dev/netmap present"
+    return 0
+  fi
+  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$ko" \
+    "${UBUNTU_USER}@${host}:/tmp/netmap.ko"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" "$NM_SHA" <<'EON'
+    bash -s -- "$UBUNTU_PASS" <<'EON'
 set -euo pipefail
 PASS="$1"
-NM_SHA="$2"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
-export DEBIAN_FRONTEND=noninteractive
-
-# 已加载就直接走人（幂等）
-if lsmod 2>/dev/null | grep -q '^netmap\b' && [ -e /dev/netmap ]; then
-  echo "  ✓ netmap module already loaded; /dev/netmap present"
-  exit 0
-fi
-
 KREL="$(uname -r)"
-KBUILD="/lib/modules/${KREL}/build"
-
-s apt-get update -qq
-s apt-get install -y -qq build-essential git "linux-headers-${KREL}"
-
-# 双保险：linux-headers-<rel> 偶发未拉到 build 链接，再装一次 generic
-if [ ! -d "$KBUILD" ]; then
-  s apt-get install -y -qq linux-headers-generic || true
-fi
-if [ ! -d "$KBUILD" ]; then
-  echo "  ✗ kernel headers missing at $KBUILD; cannot build netmap.ko" >&2
-  exit 1
-fi
-
-SRC=/usr/local/src/netmap
-# 已存在但 commit 不对（之前装过 v13.0）→ 删掉重 clone
-if [ -d "$SRC" ]; then
-  cur=$(s git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "")
-  if [ "$cur" != "$NM_SHA" ]; then
-    echo "  removing stale $SRC (cur=${cur:0:12} want=${NM_SHA:0:12})"
-    s rm -rf "$SRC"
-  fi
-fi
-if [ ! -d "$SRC" ]; then
-  # 浅 clone master 再 reset 到固定 commit；避免直接 fetch 单 commit 在某些 git 版本上不稳
-  s git clone --depth=200 https://github.com/luigirizzo/netmap.git "$SRC"
-  s git -C "$SRC" -c advice.detachedHead=false checkout "$NM_SHA"
-fi
-
-cd "$SRC/LINUX"
-s ./configure --no-drivers --kernel-dir="$KBUILD"
-s make -j"$(nproc)"
-s make install
+MOD="/lib/modules/${KREL}/extra/netmap.ko"
+s install -d "/lib/modules/${KREL}/extra"
+s install -m 644 /tmp/netmap.ko "$MOD"
+rm -f /tmp/netmap.ko
 s depmod -a
 s modprobe netmap
-
-# 校验
 ls -l /dev/netmap
 lsmod | grep '^netmap\b' || { echo "  ✗ netmap not in lsmod" >&2; exit 1; }
-echo "  ✓ netmap kernel module loaded"
+echo "  ✓ netmap kernel module loaded on $(hostname)"
 EON
+}
+
+# 左右手任一为 netmap：宿主机 docker 编一次 ko，再分发到各 leaf
+pproxy_install_netmap() {
+  local k1 k2
+  k1=$(pproxy_leaf_kernel_release "$LEAF1_HOST")
+  k2=$(pproxy_leaf_kernel_release "$LEAF2_HOST")
+  echo "  pproxy: leaf kernel: ${LEAF1_HOST}=${k1}  ${LEAF2_HOST}=${k2}"
+  if [[ "$k1" != "$k2" ]]; then
+    echo "  ⚠ leaf1/leaf2 内核版本不同（${k1} vs ${k2}）；按 ${LEAF1_HOST}=${k1} 编译 netmap.ko" >&2
+    echo "     若 ${LEAF2_HOST} 加载失败，请对 ${k2} 再跑 build-netmap-ko.sh 或设 PPROXY_NETMAP_KO=" >&2
+  fi
+  pproxy_build_netmap_ko_host "$k1"
+  pproxy_install_netmap_on_leaf "$LEAF1_HOST"
+  pproxy_install_netmap_on_leaf "$LEAF2_HOST"
 }
 
 pproxy_remote_prepare() {
@@ -777,6 +787,30 @@ with open(dst, 'w', encoding='utf-8') as f:
 PY
 }
 
+# netmap：io_cfg.ifname=netmap:<WAN dev>；client 显式 bind WAN IP（与 dpdk_render_cfg 一致）
+netmap_render_cfg() {
+  local src=$1
+  local dst=$2
+  local wan_dev=$3
+  local local_ep=${4:-}
+  python3 - "$src" "$dst" "$wan_dev" "$local_ep" <<'PY'
+import json, sys
+src, dst, wan, local_ep = sys.argv[1:5]
+with open(src, encoding='utf-8') as f:
+    d = json.load(f)
+t = d['tunnels'][0]
+io = t.setdefault('io_cfg', {})
+io['ifname'] = f'netmap:{wan}'
+if local_ep:
+    if t.get('mode', 'client') == 'server':
+        t['listen'] = local_ep
+    else:
+        t['bind'] = local_ep
+with open(dst, 'w', encoding='utf-8') as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
 pproxy_push_cfgs() {
   if [[ ! -f "$PP1_JSON" ]] || [[ ! -f "$PP2_JSON" ]]; then
     echo "  ✗ 缺少配置: $PP1_JSON 或 $PP2_JSON" >&2
@@ -789,6 +823,19 @@ pproxy_push_cfgs() {
   if command -v python3 >/dev/null 2>&1; then
     python3 -c "import json,sys; [json.load(open(f,encoding='utf-8')) for f in sys.argv[1:]]" \
       "$PP1_JSON" "$PP2_JSON" || { echo "  ✗ JSON 校验失败: $PP1_JSON / $PP2_JSON" >&2; exit 1; }
+    python3 - "$PP1_JSON" "$PP2_JSON" "$DEPLOY_IO_RIGHT" <<'PY' || {
+import json, sys
+want = sys.argv[3]
+for path in sys.argv[1:3]:
+    t = json.load(open(path, encoding='utf-8'))['tunnels'][0]
+    got = t.get('io', '')
+    if got != want:
+        print(f"  ✗ {path}: tunnels[0].io={got!r} 与 --right-io={want!r} 不一致", file=sys.stderr)
+        sys.exit(1)
+PY
+      echo "  ✗ 配置 io 与 --right-io 不匹配（勿用回退 JSON 冒充 dpdk/netmap 等）" >&2
+      exit 1
+    }
   fi
 
   local pp1_src=$PP1_JSON
@@ -809,6 +856,17 @@ pproxy_push_cfgs() {
     pp2_src=$tmp2
     echo "  pproxy: DPDK 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("listen"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
     echo "  pproxy: DPDK 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("bind"), t["io_cfg"]["eal_args"], t["io_cfg"]["peer_mac"])')"
+  elif [[ "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+    : "${LEAF1_WAN_DEV:?netmap push: LEAF1_WAN_DEV 未设置 (先跑 [3.5/5] probe?)}"
+    : "${LEAF2_WAN_DEV:?netmap push: LEAF2_WAN_DEV 未设置}"
+    local tmp1=$(mktemp --suffix=.json)
+    local tmp2=$(mktemp --suffix=.json)
+    netmap_render_cfg "$PP1_JSON" "$tmp1" "$LEAF1_WAN_DEV" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    netmap_render_cfg "$PP2_JSON" "$tmp2" "$LEAF2_WAN_DEV" "${LEAF2_WAN_IP}:0"
+    pp1_src=$tmp1
+    pp2_src=$tmp2
+    echo "  pproxy: netmap 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t["io_cfg"]["ifname"])')"
+    echo "  pproxy: netmap 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t.get("bind"), t["io_cfg"]["ifname"])')"
   fi
 
   echo "  pproxy: scp 配置 $pp1_src → ${LEAF1_HOST}:${VM_PP1_CFG} …"
@@ -818,7 +876,7 @@ pproxy_push_cfgs() {
   sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$pp2_src" \
     "${UBUNTU_USER}@${LEAF2_HOST}:${VM_PP2_CFG}"
 
-  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
     rm -f "${pp1_src}" "${pp2_src}"
   fi
 }
@@ -942,8 +1000,7 @@ pproxy_smoke() {
   pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK"
   pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK"
   if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
-    pproxy_install_netmap "$LEAF1_HOST"
-    pproxy_install_netmap "$LEAF2_HOST"
+    pproxy_install_netmap
   fi
   pproxy_remote_prepare "$LEAF1_HOST"
   pproxy_remote_prepare "$LEAF2_HOST"
@@ -1057,6 +1114,21 @@ if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
   # 用 router 容器内 eth1/eth2 的 MAC 作为各 leaf 的 next-hop peer_mac
   DPDK_LEAF1_PEER_MAC=$(router_iface_mac eth1)
   DPDK_LEAF2_PEER_MAC=$(router_iface_mac eth2)
+elif [[ "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+  echo ""
+  echo "=== [3.5/5] netmap: probe WAN ifname for io_cfg ==="
+  read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+  read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+  echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
+  echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+  if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
+    echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+    exit 1
+  fi
+  export LEAF1_WAN_DEV LEAF2_WAN_DEV
+fi
+
+if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
   echo "  router: eth1 MAC=${DPDK_LEAF1_PEER_MAC} (leaf1 next-hop); eth2 MAC=${DPDK_LEAF2_PEER_MAC} (leaf2 next-hop)"
   if [[ -z "$DPDK_LEAF1_PEER_MAC" || -z "$DPDK_LEAF2_PEER_MAC" ]]; then
     echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2

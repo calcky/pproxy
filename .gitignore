@@ -59,3 +59,4 @@ build/
 tags
 TAGS
 tests/clab/clab-pproxy
+tests/clab/.cache/

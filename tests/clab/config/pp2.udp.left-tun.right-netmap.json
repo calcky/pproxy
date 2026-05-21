@@ -1,0 +1,19 @@
+{
+  "log":     { "level": "trace" },
+  "runtime": { "workers": 1 },
+  "left":    { "kind": "tun", "name": "pp2",
+               "tun": { "ifname": "ppclab2", "cidr": "192.168.0.0/24",
+                        "mtu": 1500, "no_pi": true } },
+  "tunnels": [{
+    "name": "cli", "proto": "udp", "io": "netmap",
+    "mode": "client", "server": "172.16.0.2:19900",
+    "bind": "172.16.1.2:0",
+    "udp":  { "mtu": 1500 },
+    "io_cfg": {
+      "ifname": "netmap:eth0",
+      "nrings": 1
+    }
+  }],
+  "mgmt":    { "unix_socket": "/opt/pproxy/run/pp.sock",
+               "metrics": { "enable": true, "listen": "127.0.0.1:19992" } }
+}
