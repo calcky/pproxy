@@ -428,10 +428,12 @@ static int  tcp_get_fd(void *ctx)
 static int  tcp_stat(void *ctx, char *json, size_t cap)
 {
     struct tcp_ctx *c = ctx;
+    bool ready = c->conn_fd >= 0;
     return snprintf(json, cap,
-        "{\"backend\":\"tcp\",\"mode\":\"%s\",\"listen_fd\":%d,\"conn_fd\":%d}",
+        "{\"backend\":\"tcp\",\"mode\":\"%s\",\"listen_fd\":%d,\"conn_fd\":%d,"
+        "\"ready\":%s}",
         c->cfg.mode == PP_TMODE_SERVER ? "server" : "client",
-        c->listen_fd, c->conn_fd);
+        c->listen_fd, c->conn_fd, ready ? "true" : "false");
 }
 
 const pp_tunnel_ops_t pp_tunnel_tcp = {

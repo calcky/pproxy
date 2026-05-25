@@ -12,6 +12,7 @@ usage: pproxy-ctl [-s sock] <command> [args...]
 commands (see also: pproxy-ctl help):
   help                   this message (via mgmt)
   stat | stats           module statistics
+  tunnel | tunnels       tunnel proto/io/mode/ready status
   sessions               session snapshot
   drops                  orphan + session drop breakdown
   reload [path]          hot-reload JSON config
@@ -22,6 +23,7 @@ environment:
 
 examples:
   pproxy-ctl stat
+  pproxy-ctl tunnel
   pproxy-ctl sessions
   pproxy-ctl 'reload /opt/pproxy/pp1.json'
   PPROXY_SOCK=/path/to.sock pproxy-ctl stat

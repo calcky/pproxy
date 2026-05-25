@@ -121,6 +121,7 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
                                  不能与 kernel_socket 共用同一张卡；router 需静态 ARP
                            netmap 需内核 netmap 模块；入向 ARP 由 pproxy 用户态处理，router 可动态 ARP
                            （netmap.ko 在宿主机 Docker 编一次，见 tests/clab/build-netmap-ko.sh）
+  --perf-config-dir=DIR    性能测试 JSON 模板目录（等价 PPROXY_PERF_CONFIG_DIR）
   --ks-backend=BACKEND     kernel_socket 热路径：syscall（默认）或 io_uring（与 --right-io=io_uring 等价）
   --gdb / --no-gdb         是否用 gdbserver 起 pproxy（默认 --no-gdb）
   --gdb-tunnel             部署结束后在本机跑 gdb-tunnel.sh（ssh -L 转发 gdb 端口）
@@ -131,6 +132,10 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   PPROXY_SKIP_BUILD=1      跳过宿主机 ./build.sh
   PPROXY_BIN=路径          pproxy 可执行文件（默认 仓库/build/pproxy）
   PPROXY_CFG_DIR=路径      配置文件目录（默认 tests/clab/config）
+  PPROXY_PERF_CONFIG_DIR=  同 --perf-config-dir（优先于 PPROXY_CFG_DIR 选模板）
+  PPROXY_SKIP_SMOKE=1      跳过 [4/5] metrics smoke（perf 矩阵 redeploy 时用）
+  --pproxy-only            跳过 clab 重建，仅按 --right-io 做后端准备 + 推配置 + 重启 pproxy
+  --matrix-prep            perf --matrix 首次：编全后端、装齐依赖/netmap，仍走完整 clab deploy
   PPROXY_TUNNEL_MODE       同 --tunnel（命令行优先）
   PPROXY_LEFT_IO, PPROXY_RIGHT_IO  同 --left-io / --right-io（命令行优先）
   PPROXY_KS_BACKEND                同 --ks-backend（syscall|io_uring；命令行优先）
@@ -147,10 +152,16 @@ EOF
 
 CLAB_ARGS=()
 SKIP_PPROXY=0
+PPROXY_ONLY=0
+MATRIX_PREP=0
 DEPLOY_HELP=0
 for a in "$@"; do
   if [[ "$a" == "--no-pproxy" ]]; then
     SKIP_PPROXY=1
+  elif [[ "$a" == "--pproxy-only" ]]; then
+    PPROXY_ONLY=1
+  elif [[ "$a" == "--matrix-prep" ]]; then
+    MATRIX_PREP=1
   elif [[ "$a" == "-h" || "$a" == "--help" ]]; then
     DEPLOY_HELP=1
   elif [[ "$a" == "--gdb" ]]; then
@@ -173,10 +184,16 @@ for a in "$@"; do
     PPROXY_IO_URING_ZC=1
   elif [[ "$a" == --no-io-uring-zc ]]; then
     PPROXY_IO_URING_ZC=0
+  elif [[ "$a" == --perf-config-dir=* ]]; then
+    PPROXY_PERF_CONFIG_DIR="${a#--perf-config-dir=}"
   else
     CLAB_ARGS+=("$a")
   fi
 done
+# perf 模板目录：优先于默认 config/
+if [[ -n "${PPROXY_PERF_CONFIG_DIR:-}" ]]; then
+  PPROXY_CFG_DIR="$PPROXY_PERF_CONFIG_DIR"
+fi
 # set -u：未设时为空串；可由 --gdb-tunnel / --no-gdb-tunnel 或环境变量覆盖
 : "${PPROXY_GDB_TUNNEL:=}"
 # io_uring TX ZC：空=沿用模板；0=关；1=开（--io-uring-zc / --no-io-uring-zc / PPROXY_IO_URING_ZC）
@@ -196,6 +213,11 @@ fi
 if [[ "$DEPLOY_HELP" -eq 1 ]]; then
   deploy_print_help
   exit 0
+fi
+
+if [[ "$PPROXY_ONLY" -eq 1 && "$SKIP_PPROXY" -eq 1 ]]; then
+  echo "  ✗ --pproxy-only 不能与 --no-pproxy 同用" >&2
+  exit 1
 fi
 
 resolve_tunnel_cfgs() {
@@ -353,30 +375,36 @@ require containerlab "containerlab (https://containerlab.dev)"
 
 # 宿主编译：与 pproxy_apt_deps / 拷贝的运行动态库一致（xdp+pcap；
 # 左右手任一为 dpdk/netmap 时分别追加 --dpdk / --netmap）
-if [[ "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
+if [[ "$PPROXY_ONLY" -eq 0 && "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
   BUILD_ARGS=(--xdp --pcap --debug)
-  if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
-    BUILD_ARGS+=(--dpdk)
-  fi
-  if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
-    BUILD_ARGS+=(--netmap)
-  fi
-  if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
-    BUILD_ARGS+=(--io-uring)
+  if [[ "$MATRIX_PREP" -eq 1 ]]; then
+    BUILD_ARGS+=(--dpdk --netmap --io-uring)
+  else
+    if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+      BUILD_ARGS+=(--dpdk)
+    fi
+    if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+      BUILD_ARGS+=(--netmap)
+    fi
+    if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+      BUILD_ARGS+=(--io-uring)
+    fi
   fi
   echo "=== [0/5] Host: $REPO_ROOT/build.sh ${BUILD_ARGS[*]} ==="
   (cd "$REPO_ROOT" && ./build.sh "${BUILD_ARGS[@]}")
 fi
 
-echo "=== [1/5] Deploying containerlab topology ==="
-if [[ "${CLAB_SUDO:-0}" == "1" ]]; then
-  echo "  (using: sudo containerlab …; set CLAB_SUDO=0 to try without sudo)"
-  sudo containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
-  sudo containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
-else
-  echo "  (using: containerlab without sudo; need root? set CLAB_SUDO=1)"
-  containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
-  containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
+if [[ "$PPROXY_ONLY" -eq 0 ]]; then
+  echo "=== [1/5] Deploying containerlab topology ==="
+  if [[ "${CLAB_SUDO:-0}" == "1" ]]; then
+    echo "  (using: sudo containerlab …; set CLAB_SUDO=0 to try without sudo)"
+    sudo containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
+    sudo containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
+  else
+    echo "  (using: containerlab without sudo; need root? set CLAB_SUDO=1)"
+    containerlab destroy -t "$TOPO" --cleanup 2>/dev/null || true
+    containerlab deploy -t "$TOPO" "${CLAB_ARGS[@]:-}"
+  fi
 fi
 
 wait_for_ssh() {
@@ -634,6 +662,118 @@ fi
 s python3 "$DEVBIND" --bind=vfio-pci "$PCI"
 s python3 "$DEVBIND" --status-dev net | head -40
 EOB
+}
+
+# perf 矩阵切换离开 dpdk 时：尽量把 WAN 还回内核 virtio 驱动
+pproxy_dpdk_restore_kernel_wan() {
+  local host=$1
+  echo "  pproxy: restore kernel WAN on ${host} (if vfio-bound) …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" <<'EOR'
+set -euo pipefail
+PASS="$1"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+MGT=$(ip -4 route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
+WAN=""
+while read -r name _; do
+  [[ "$name" == "lo" ]] && continue
+  [[ -n "$MGT" && "$name" == "$MGT" ]] && continue
+  WAN="$name"
+  break
+done < <(ip -br link | awk '{print $1}')
+[[ -n "$WAN" ]] || exit 0
+P=$(readlink -f "/sys/class/net/$WAN/device" 2>/dev/null || echo "")
+PCI=""
+while [[ -n "$P" && "$P" != "/" ]]; do
+  B=$(basename "$P")
+  if [[ "$B" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
+    PCI="$B"
+    break
+  fi
+  P=$(dirname "$P")
+done
+[[ -n "$PCI" ]] || exit 0
+DEVBIND=""
+for p in /usr/share/dpdk/usertools/dpdk-devbind.py /usr/bin/dpdk-devbind.py /usr/local/bin/dpdk-devbind.py; do
+  [[ -x "$p" || -f "$p" ]] && DEVBIND="$p" && break
+done
+[[ -n "$DEVBIND" ]] || exit 0
+if s python3 "$DEVBIND" --status-dev net 2>/dev/null | grep -q "drv=vfio-pci.*${PCI}"; then
+  s python3 "$DEVBIND" --bind=virtio-pci "$PCI" 2>/dev/null \
+    || s python3 "$DEVBIND" --bind=virtio_net "$PCI" 2>/dev/null \
+    || true
+  s ip link set "$WAN" up 2>/dev/null || true
+  echo "  ✓ ${host}: WAN ${WAN} (${PCI}) back to kernel driver"
+fi
+EOR
+}
+
+router_clear_static_arp() {
+  echo "  pproxy: router 清除 DPDK 静态 ARP …"
+  docker exec router sh -c "ip neigh del 172.16.0.2 dev eth1 2>/dev/null || true; \
+    ip neigh del 172.16.1.2 dev eth2 2>/dev/null || true" >/dev/null 2>&1 || true
+}
+
+# [3.5/5] 按右手 I/O 探测/绑卡（--pproxy-only 与完整 deploy 共用）
+deploy_io_backend_prep() {
+  if [[ "$DEPLOY_IO_RIGHT" != "dpdk" ]]; then
+    pproxy_dpdk_restore_kernel_wan "$LEAF1_HOST"
+    pproxy_dpdk_restore_kernel_wan "$LEAF2_HOST"
+    router_clear_static_arp
+  fi
+
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    echo ""
+    echo "=== [3.5/5] DPDK: probe → runtime → bind vfio-pci → router static ARP ==="
+    read -r LEAF1_WAN_DEV DPDK_LEAF1_WAN_MAC DPDK_LEAF1_PCI < <(probe_leaf_wan_info "$LEAF1_HOST")
+    read -r LEAF2_WAN_DEV DPDK_LEAF2_WAN_MAC DPDK_LEAF2_PCI < <(probe_leaf_wan_info "$LEAF2_HOST")
+    echo "  leaf1: WAN=${LEAF1_WAN_DEV} MAC=${DPDK_LEAF1_WAN_MAC} PCI=${DPDK_LEAF1_PCI}"
+    echo "  leaf2: WAN=${LEAF2_WAN_DEV} MAC=${DPDK_LEAF2_WAN_MAC} PCI=${DPDK_LEAF2_PCI}"
+    if [[ -z "$DPDK_LEAF1_PCI" || -z "$DPDK_LEAF2_PCI" ]]; then
+      echo "  ✗ probe 未拿到 PCI 地址（leaf 上 /sys/class/net/<wan>/device readlink 失败？）" >&2
+      exit 1
+    fi
+    DPDK_LEAF1_PEER_MAC=$(router_iface_mac eth1)
+    DPDK_LEAF2_PEER_MAC=$(router_iface_mac eth2)
+    echo "  router: eth1 MAC=${DPDK_LEAF1_PEER_MAC} (leaf1 next-hop); eth2 MAC=${DPDK_LEAF2_PEER_MAC} (leaf2 next-hop)"
+    if [[ -z "$DPDK_LEAF1_PEER_MAC" || -z "$DPDK_LEAF2_PEER_MAC" ]]; then
+      echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2
+      exit 1
+    fi
+    pproxy_apt_deps "$LEAF1_HOST" 1 0
+    pproxy_apt_deps "$LEAF2_HOST" 1 0
+    pproxy_dpdk_runtime_setup "$LEAF1_HOST"
+    pproxy_dpdk_runtime_setup "$LEAF2_HOST"
+    pproxy_dpdk_bind_wan "$LEAF1_HOST" "$LEAF1_WAN_DEV" "$DPDK_LEAF1_PCI"
+    pproxy_dpdk_bind_wan "$LEAF2_HOST" "$LEAF2_WAN_DEV" "$DPDK_LEAF2_PCI"
+    router_set_static_arp "172.16.0.2" "$DPDK_LEAF1_WAN_MAC" \
+                          "172.16.1.2" "$DPDK_LEAF2_WAN_MAC"
+    export DPDK_LEAF1_PCI DPDK_LEAF2_PCI DPDK_LEAF1_PEER_MAC DPDK_LEAF2_PEER_MAC
+  elif [[ "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+    echo ""
+    echo "=== [3.5/5] netmap: probe WAN ifname for io_cfg ==="
+    read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+    read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+    echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
+    echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+    if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
+      echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+      exit 1
+    fi
+    export LEAF1_WAN_DEV LEAF2_WAN_DEV
+  elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+    echo ""
+    echo "=== [3.5/5] io_uring: probe WAN ifname for io_cfg.ifname (SO_BINDTODEVICE) ==="
+    read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+    read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+    echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
+    echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+    if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
+      echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+      exit 1
+    fi
+    export LEAF1_WAN_DEV LEAF2_WAN_DEV
+  fi
 }
 
 # router 容器写两条静态 ARP：leaf{1,2} 的 WAN IP → 各自 WAN MAC（DPDK 接管后内核 ARP 学不到）
@@ -985,6 +1125,20 @@ PY
   fi
 }
 
+pproxy_stop_leaf() {
+  local host=$1 cfg=$2
+  echo "  pproxy: stopping on ${host} (${cfg}) …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$cfg" <<'EOST'
+set -euo pipefail
+PASS="$1"
+CFG="$2"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s pkill -f "pproxy -c $CFG" 2>/dev/null || true
+sleep 0.5
+EOST
+}
+
 pproxy_start() {
   local host=$1 bin=$2 cfg=$3 log=$4
   local gdbport="${5:-0}"
@@ -1099,35 +1253,55 @@ pproxy_smoke() {
 
   local NEED_DPDK=0
   local NEED_IO_URING=0
-  if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+  if [[ "$MATRIX_PREP" -eq 1 ]]; then
     NEED_DPDK=1
-  fi
-  if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     NEED_IO_URING=1
+  else
+    if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+      NEED_DPDK=1
+    fi
+    if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+      NEED_IO_URING=1
+    fi
+    # 全后端 build/pproxy 动态链接 liburing；非 matrix 单场景 deploy 也要装
+    if [[ "$PPROXY_ONLY" -eq 0 ]]; then
+      NEED_IO_URING=1
+    fi
   fi
   pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK" "$NEED_IO_URING"
   pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK" "$NEED_IO_URING"
-  if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+  if [[ "$MATRIX_PREP" -eq 1 || "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
     pproxy_install_netmap
   fi
-  pproxy_remote_prepare "$LEAF1_HOST"
-  pproxy_remote_prepare "$LEAF2_HOST"
-  pproxy_coredump_setup "$LEAF1_HOST"
-  pproxy_coredump_setup "$LEAF2_HOST"
+  if [[ "$PPROXY_ONLY" -eq 0 ]]; then
+    pproxy_remote_prepare "$LEAF1_HOST"
+    pproxy_remote_prepare "$LEAF2_HOST"
+    pproxy_coredump_setup "$LEAF1_HOST"
+    pproxy_coredump_setup "$LEAF2_HOST"
+  else
+    echo "  (--pproxy-only: skip binary/ctl scp and remote prepare)"
+  fi
   if [[ "$NEED_DPDK" -eq 1 ]]; then
     pproxy_dpdk_runtime_setup "$LEAF1_HOST"
     pproxy_dpdk_runtime_setup "$LEAF2_HOST"
   fi
-  pproxy_scp_bin "$LEAF1_HOST"
-  pproxy_scp_bin "$LEAF2_HOST"
-  pproxy_scp_pproxy_ctl "$LEAF1_HOST"
-  pproxy_scp_pproxy_ctl "$LEAF2_HOST"
+  if [[ "$PPROXY_ONLY" -eq 0 ]]; then
+    pproxy_scp_bin "$LEAF1_HOST"
+    pproxy_scp_bin "$LEAF2_HOST"
+    pproxy_scp_pproxy_ctl "$LEAF1_HOST"
+    pproxy_scp_pproxy_ctl "$LEAF2_HOST"
+    if [[ "$USE_XDPCAP" -eq 1 ]]; then
+      pproxy_scp_xdpcap "$LEAF1_HOST"
+      pproxy_scp_xdpcap "$LEAF2_HOST"
+    fi
+  fi
+  # af_xdp 必须加载自编译 xsk_xdpcap.bpf.o（含隧道 filter）；--pproxy-only 切换后端时也要 scp
   if [[ "$USE_XDPCAP" -eq 1 ]]; then
     pproxy_scp_xdpcap_bpf "$LEAF1_HOST" "$PPROXY_XDPCAP_BPF_HOST"
     pproxy_scp_xdpcap_bpf "$LEAF2_HOST" "$PPROXY_XDPCAP_BPF_HOST"
-    pproxy_scp_xdpcap "$LEAF1_HOST"
-    pproxy_scp_xdpcap "$LEAF2_HOST"
   fi
+  pproxy_stop_leaf "$LEAF1_HOST" "$VM_PP1_CFG"
+  pproxy_stop_leaf "$LEAF2_HOST" "$VM_PP2_CFG"
   pproxy_push_cfgs
 
   g1=0
@@ -1143,6 +1317,8 @@ pproxy_smoke() {
     echo ""
     echo "  pproxy: PPROXY_GDB=1 — gdbserver 会等远程调试器，进程在 VSCode/ gdb「继续」前可能未完成初始化。"
     echo "  已跳过 metrics / 日志的 smoke 检查。请在本机: ./tests/clab/gdb-tunnel.sh  再在 VSCode F5 连接 localhost:${GDBSERVER_PORT_LEAF1} / :${GDBSERVER_PORT_LEAF2}。"
+  elif [[ "${PPROXY_SKIP_SMOKE:-0}" == "1" ]]; then
+    echo "  smoke checks skipped (PPROXY_SKIP_SMOKE=1); pproxy started"
   else
     wait_vm_http "$LEAF1_HOST" "$PP1_METRICS" "leaf1"
     wait_vm_http "$LEAF2_HOST" "$PP2_METRICS" "leaf2"
@@ -1192,87 +1368,33 @@ pproxy_smoke() {
 }
 
 echo ""
-echo "=== [2/5] Waiting for Ubuntu (generic_vm) SSH ==="
-echo "  SSH targets: ${LEAF1_HOST}, ${LEAF2_HOST} (clab 节点名; /etc/hosts 由 containerlab 维护)"
-wait_for_ssh leaf1 "$LEAF1_HOST"
-wait_for_ssh leaf2 "$LEAF2_HOST"
+if [[ "$PPROXY_ONLY" -eq 1 ]]; then
+  echo "=== [--pproxy-only] leaf SSH check ==="
+  echo "  SSH targets: ${LEAF1_HOST}, ${LEAF2_HOST}"
+  wait_for_ssh leaf1 "$LEAF1_HOST"
+  wait_for_ssh leaf2 "$LEAF2_HOST"
+  deploy_io_backend_prep
+else
+  echo "=== [2/5] Waiting for Ubuntu (generic_vm) SSH ==="
+  echo "  SSH targets: ${LEAF1_HOST}, ${LEAF2_HOST} (clab 节点名; /etc/hosts 由 containerlab 维护)"
+  wait_for_ssh leaf1 "$LEAF1_HOST"
+  wait_for_ssh leaf2 "$LEAF2_HOST"
 
-echo ""
-echo "=== [3/5] Applying Ubuntu data-plane configuration ==="
-WAN_FOR_DPDK=0
-if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
-  WAN_FOR_DPDK=1
-fi
-configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24" "$WAN_FOR_DPDK"
-configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24" "$WAN_FOR_DPDK"
-
-if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
   echo ""
-  echo "=== [3.5/5] DPDK: probe → runtime → bind vfio-pci → router static ARP ==="
-  # 探测两端 WAN devname/MAC/PCI（DPDK 接管前内核 sysfs 还可见）
-  read -r LEAF1_WAN_DEV DPDK_LEAF1_WAN_MAC DPDK_LEAF1_PCI < <(probe_leaf_wan_info "$LEAF1_HOST")
-  read -r LEAF2_WAN_DEV DPDK_LEAF2_WAN_MAC DPDK_LEAF2_PCI < <(probe_leaf_wan_info "$LEAF2_HOST")
-  echo "  leaf1: WAN=${LEAF1_WAN_DEV} MAC=${DPDK_LEAF1_WAN_MAC} PCI=${DPDK_LEAF1_PCI}"
-  echo "  leaf2: WAN=${LEAF2_WAN_DEV} MAC=${DPDK_LEAF2_WAN_MAC} PCI=${DPDK_LEAF2_PCI}"
-  if [[ -z "$DPDK_LEAF1_PCI" || -z "$DPDK_LEAF2_PCI" ]]; then
-    echo "  ✗ probe 未拿到 PCI 地址（leaf 上 /sys/class/net/<wan>/device readlink 失败？）" >&2
-    exit 1
+  echo "=== [3/5] Applying Ubuntu data-plane configuration ==="
+  WAN_FOR_DPDK=0
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
+    WAN_FOR_DPDK=1
   fi
+  configure_ubuntu_leaf leaf1 "$LEAF1_HOST" "172.16.0.2/24" "192.168.0.1/24" "172.16.0.1" "192.168.1.0/24" "172.16.1.0/24" "$WAN_FOR_DPDK"
+  configure_ubuntu_leaf leaf2 "$LEAF2_HOST" "172.16.1.2/24" "192.168.1.1/24" "172.16.1.1" "192.168.0.0/24" "172.16.0.0/24" "$WAN_FOR_DPDK"
 
-  # 用 router 容器内 eth1/eth2 的 MAC 作为各 leaf 的 next-hop peer_mac
-  DPDK_LEAF1_PEER_MAC=$(router_iface_mac eth1)
-  DPDK_LEAF2_PEER_MAC=$(router_iface_mac eth2)
-elif [[ "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
+  deploy_io_backend_prep
+
   echo ""
-  echo "=== [3.5/5] netmap: probe WAN ifname for io_cfg ==="
-  read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
-  read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
-  echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
-  echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
-  if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
-    echo "  ✗ probe 未拿到 WAN 网卡名" >&2
-    exit 1
-  fi
-  export LEAF1_WAN_DEV LEAF2_WAN_DEV
-elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
-  echo ""
-  echo "=== [3.5/5] io_uring: probe WAN ifname for io_cfg.ifname (SO_BINDTODEVICE) ==="
-  read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
-  read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
-  echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
-  echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
-  if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
-    echo "  ✗ probe 未拿到 WAN 网卡名" >&2
-    exit 1
-  fi
-  export LEAF1_WAN_DEV LEAF2_WAN_DEV
+  echo "  pwru (eBPF helper): install to /usr/bin on both leaves"
+  leaf_install_pwru
 fi
-
-if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
-  echo "  router: eth1 MAC=${DPDK_LEAF1_PEER_MAC} (leaf1 next-hop); eth2 MAC=${DPDK_LEAF2_PEER_MAC} (leaf2 next-hop)"
-  if [[ -z "$DPDK_LEAF1_PEER_MAC" || -z "$DPDK_LEAF2_PEER_MAC" ]]; then
-    echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2
-    exit 1
-  fi
-
-  # dpdk-devbind.py 来自 apt install dpdk；提前装好，pproxy_smoke 里会再走一遍也无害
-  pproxy_apt_deps "$LEAF1_HOST" 1
-  pproxy_apt_deps "$LEAF2_HOST" 1
-  pproxy_dpdk_runtime_setup "$LEAF1_HOST"
-  pproxy_dpdk_runtime_setup "$LEAF2_HOST"
-  pproxy_dpdk_bind_wan "$LEAF1_HOST" "$LEAF1_WAN_DEV" "$DPDK_LEAF1_PCI"
-  pproxy_dpdk_bind_wan "$LEAF2_HOST" "$LEAF2_WAN_DEV" "$DPDK_LEAF2_PCI"
-
-  # DPDK 接管后 leaf 不再回应 ARP；router 必须有静态 ARP 才能往 leaf WAN 转发包
-  router_set_static_arp "172.16.0.2" "$DPDK_LEAF1_WAN_MAC" \
-                        "172.16.1.2" "$DPDK_LEAF2_WAN_MAC"
-
-  export DPDK_LEAF1_PCI DPDK_LEAF2_PCI DPDK_LEAF1_PEER_MAC DPDK_LEAF2_PEER_MAC
-fi
-
-echo ""
-echo "  pwru (eBPF helper): install to /usr/bin on both leaves"
-leaf_install_pwru
 
 if [[ "$SKIP_PPROXY" -eq 0 ]]; then
   pproxy_smoke

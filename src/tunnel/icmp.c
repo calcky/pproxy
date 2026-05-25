@@ -798,15 +798,28 @@ static int ic_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 
 static void ic_session_close(void *ctx, uint64_t sid) { (void)ctx; (void)sid; }
 static int  ic_get_fd(void *ctx) { return ((struct icmp_ctx *)ctx)->fd; }
+
+static bool ic_tunnel_ready(const struct icmp_ctx *c)
+{
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK)
+        return c->dpdk != NULL;
+#endif
+    return c->fd >= 0;
+}
+
 static int  ic_stat(void *ctx, char *json, size_t cap)
 {
     struct icmp_ctx *c = ctx;
+    bool ready = ic_tunnel_ready(c);
     return snprintf(json, cap,
         "{\"backend\":\"icmp\",\"io\":\"%s\",\"mode\":\"%s\","
-        "\"fd\":%d,\"id\":%u,\"seq\":%u,\"peer_known\":%s}",
+        "\"fd\":%d,\"id\":%u,\"seq\":%u,\"peer_known\":%s,"
+        "\"ready\":%s}",
         pp_tunnel_io_name(c->cfg.io),
         c->cfg.mode == PP_TMODE_SERVER ? "server" : "client",
-        c->fd, c->identifier, c->seq, c->peer_known ? "true" : "false");
+        c->fd, c->identifier, c->seq, c->peer_known ? "true" : "false",
+        ready ? "true" : "false");
 }
 
 const pp_tunnel_ops_t pp_tunnel_icmp = {

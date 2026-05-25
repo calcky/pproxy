@@ -1,0 +1,43 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "runtime": {
+    "workers": 4,
+    "rings": {
+      "right_tx_capacity": 8192
+    }
+  },
+  "left": {
+    "kind": "tun",
+    "name": "pp1",
+    "tun": {
+      "ifname": "ppclab1",
+      "cidr": "192.168.1.0/24",
+      "mtu": 1500,
+      "no_pi": true
+    }
+  },
+  "tunnels": [
+    {
+      "name": "srv",
+      "proto": "udp",
+      "io": "kernel_socket",
+      "mode": "server",
+      "listen": "0.0.0.0:19900",
+      "udp": {
+        "mtu": 1500
+      }
+    }
+  ],
+  "session": {
+    "max_per_shard": 1024
+  },
+  "mgmt": {
+    "unix_socket": "/opt/pproxy/run/pp.sock",
+    "metrics": {
+      "enable": true,
+      "listen": "127.0.0.1:19991"
+    }
+  }
+}

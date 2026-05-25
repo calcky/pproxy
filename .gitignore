@@ -60,3 +60,7 @@ tags
 TAGS
 tests/clab/clab-pproxy
 tests/clab/.cache/
+
+# clab perf results (generated)
+tests/clab/results/*
+!tests/clab/results/.gitkeep

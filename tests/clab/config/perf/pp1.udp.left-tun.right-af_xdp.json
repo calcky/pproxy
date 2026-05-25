@@ -1,0 +1,47 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "runtime": {
+    "workers": 4,
+    "rings": {
+      "right_tx_capacity": 8192
+    }
+  },
+  "left": {
+    "kind": "tun",
+    "name": "pp1",
+    "tun": {
+      "ifname": "ppclab1",
+      "cidr": "192.168.1.0/24",
+      "mtu": 1500,
+      "no_pi": true
+    }
+  },
+  "tunnels": [
+    {
+      "name": "srv",
+      "proto": "udp",
+      "io": "af_xdp",
+      "mode": "server",
+      "listen": "0.0.0.0:19900",
+      "udp": {
+        "mtu": 1500
+      },
+      "io_cfg": {
+        "ifname": "ens2",
+        "queue_id": 0,
+        "nframes": 4096,
+        "zero_copy": false,
+        "need_wakeup": true
+      }
+    }
+  ],
+  "mgmt": {
+    "unix_socket": "/opt/pproxy/run/pp.sock",
+    "metrics": {
+      "enable": true,
+      "listen": "127.0.0.1:19991"
+    }
+  }
+}

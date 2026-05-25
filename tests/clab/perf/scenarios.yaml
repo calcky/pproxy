@@ -1,0 +1,112 @@
+# clab perf 场景定义（perf.sh / CI 读取）
+# iperf3：TCP only，10s，单流 + 10 并行流（parallel_runs）
+
+- name: udp_kernel
+  ci: true
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: kernel_socket
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+    runtime.rings.right_tx_capacity: 8192
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 50
+
+- name: udp_uring_batch32
+  ci: true
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: io_uring
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+    runtime.rings.right_tx_capacity: 8192
+    tunnels[0].io_cfg.batch_tx: 32
+    tunnels[0].io_cfg.zerocopy: false
+    tunnels[0].io_cfg.tx_zc: false
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 50
+
+- name: udp_uring_batch1
+  ci: false
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: io_uring
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+    tunnels[0].io_cfg.batch_tx: 1
+    tunnels[0].io_cfg.zerocopy: false
+    tunnels[0].io_cfg.tx_zc: false
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 50
+
+- name: udp_af_xdp
+  ci: true
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: af_xdp
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 30
+
+- name: udp_netmap
+  ci: false
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: netmap
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 30
+
+- name: udp_dpdk
+  ci: false
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: dpdk
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 30

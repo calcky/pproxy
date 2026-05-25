@@ -51,6 +51,7 @@ static const char HELP_TEXT[] =
     "commands:\n"
     "  help                   -- this message\n"
     "  stat                   -- module statistics\n"
+    "  tunnel | tunnels       -- tunnel config + runtime status (proto/io/ready)\n"
     "  sessions               -- session snapshot (per-flow up/dn pkts/bytes/drops)\n"
     "  drops                  -- orphan drop breakdown + sum of session drops\n"
     "  reload [path]          -- hot-reload JSON (log.level, session.*_ttl_ms,\n"
@@ -125,6 +126,79 @@ static int stat_walk_prom(pp_module_t *m, void *user)
 
 /* ---------- unix socket 文本命令 ---------- */
 
+static const char *mgmt_tunnel_io_name(pp_tunnel_io_t io)
+{
+    switch (io) {
+    case PP_TIO_KERNEL_SOCKET: return "kernel_socket";
+    case PP_TIO_RAW_SOCKET:    return "raw_socket";
+    case PP_TIO_AF_XDP:        return "af_xdp";
+    case PP_TIO_NETMAP:        return "netmap";
+    case PP_TIO_PCAP:          return "pcap";
+    case PP_TIO_TUN:           return "tun";
+    case PP_TIO_DPDK:          return "dpdk";
+    default:                   return "unknown";
+    }
+}
+
+static const char *mgmt_proto_name(pp_tunnel_proto_t p)
+{
+    switch (p) {
+    case PP_PROTO_TCP:  return "tcp";
+    case PP_PROTO_UDP:  return "udp";
+    case PP_PROTO_ICMP: return "icmp";
+    case PP_PROTO_KCP:  return "kcp";
+    case PP_PROTO_QUIC: return "quic";
+    default:            return "unknown";
+    }
+}
+
+static const char *mgmt_left_kind_name(pp_io_kind_t k)
+{
+    switch (k) {
+    case PP_IO_TUN:        return "tun";
+    case PP_IO_RAW_SOCKET: return "raw_socket";
+    case PP_IO_AF_XDP:     return "af_xdp";
+    case PP_IO_NETMAP:     return "netmap";
+    case PP_IO_PCAP:       return "pcap";
+    case PP_IO_DPDK:       return "dpdk";
+    default:               return "unknown";
+    }
+}
+
+static void mgmt_tunnel_status(struct stat_acc *a)
+{
+    if (!g_rt) {
+        acc_printf(a, "runtime not ready\n");
+        return;
+    }
+    acc_printf(a, "left: %s\n", mgmt_left_kind_name(g_rt->left_kind));
+    acc_printf(a, "tunnels: %d\n", g_rt->n_tunnels);
+    for (int i = 0; i < g_rt->n_tunnels; i++) {
+        const pp_tunnel_cfg_t *tc = &g_rt->tun_cfg[i];
+        const char *ks_be = "syscall";
+        if (tc->io == PP_TIO_KERNEL_SOCKET
+            && tc->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING)
+            ks_be = "io_uring";
+        acc_printf(a,
+            "tunnel[%d]: proto=%s io=%s mode=%s ks_backend=%s ready=",
+            i, mgmt_proto_name(tc->proto), mgmt_tunnel_io_name(tc->io),
+            tc->mode == PP_TMODE_SERVER ? "server" : "client", ks_be);
+        if (g_rt->tun_ops[i] && g_rt->tun_ctx[i]
+            && g_rt->tun_ops[i]->stat) {
+            char tjson[512];
+            int tn = g_rt->tun_ops[i]->stat(g_rt->tun_ctx[i], tjson, sizeof tjson);
+            if (tn > 0) {
+                const char *rdy = strstr(tjson, "\"ready\":true");
+                acc_printf(a, "%s\n  %s\n", rdy ? "yes" : "no", tjson);
+            } else {
+                acc_printf(a, "unknown\n");
+            }
+        } else {
+            acc_printf(a, "no\n");
+        }
+    }
+}
+
 static void write_all(int fd, const char *buf, size_t n)
 {
     while (n > 0) {
@@ -150,6 +224,8 @@ static void handle_unix(int cfd)
     } else if (strcmp(req, "stat") == 0 || strcmp(req, "stats") == 0) {
         acc_printf(&a, "modules:\n");
         pp_module_walk(stat_walk_human, &a);
+    } else if (strcmp(req, "tunnel") == 0 || strcmp(req, "tunnels") == 0) {
+        mgmt_tunnel_status(&a);
     } else if (strcmp(req, "sessions") == 0) {
         pp_session_view_t views[64];
         int got = pp_session_snapshot(g_rt->shards, g_rt->n_workers,

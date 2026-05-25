@@ -1,0 +1,47 @@
+# clab 端到端性能回归（需 self-hosted runner + KVM + containerlab）
+name: clab-perf
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 0'
+
+concurrency:
+  group: clab-perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    name: clab perf (ci scenarios)
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-yaml sshpass curl iproute2 iperf3
+          if ! command -v containerlab >/dev/null 2>&1; then
+            echo "containerlab must be preinstalled on self-hosted runner" >&2
+            exit 1
+          fi
+
+      - name: Build pproxy (xdp + pcap + io-uring)
+        run: ./build.sh --native --xdp --pcap --io-uring
+
+      - name: Run clab perf CI scenarios
+        run: |
+          chmod +x tests/clab/perf.sh tests/clab/perf/*.sh
+          tests/clab/perf.sh --ci --fail-on-threshold
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clab-perf-results
+          path: tests/clab/results/
+          if-no-files-found: warn

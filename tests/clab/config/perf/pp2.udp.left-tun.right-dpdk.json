@@ -1,0 +1,46 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "runtime": {
+    "workers": 4,
+    "rings": {
+      "right_tx_capacity": 8192
+    }
+  },
+  "left": {
+    "kind": "tun",
+    "name": "pp2",
+    "tun": {
+      "ifname": "ppclab2",
+      "cidr": "192.168.0.0/24",
+      "mtu": 1500,
+      "no_pi": true
+    }
+  },
+  "tunnels": [
+    {
+      "name": "cli",
+      "proto": "udp",
+      "io": "dpdk",
+      "mode": "client",
+      "server": "172.16.0.2:19900",
+      "udp": {
+        "mtu": 1500
+      },
+      "io_cfg": {
+        "port_id": 0,
+        "queue_id": 0,
+        "nframes": 2048,
+        "eal_args": "pproxy -l 0,1 --proc-type=primary --in-memory"
+      }
+    }
+  ],
+  "mgmt": {
+    "unix_socket": "/opt/pproxy/run/pp.sock",
+    "metrics": {
+      "enable": true,
+      "listen": "127.0.0.1:19992"
+    }
+  }
+}

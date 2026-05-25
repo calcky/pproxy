@@ -1064,15 +1064,28 @@ static int udp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
 
 static void udp_session_close(void *ctx, uint64_t sid) { (void)ctx; (void)sid; }
 static int  udp_get_fd(void *ctx) { return ((struct udp_ctx *)ctx)->fd; }
+
+static bool udp_tunnel_ready(const struct udp_ctx *c)
+{
+#ifdef PP_HAVE_DPDK
+    if (c->cfg.io == PP_TIO_DPDK)
+        return c->dpdk != NULL;
+#endif
+    return c->fd >= 0;
+}
+
 static int  udp_stat(void *ctx, char *json, size_t cap)
 {
     struct udp_ctx *c = ctx;
+    bool ready = udp_tunnel_ready(c);
     return snprintf(json, cap,
         "{\"backend\":\"udp\",\"io\":\"%s\",\"mode\":\"%s\","
-        "\"fd\":%d,\"src_port\":%u,\"dst_port\":%u,\"peer_known\":%s}",
+        "\"fd\":%d,\"src_port\":%u,\"dst_port\":%u,\"peer_known\":%s,"
+        "\"ready\":%s}",
         pp_tunnel_io_name(c->cfg.io),
         c->cfg.mode == PP_TMODE_SERVER ? "server" : "client",
-        c->fd, c->src_port, c->dst_port, c->peer_known ? "true" : "false");
+        c->fd, c->src_port, c->dst_port, c->peer_known ? "true" : "false",
+        ready ? "true" : "false");
 }
 
 const pp_tunnel_ops_t pp_tunnel_udp = {
