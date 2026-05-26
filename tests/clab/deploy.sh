@@ -550,7 +550,8 @@ NEED_IO_URING="$3"
 s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
-s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils netcat-openbsd
+s apt-get install -y -qq curl ca-certificates libbpf1 libxdp1 gdb binutils netcat-openbsd python3-psutil 2>/dev/null \
+  || true
 if ! command -v gdbserver >/dev/null 2>&1; then
   s apt-get install -y -qq gdbserver
 fi

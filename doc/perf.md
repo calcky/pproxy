@@ -15,7 +15,7 @@
 | [`tests/clab/perf/baseline-direct.sh`](../tests/clab/perf/baseline-direct.sh) | 停 pproxy、恢复 WAN 路由的直连基线 |
 | [`tests/clab/perf/report.py`](../tests/clab/perf/report.py) | 合并结果 → `tests/clab/results/*.json` |
 | [`tests/clab/perf/check-tunnel.sh`](../tests/clab/perf/check-tunnel.sh) | iperf 前校验 tunnel ready / proto / io |
-| [`tests/clab/perf/collect-cpu.sh`](../tests/clab/perf/collect-cpu.sh) | iperf 期间 pproxy 进程/线程 CPU 采样 |
+| [`tests/clab/perf/collect-cpu.sh`](../tests/clab/perf/collect-cpu.sh) | 正式 iperf 起/止 CPU 快照 |
 
 ### iperf3 参数
 
@@ -23,10 +23,11 @@
 - 时长：**10s**（warmup **2s**）
 - 每个场景跑 **单流（-P 1）** 和 **10 并行流（-P 10）**
 - 吞吐取接收端 `sum_received`（goodput）
-- 结果 JSON 含 **CPU 占用**（pproxy 总/usr/sys、系统 usr/nice/sys/irq/softirq/idle、各线程）与 **metrics delta**
-- `--matrix` 时每组 iperf 结果追加到 `tests/clab/results/matrix_<timestamp>.md`（列：scenario / right_io / P / Mbps / PPS / L1·L2 各 pp、u/s、irq/sirq、cpp）
+- 结果 JSON 含 **CPU 占用**（正式 iperf 窗口起止快照：pproxy 单核基准 usr/sys、sys 的 us/sy/si/id、各线程）与 **metrics delta**
+- `--matrix` 时每组 iperf 结果追加到 `tests/clab/results/matrix_<timestamp>.md`（列：scenario / right_io / P / Mbps / PPS / L1·L2 各 pp、sys、core-us）
+- **L1/L2 sys**：正式 iperf 窗口 `/proc/stat` 占比，仅 `us sy si id`（四项之和 ≤ 100%）
 - **PPS**：两 leaf `right_tx` 计数之和 ÷ iperf 时长（tunnel 发包速率）
-- **cpp**：各 leaf pproxy 进程 core-µs/包（`CPU% × ncpu × 10⁶ / worker 转发包率`）
+- **core-us**：pproxy 进程树 core-µs/包（`pp_abs × 10⁶ / worker_pps`）
 
 ### matrix 流程
 

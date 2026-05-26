@@ -7,7 +7,7 @@
 #   IPERF_PARALLEL=1      并行流数（-P）
 #   IPERF_LENGTH=1400     仅 UDP -l
 #   IPERF_WARMUP=2        预热秒数（不计入结果；0=跳过）
-#   IPERF_CPU_OUT=        若设置，写入 iperf 期间 CPU 采样 JSON
+#   IPERF_CPU_OUT=        若设置，正式 iperf 起/止各快照一次 CPU
 #   IPERF_SERVER_IP=192.168.1.2
 set -euo pipefail
 
@@ -26,12 +26,10 @@ IPERF_CPU_OUT="${IPERF_CPU_OUT:-}"
 
 ensure_iperf3_clients
 
-CPU_PID=""
+CPU_BEGIN=""
 if [[ -n "$IPERF_CPU_OUT" ]]; then
-  CPU_SEC=$((IPERF_WARMUP + IPERF_DURATION_MAIN))
+  CPU_BEGIN=$(mktemp)
   chmod +x "$PERF_DIR/collect-cpu.sh" 2>/dev/null || true
-  "$PERF_DIR/collect-cpu.sh" --duration "$CPU_SEC" --out "$IPERF_CPU_OUT" &
-  CPU_PID=$!
 fi
 
 # 停掉可能残留的 iperf3
@@ -64,8 +62,11 @@ if [[ "$IPERF_WARMUP" -gt 0 ]]; then
 fi
 
 IPERF_DURATION="$IPERF_DURATION_MAIN"
+if [[ -n "$CPU_BEGIN" ]]; then
+  "$PERF_DIR/collect-cpu.sh" --begin "$CPU_BEGIN"
+fi
 run_once
-
-if [[ -n "$CPU_PID" ]]; then
-  wait "$CPU_PID" 2>/dev/null || true
+if [[ -n "$IPERF_CPU_OUT" ]]; then
+  "$PERF_DIR/collect-cpu.sh" --end "$CPU_BEGIN" --duration "$IPERF_DURATION_MAIN" --out "$IPERF_CPU_OUT"
+  rm -f "$CPU_BEGIN"
 fi

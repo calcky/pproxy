@@ -76,37 +76,57 @@ def iperf_duration_sec(deploy: dict) -> float:
     return float(deploy.get("duration") or 10)
 
 
+def pproxy_core_sec_per_s(leaf_cpu: dict) -> float:
+    """进程树 CPU 核·秒/秒。新 JSON 为单核基准 %；旧 JSON 为 /ncpu 容量 %。"""
+    pproxy = leaf_cpu.get("pproxy") or {}
+    if pproxy.get("total_per_core_pct") is not None:
+        return float(pproxy["total_per_core_pct"]) / 100.0
+    total_pct = float(
+        pproxy.get("total_pct") or leaf_cpu.get("process_cpu_avg_pct") or 0
+    )
+    ncpu = int(leaf_cpu.get("ncpu") or 1)
+    return total_pct / 100.0 * ncpu
+
+
 def compute_pps_cpp(result: dict) -> dict[str, Any]:
-    """PPS from right_tx counters; CPP = pproxy core-µs per worker-forwarded packet."""
+    """PPS + cpp(pp) = pproxy core-µs per worker-forwarded packet."""
     duration = iperf_duration_sec(result.get("deploy") or {})
     delta = result.get("metrics_delta") or {}
     cpu = result.get("cpu") or {}
     total_pkts = float(delta.get("right_tx_out_delta") or 0)
     pps = total_pkts / duration if duration > 0 else 0.0
 
-    cpp: dict[str, float | None] = {}
+    cpp_pp: dict[str, float | None] = {}
     for leaf in ("leaf1", "leaf2"):
-        leaf_delta = delta.get(leaf) or {}
-        pkts = leaf_delta.get("worker_out_delta")
-        if pkts is None:
-            pkts = leaf_delta.get("right_tx_out_delta")
-        if pkts is None and total_pkts > 0:
-            pkts = total_pkts / 2.0
-        pkts = float(pkts or 0)
-        leaf_pps = pkts / duration if duration > 0 else 0.0
+        leaf_pps = leaf_worker_pps(leaf, delta, total_pkts, duration)
         leaf_cpu = cpu.get(leaf) or {}
-        pproxy = leaf_cpu.get("pproxy") or {}
-        total_pct = float(
-            pproxy.get("total_pct") or leaf_cpu.get("process_cpu_avg_pct") or 0
-        )
-        ncpu = int(leaf_cpu.get("ncpu") or 1)
-        if leaf_pps > 0 and total_pct > 0:
-            cpp[leaf] = round(total_pct / 100.0 * ncpu * 1e6 / leaf_pps, 1)
-        else:
-            cpp[leaf] = None
+        pp_sec = pproxy_core_sec_per_s(leaf_cpu)
+        cpp_pp[leaf] = cpp_from_core_sec(pp_sec, leaf_pps)
 
-    return {"pps": round(pps, 1), "cpp": cpp}
+    return {
+        "pps": round(pps, 1),
+        "cpp": cpp_pp,
+        "cpp_pp": cpp_pp,
+    }
 
+
+def leaf_worker_pps(
+    leaf: str, delta: dict, total_pkts: float, duration: float
+) -> float:
+    leaf_delta = delta.get(leaf) or {}
+    pkts = leaf_delta.get("worker_out_delta")
+    if pkts is None:
+        pkts = leaf_delta.get("right_tx_out_delta")
+    if pkts is None and total_pkts > 0:
+        pkts = total_pkts / 2.0
+    pkts = float(pkts or 0)
+    return pkts / duration if duration > 0 else 0.0
+
+
+def cpp_from_core_sec(core_sec: float, leaf_pps: float) -> float | None:
+    if leaf_pps > 0 and core_sec > 0:
+        return round(core_sec * 1e6 / leaf_pps, 1)
+    return None
 
 def fmt_pps(pps: float) -> str:
     if pps <= 0:
@@ -152,22 +172,32 @@ def _leaf_cpu_block(leaf: dict | None) -> dict[str, Any]:
     }
 
 
-def fmt_leaf_cpu_cols(leaf_raw: dict | None) -> tuple[str, str, str]:
-    """Return (pproxy, sys u/s, irq/sirq) for one leaf."""
+def fmt_system_top(system: dict) -> str:
+    """Format us/sy/si/id from /proc/stat window (sum ≤ 100%)."""
+    if not system:
+        return "-"
+    fields = (
+        ("user_pct", "us"),
+        ("system_pct", "sy"),
+        ("softirq_pct", "si"),
+        ("idle_pct", "id"),
+    )
+    parts = [f"{float(system.get(key, 0) or 0):.1f} {label}" for key, label in fields]
+    return ", ".join(parts)
+
+
+def fmt_leaf_cpu_cols(leaf_raw: dict | None) -> tuple[str, str]:
+    """Return (pproxy, system top line) for one leaf."""
     cell = _leaf_cpu_block(leaf_raw)
     if not cell:
-        return "-", "-", "-"
+        return "-", "-"
     p = cell.get("pproxy") or {}
     s = cell.get("system") or {}
     if p:
         pp = f"{p.get('total_pct', 0):.1f} (u{p.get('user_pct', 0):.1f}/s{p.get('sys_pct', 0):.1f})"
     else:
         pp = "-"
-    if s:
-        us = f"u{s.get('user_pct', 0):.1f}/s{s.get('system_pct', 0):.1f}"
-        irqs = f"{s.get('irq_pct', 0):.1f}/{s.get('softirq_pct', 0):.1f}"
-        return pp, us, irqs
-    return pp, "-", "-"
+    return pp, fmt_system_top(s)
 
 
 def markdown_row(result: dict) -> str:
@@ -190,21 +220,21 @@ def matrix_markdown_row(result: dict, json_name: str = "") -> str:
     pc = result.get("pps_cpp") or compute_pps_cpp(result)
     l1 = fmt_leaf_cpu_cols(cpu.get("leaf1"))
     l2 = fmt_leaf_cpu_cols(cpu.get("leaf2"))
-    cpp = pc.get("cpp") or {}
+    cpp_pp = pc.get("cpp_pp") or pc.get("cpp") or {}
     return (
         f"| {result.get('scenario', '?')} | {d.get('right_io', '?')} | "
         f"{i.get('parallel', '-')} | {i.get('bitrate_mbps', 0)} | "
         f"{fmt_pps(float(pc.get('pps') or 0))} | "
-        f"{l1[0]} | {l1[1]} | {l1[2]} | {fmt_cpp(cpp.get('leaf1'))} | "
-        f"{l2[0]} | {l2[1]} | {l2[2]} | {fmt_cpp(cpp.get('leaf2'))} |"
+        f"{l1[0]} | {l1[1]} | {fmt_cpp(cpp_pp.get('leaf1'))} | "
+        f"{l2[0]} | {l2[1]} | {fmt_cpp(cpp_pp.get('leaf2'))} |"
     )
 
 
 def matrix_md_header(started: str) -> str:
     headers = [
         "scenario", "right_io", "P", "Mbps", "PPS",
-        "L1 pp", "L1 u/s", "L1 irq/sirq", "L1 cpp",
-        "L2 pp", "L2 u/s", "L2 irq/sirq", "L2 cpp",
+        "L1 pp", "L1 sys", "L1 core-us",
+        "L2 pp", "L2 sys", "L2 core-us",
     ]
     hdr = "| " + " | ".join(headers) + " |"
     sep = "| " + " | ".join("---" for _ in headers) + " |"
