@@ -5,6 +5,8 @@
  *   2) rx_burst 拉一批包；
  *   3) 解析 FlowKey -> 计算 hash -> 投递到对应 worker rx_ring；
  *   4) 队列满则丢弃 + drops++（暂不背压）。
+ *
+ * 模块边界：init() 把 g_rt 中需要的指针快照到 priv，主循环只读 priv。
  */
 #include <pthread.h>
 #include <stdlib.h>
@@ -20,6 +22,12 @@
 typedef struct lrx_priv {
     int        epfd;
     int        rx_fd;
+    /* injected at init() */
+    const pp_pkt_io_ops_t *left_ops;
+    void                  *left_ctx;
+    pp_ring_t            **worker_rx_rings;   /* size = n_workers */
+    int                    n_workers;
+    /* counters */
     uint64_t   loops, in, out, drops;
 } lrx_priv_t;
 
@@ -28,7 +36,13 @@ static int lrx_init(pp_module_t *m, void *cfg)
     (void)cfg;
     lrx_priv_t *p = calloc(1, sizeof *p);
     if (!p) return PP_ERR_NOMEM;
-    p->rx_fd = g_rt->left_ops->get_rx_fd ? g_rt->left_ops->get_rx_fd(g_rt->left_ctx) : -1;
+
+    p->left_ops        = g_rt->left_ops;
+    p->left_ctx        = g_rt->left_ctx;
+    p->worker_rx_rings = g_rt->worker_rx_ring;
+    p->n_workers       = g_rt->n_workers;
+
+    p->rx_fd = p->left_ops->get_rx_fd ? p->left_ops->get_rx_fd(p->left_ctx) : -1;
     if (p->rx_fd >= 0) {
         p->epfd = epoll_create1(EPOLL_CLOEXEC);
         struct epoll_event ev = { .events = EPOLLIN, .data.fd = p->rx_fd };
@@ -54,7 +68,7 @@ static void *lrx_loop(void *arg)
             int n = epoll_wait(p->epfd, &ev, 1, 100);
             if (n <= 0) { p->loops++; continue; }
         }
-        int n = g_rt->left_ops->rx_burst(g_rt->left_ctx, batch, PP_PKT_BURST_MAX, 0);
+        int n = p->left_ops->rx_burst(p->left_ctx, batch, PP_PKT_BURST_MAX, 0);
         if (n <= 0) { p->loops++; continue; }
         p->in += n;
 
@@ -69,11 +83,12 @@ static void *lrx_loop(void *arg)
             pp_flow_dir_t dir;
             pp_flow_key_normalize(&k, &dir);
             uint64_t h = pp_flow_key_hash(&k);
-            int idx = (int)(h % (uint64_t)g_rt->n_workers);
+            /* shard 与 right_rx 一致：见 pp_flow_shard() 契约 */
+            int idx = (int)(h % (uint64_t)p->n_workers);
             pkt->meta.shard     = (uint16_t)idx;
             pkt->meta.flow_hash = h;
 
-            if (pp_ring_enqueue(g_rt->worker_rx_ring[idx], pkt) == 0) {
+            if (pp_ring_enqueue(p->worker_rx_rings[idx], pkt) == 0) {
                 pp_drop_orphan(1, PP_ORPHAN_LRX_WKR_RX_RING, "left_rx",
                                "worker_rx ring full", &k);
                 pp_pkt_put_ref(pkt); p->drops++;

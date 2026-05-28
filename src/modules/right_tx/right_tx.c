@@ -1,4 +1,7 @@
-/* src/modules/right_tx/right_tx.c -- 右手发包线程（每条 tunnel 一个） */
+/* src/modules/right_tx/right_tx.c -- 右手发包线程（每条 tunnel 一个）
+ *
+ * 模块边界：init() 把 g_rt 中需要的指针快照到 priv，主循环只读 priv。
+ */
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
@@ -10,6 +13,13 @@
 
 typedef struct rtx_priv {
     int      idx;                       /* tunnel idx */
+    /* injected at init() */
+    pp_runtime_t          *rt;          /* 仅给 pp_drop_by_sid 用 */
+    const pp_tunnel_ops_t *tun_ops;
+    void                  *tun_ctx;
+    pp_ring_t             *tx_ring;
+    const pp_tunnel_cfg_t *tun_cfg;     /* uring 分支按 cfg 决定路径 */
+    /* counters */
     uint64_t loops, in, out, drops;
 } rtx_priv_t;
 
@@ -30,9 +40,14 @@ static int rtx_init(pp_module_t *m, void *cfg)
     (void)cfg;
     if (!m->priv) return PP_ERR_INVAL;
     rtx_priv_t *p = m->priv;
+    p->rt      = g_rt;
+    p->tun_ops = g_rt->tun_ops[p->idx];
+    p->tun_ctx = g_rt->tun_ctx[p->idx];
+    p->tx_ring = g_rt->right_tx_ring[p->idx];
+    p->tun_cfg = &g_rt->tun_cfg[p->idx];
     /* 主动 connect 一次（同步）；失败由 send 时再重试 */
-    if (g_rt->tun_ops[p->idx]->connect)
-        g_rt->tun_ops[p->idx]->connect(g_rt->tun_ctx[p->idx]);
+    if (p->tun_ops->connect)
+        p->tun_ops->connect(p->tun_ctx);
     return PP_OK;
 }
 
@@ -42,11 +57,11 @@ static void rtx_nanosleep_again(void)
     nanosleep(&ts, NULL);
 }
 
-static int rtx_send_one(int idx, const pp_tun_buf_t *b)
+static int rtx_send_one(rtx_priv_t *p, const pp_tun_buf_t *b)
 {
     int r;
     for (int a = 0; ; a++) {
-        r = g_rt->tun_ops[idx]->send(g_rt->tun_ctx[idx], b);
+        r = p->tun_ops->send(p->tun_ctx, b);
         if (r != PP_ERR_AGAIN) break;
         if (a >= RTX_SEND_AGAIN_MAX) break;
         rtx_nanosleep_again();
@@ -55,9 +70,9 @@ static int rtx_send_one(int idx, const pp_tun_buf_t *b)
 }
 
 #ifdef PP_HAVE_IO_URING
-static bool rtx_use_uring_burst(int idx)
+static bool rtx_use_uring_burst(const rtx_priv_t *p)
 {
-    const pp_tunnel_cfg_t *tc = &g_rt->tun_cfg[idx];
+    const pp_tunnel_cfg_t *tc = p->tun_cfg;
     return tc->io == PP_TIO_KERNEL_SOCKET
         && tc->proto == PP_PROTO_UDP
         && tc->io_cfg.ks.backend == PP_KS_BACKEND_IO_URING
@@ -68,7 +83,7 @@ static void rtx_handle_send_result(rtx_priv_t *p, pp_pkt_t *pkt, uint64_t sid, i
 {
     if (r < 0) {
         PP_TRACE("right_tx: tunnel send failed: %s (r=%d)", pp_strerror(r), r);
-        pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
+        pp_drop_by_sid(p->rt, sid, 1, "right_tx", "tunnel send failed");
         p->drops++;
     } else {
         p->out++;
@@ -102,7 +117,7 @@ static void rtx_burst_send(rtx_priv_t *p, pp_pkt_t **batch, int n)
     if (nv <= 0)
         return;
 
-    unsigned btx = g_rt->tun_cfg[p->idx].io_cfg.ks.batch_tx;
+    unsigned btx = p->tun_cfg->io_cfg.ks.batch_tx;
     if (btx > PP_PKT_BURST_MAX)
         btx = PP_PKT_BURST_MAX;
 
@@ -111,11 +126,11 @@ static void rtx_burst_send(rtx_priv_t *p, pp_pkt_t **batch, int n)
         if (chunk > (int)btx)
             chunk = (int)btx;
 
-        int brc = pp_udp_ks_send_burst(g_rt->tun_ctx[p->idx],
+        int brc = pp_udp_ks_send_burst(p->tun_ctx,
                                        bufs + off, chunk, results + off);
         if (brc < 0) {
             for (int i = off; i < off + chunk; i++) {
-                int r = rtx_send_one(p->idx, &bufs[i]);
+                int r = rtx_send_one(p, &bufs[i]);
                 rtx_handle_send_result(p, valid[i], sids[i], r);
             }
             continue;
@@ -124,7 +139,7 @@ static void rtx_burst_send(rtx_priv_t *p, pp_pkt_t **batch, int n)
         for (int i = off; i < off + chunk; i++) {
             int r = results[i];
             if (r == PP_ERR_AGAIN)
-                r = rtx_send_one(p->idx, &bufs[i]);
+                r = rtx_send_one(p, &bufs[i]);
             rtx_handle_send_result(p, valid[i], sids[i], r);
         }
     }
@@ -140,7 +155,7 @@ static void *rtx_loop(void *arg)
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];
     while (!pp_module_should_quit(m)) {
-        int n = pp_ring_dequeue_burst(g_rt->right_tx_ring[p->idx],
+        int n = pp_ring_dequeue_burst(p->tx_ring,
                                       (void **)batch, PP_PKT_BURST_MAX);
         if (n <= 0) {
             struct timespec ts = {0, 200 * 1000};
@@ -150,7 +165,7 @@ static void *rtx_loop(void *arg)
         p->in += n;
 
 #ifdef PP_HAVE_IO_URING
-        if (rtx_use_uring_burst(p->idx)) {
+        if (rtx_use_uring_burst(p)) {
             rtx_burst_send(p, batch, n);
             p->loops++;
             continue;
@@ -168,13 +183,13 @@ static void *rtx_loop(void *arg)
             }
             uint64_t sid = pkt->meta.sid ? pkt->meta.sid : pkt->meta.flow_hash;
             pp_tun_buf_t b = { .data = pkt->data, .len = pkt->data_len };
-            int r = rtx_send_one(p->idx, &b);
+            int r = rtx_send_one(p, &b);
 #ifdef PP_HAVE_IO_URING
             rtx_handle_send_result(p, pkt, sid, r);
 #else
             if (r < 0) {
                 PP_TRACE("right_tx: tunnel send failed: %s (r=%d)", pp_strerror(r), r);
-                pp_drop_by_sid(g_rt, sid, 1, "right_tx", "tunnel send failed");
+                pp_drop_by_sid(p->rt, sid, 1, "right_tx", "tunnel send failed");
                 p->drops++;
             } else
                 p->out++;

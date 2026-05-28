@@ -1,4 +1,7 @@
-/* src/modules/timer/timer.c -- 老化、心跳 */
+/* src/modules/timer/timer.c -- 老化、心跳
+ *
+ * 模块边界：init() 把 g_rt 中需要的指针快照到 priv，主循环只读 priv。
+ */
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
@@ -6,13 +9,21 @@
 #include "pproxy/log.h"
 #include "../runtime.h"
 
-typedef struct tm_priv { uint64_t loops, ticks; } tm_priv_t;
+typedef struct tm_priv {
+    /* injected at init() */
+    pp_ring_t **ctrl_rings;     /* size = n_workers */
+    int         n_workers;
+    /* counters */
+    uint64_t loops, ticks;
+} tm_priv_t;
 
 static int tm_init(pp_module_t *m, void *cfg)
 {
     (void)cfg;
     tm_priv_t *p = calloc(1, sizeof *p);
     if (!p) return PP_ERR_NOMEM;
+    p->ctrl_rings = g_rt->worker_ctrl_ring;
+    p->n_workers  = g_rt->n_workers;
     m->priv = p;
     return PP_OK;
 }
@@ -30,11 +41,11 @@ static void *tm_loop(void *arg)
         if (pp_module_should_quit(m)) break;
         p->ticks++;
 
-        for (int i = 0; i < g_rt->n_workers; i++) {
+        for (int i = 0; i < p->n_workers; i++) {
             pp_ctl_msg_t *msg = calloc(1, sizeof *msg);
             if (!msg) continue;
             msg->op = PP_CTL_GC_TICK;
-            if (pp_ring_enqueue(g_rt->worker_ctrl_ring[i], msg) == 0) free(msg);
+            if (pp_ring_enqueue(p->ctrl_rings[i], msg) == 0) free(msg);
         }
         p->loops++;
     }

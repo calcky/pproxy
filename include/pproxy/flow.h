@@ -35,6 +35,15 @@ void pp_flow_key_normalize(pp_flow_key_t *k, pp_flow_dir_t *out_dir);
 /* 哈希；64-bit，便于直接做 hash & (N-1) */
 uint64_t pp_flow_key_hash(const pp_flow_key_t *k);
 
+/* hash(key) % n_workers —— left_rx 上行、right_rx 兜底回路共用，
+ * 保证 normalize 一致前提下两端落到同一 shard。
+ * 未来真正接入 "sid 高 16 位编码 shard" 的隧道头后，下游只对
+ * "解隧道头失败 / sid 未知" 的兜底走本函数。 */
+PP_INLINE int pp_flow_shard(const pp_flow_key_t *k, int n_workers)
+{
+    return (int)(pp_flow_key_hash(k) % (uint64_t)n_workers);
+}
+
 bool pp_flow_key_equal(const pp_flow_key_t *a, const pp_flow_key_t *b);
 
 /* 调试打印：tcp 1.2.3.4:5678 -> 5.6.7.8:443 */

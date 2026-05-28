@@ -1,4 +1,7 @@
-/* src/modules/left_tx/left_tx.c -- 左手发包线程 */
+/* src/modules/left_tx/left_tx.c -- 左手发包线程
+ *
+ * 模块边界：init() 把 g_rt 中需要的指针快照到 priv，主循环只读 priv。
+ */
 #include <pthread.h>
 #include <stdlib.h>
 #include "pproxy/module.h"
@@ -7,6 +10,12 @@
 #include "../runtime.h"
 
 typedef struct ltx_priv {
+    /* injected at init() */
+    pp_runtime_t          *rt;             /* 仅给 pp_drop_by_sid 用 */
+    const pp_pkt_io_ops_t *left_ops;
+    void                  *left_ctx;
+    pp_ring_t             *left_tx_ring;
+    /* counters */
     uint64_t loops, in, out, drops;
 } ltx_priv_t;
 
@@ -15,6 +24,10 @@ static int ltx_init(pp_module_t *m, void *cfg)
     (void)cfg;
     ltx_priv_t *p = calloc(1, sizeof *p);
     if (!p) return PP_ERR_NOMEM;
+    p->rt           = g_rt;
+    p->left_ops     = g_rt->left_ops;
+    p->left_ctx     = g_rt->left_ctx;
+    p->left_tx_ring = g_rt->left_tx_ring;
     m->priv = p;
     return PP_OK;
 }
@@ -28,7 +41,7 @@ static void *ltx_loop(void *arg)
 
     pp_pkt_t *batch[PP_PKT_BURST_MAX];
     while (!pp_module_should_quit(m)) {
-        int n = pp_ring_dequeue_burst(g_rt->left_tx_ring,
+        int n = pp_ring_dequeue_burst(p->left_tx_ring,
                                       (void **)batch, PP_PKT_BURST_MAX);
         if (n <= 0) {
             struct timespec ts = {0, 100 * 1000};   /* 0.1ms */
@@ -36,14 +49,14 @@ static void *ltx_loop(void *arg)
             p->loops++; continue;
         }
         p->in += n;
-        int sent = g_rt->left_ops->tx_burst(g_rt->left_ctx, batch, n);
+        int sent = p->left_ops->tx_burst(p->left_ctx, batch, n);
         p->out += sent;
         p->drops += (unsigned)(n - sent);
         for (int i = sent; i < n; i++) {
             uint64_t psid = batch[i]->meta.sid
                           ? batch[i]->meta.sid
                           : batch[i]->meta.flow_hash;
-            pp_drop_by_sid(g_rt, psid, 0, "left_tx",
+            pp_drop_by_sid(p->rt, psid, 0, "left_tx",
                           "left tx_burst drop (backlog/errno)");
         }
         for (int i = 0; i < n; i++) pp_pkt_put_ref(batch[i]);

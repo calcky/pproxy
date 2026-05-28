@@ -1,4 +1,7 @@
-/* src/modules/right_rx/right_rx.c -- 右手收包线程（每条 tunnel 一个） */
+/* src/modules/right_rx/right_rx.c -- 右手收包线程（每条 tunnel 一个）
+ *
+ * 模块边界：init() 把 g_rt 中需要的指针快照到 priv，主循环只读 priv。
+ */
 #include <pthread.h>
 #include <stdlib.h>
 #include <time.h>
@@ -12,6 +15,13 @@
 
 typedef struct rrx_priv {
     int      idx;
+    /* injected at init() */
+    const pp_tunnel_ops_t *tun_ops;
+    void                  *tun_ctx;
+    pp_mempool_t          *pool;
+    pp_ring_t            **back_rings;  /* size = n_workers */
+    int                    n_workers;
+    /* counters */
     uint64_t loops, in, out, drops;
 } rrx_priv_t;
 
@@ -26,7 +36,14 @@ int pp_right_rx_set_index(pp_module_t *m, int idx)
 static int rrx_init(pp_module_t *m, void *cfg)
 {
     (void)cfg;
-    return m->priv ? PP_OK : PP_ERR_INVAL;
+    if (!m->priv) return PP_ERR_INVAL;
+    rrx_priv_t *p = m->priv;
+    p->tun_ops    = g_rt->tun_ops[p->idx];
+    p->tun_ctx    = g_rt->tun_ctx[p->idx];
+    p->pool       = g_rt->pool;
+    p->back_rings = g_rt->worker_back_ring;
+    p->n_workers  = g_rt->n_workers;
+    return PP_OK;
 }
 
 static void *rrx_loop(void *arg)
@@ -37,7 +54,7 @@ static void *rrx_loop(void *arg)
     PP_INFO("%s: started (tunnel=%d)", m->name, p->idx);
 
     while (!pp_module_should_quit(m)) {
-        pp_pkt_t *pkt = pp_mempool_alloc(g_rt->pool);
+        pp_pkt_t *pkt = pp_mempool_alloc(p->pool);
         if (!pkt) {
             struct timespec ts = {0, 200 * 1000};
             nanosleep(&ts, NULL);
@@ -46,7 +63,7 @@ static void *rrx_loop(void *arg)
         pp_tun_mbuf_t mb = { .data = pkt->data,
                              .cap  = pkt->buf_len - pkt->headroom,
                              .len  = 0 };
-        int r = g_rt->tun_ops[p->idx]->recv(g_rt->tun_ctx[p->idx], &mb, 100000);
+        int r = p->tun_ops->recv(p->tun_ctx, &mb, 100000);
         if (r <= 0) {
             pp_pkt_put_ref(pkt);
             p->loops++;
@@ -66,7 +83,8 @@ static void *rrx_loop(void *arg)
         pkt->meta.rx_ns    = pp_now_ns();
         p->in++;
 
-        /* 与 left_rx 相同：按五元组 hash 选 worker，否则与 lookup_or_create 分片不一致 */
+        /* 与 left_rx 相同：按五元组 hash 选 worker，否则与 lookup_or_create 分片不一致。
+         * 共享 helper pp_flow_shard() 记录此契约。 */
         if (pp_pkt_parse_l3_ipv4(pkt) != PP_OK) {
             pp_drop_orphan_pkt(0, PP_ORPHAN_RRX_L3, "right_rx",
                                 "parse_l3_ipv4 failed", pkt);
@@ -86,10 +104,9 @@ static void *rrx_loop(void *arg)
             continue;
         }
         pp_flow_key_normalize(&fk, &fdir);
-        uint64_t h = pp_flow_key_hash(&fk);
-        int    shard = (int)(h % (uint64_t)g_rt->n_workers);
+        int shard = pp_flow_shard(&fk, p->n_workers);
         pkt->meta.shard = (uint16_t)shard;
-        if (pp_ring_enqueue(g_rt->worker_back_ring[shard], pkt) == 0) {
+        if (pp_ring_enqueue(p->back_rings[shard], pkt) == 0) {
             pp_drop_orphan(0, PP_ORPHAN_RRX_WKR_BACK_RING, "right_rx",
                            "worker_back ring full", &fk);
             pp_pkt_put_ref(pkt); p->drops++;
