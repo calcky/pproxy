@@ -10,6 +10,7 @@
 #include "pproxy/pproxy.h"
 #include "pproxy/packet.h"
 #include "pproxy/ring.h"
+#include "pproxy/ring_ipc.h"
 #include "pproxy/session.h"
 #include "pproxy/dpi.h"
 #include "pproxy/pkt_io.h"
@@ -31,6 +32,8 @@ typedef struct pp_runtime {
     uint32_t          ring_cap_worker_ctrl;
     uint32_t          ring_cap_right_tx;
     uint32_t          ring_cap_left_tx;
+
+    pp_ring_ipc_cfg_t ring_ipc;
 
     pp_io_kind_t      left_kind;
     pp_io_cfg_t       left_cfg;

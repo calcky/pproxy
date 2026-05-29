@@ -10,6 +10,8 @@
         "sstream": "c",
         "functional": "c",
         "cstdlib": "c",
-        "random": "c"
+        "random": "c",
+        "epoll.h": "c",
+        "atomic": "c"
     }
 }

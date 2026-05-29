@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "pproxy/ring.h"
+#include "pproxy/ring_ipc.h"
 
 #ifndef PP_RING_USE_CPU_BACKOFF
 #define PP_RING_USE_CPU_BACKOFF 1
@@ -55,6 +56,7 @@ struct pp_ring {
     atomic_size_t    prod_tail PP_CACHELINE_ALIGN;
     atomic_size_t    cons_head PP_CACHELINE_ALIGN;
     atomic_size_t    cons_tail PP_CACHELINE_ALIGN;
+    pp_ring_ipc_t   *ipc;
     void *slots[] PP_CACHELINE_ALIGN;
 };
 
@@ -80,7 +82,15 @@ pp_ring_t *pp_ring_create(const pp_ring_cfg_t *cfg)
     return r;
 }
 
-void pp_ring_destroy(pp_ring_t *r) { free(r); }
+void pp_ring_destroy(pp_ring_t *r)
+{
+    if (!r) return;
+    if (r->ipc) {
+        pp_ring_ipc_destroy(r->ipc);
+        r->ipc = NULL;
+    }
+    free(r);
+}
 
 size_t pp_ring_capacity(const pp_ring_t *r) { return r->capacity; }
 
@@ -94,8 +104,28 @@ size_t pp_ring_size(const pp_ring_t *r)
 bool pp_ring_empty(const pp_ring_t *r) { return pp_ring_size(r) == 0; }
 bool pp_ring_full (const pp_ring_t *r) { return pp_ring_size(r) >= r->capacity; }
 
+void pp_ring_attach_ipc(pp_ring_t *r, pp_ring_ipc_t *ipc)
+{
+    if (!r) return;
+    if (r->ipc && r->ipc != ipc)
+        pp_ring_ipc_destroy(r->ipc);
+    r->ipc = ipc;
+}
+
+pp_ring_ipc_t *pp_ring_get_ipc(const pp_ring_t *r)
+{
+    return r ? r->ipc : NULL;
+}
+
+static void ring_post_enqueue(pp_ring_t *r, bool was_empty, int n)
+{
+    if (n > 0 && was_empty && r->ipc)
+        pp_ring_ipc_notify(r->ipc);
+}
+
 int pp_ring_enqueue(pp_ring_t *r, void *elem)
 {
+    bool was_empty = pp_ring_empty(r);
     size_t old_ph, new_ph, old_ct;
     do {
         old_ph = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
@@ -110,12 +140,14 @@ int pp_ring_enqueue(pp_ring_t *r, void *elem)
 
     spin_until_eq(&r->prod_tail, old_ph);
     atomic_store_explicit(&r->prod_tail, new_ph, memory_order_release);
+    ring_post_enqueue(r, was_empty, 1);
     return 1;
 }
 
 int pp_ring_enqueue_burst(pp_ring_t *r, void *const *elems, int n)
 {
     if (n <= 0) return 0;
+    bool was_empty = pp_ring_empty(r);
     size_t old_ph, new_ph, old_ct;
     size_t entries = (size_t)n;
     do {
@@ -133,6 +165,7 @@ int pp_ring_enqueue_burst(pp_ring_t *r, void *const *elems, int n)
 
     spin_until_eq(&r->prod_tail, old_ph);
     atomic_store_explicit(&r->prod_tail, new_ph, memory_order_release);
+    ring_post_enqueue(r, was_empty, (int)entries);
     return (int)entries;
 }
 

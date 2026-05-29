@@ -9,27 +9,29 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include "pproxy/module.h"
 #include "pproxy/log.h"
 #include "pproxy/drop.h"
 #include "pproxy/flow.h"
 #include "pproxy/packet.h"
+#include "pproxy/ring_ipc.h"
 #include "../runtime.h"
 #include "../modules.h"
 
 typedef struct wk_priv {
     int      idx;                       /* 0..n_workers-1 */
     /* injected at init() */
-    pp_runtime_t       *rt;             /* 仅给 pp_drop_by_sid 用 */
-    pp_session_shard_t *shard;
-    pp_dpi_chain_t     *dpi;
-    pp_ring_t          *rx_ring;
-    pp_ring_t          *back_ring;
-    pp_ring_t          *ctrl_ring;
-    pp_ring_t          *left_tx_ring;
-    pp_ring_t         **right_tx_rings;  /* size = n_tunnels */
-    int                 n_tunnels;
+    pp_runtime_t           *rt;             /* 仅给 pp_drop_by_sid 用 */
+    pp_session_shard_t     *shard;
+    pp_dpi_chain_t         *dpi;
+    pp_ring_t              *rx_ring;
+    pp_ring_t              *back_ring;
+    pp_ring_t              *ctrl_ring;
+    pp_ring_t              *left_tx_ring;
+    pp_ring_t             **right_tx_rings;  /* size = n_tunnels */
+    int                     n_tunnels;
+    pp_ring_ipc_waiter_t   *ipc_waiter;
+    uint32_t                poll_backoff_us;
     /* counters */
     uint64_t loops, in, out, drops;
 } wk_priv_t;
@@ -58,6 +60,12 @@ static int wk_init(pp_module_t *m, void *cfg)
     p->left_tx_ring    = g_rt->left_tx_ring;
     p->right_tx_rings  = g_rt->right_tx_ring;
     p->n_tunnels       = g_rt->n_tunnels;
+    p->poll_backoff_us = g_rt->ring_ipc.poll_backoff_us;
+    p->ipc_waiter      = pp_ring_ipc_waiter_create();
+    if (!p->ipc_waiter) return PP_ERR_NOMEM;
+    pp_ring_ipc_waiter_add(p->ipc_waiter, p->rx_ring);
+    pp_ring_ipc_waiter_add(p->ipc_waiter, p->back_ring);
+    pp_ring_ipc_waiter_add(p->ipc_waiter, p->ctrl_ring);
     return PP_OK;
 }
 
@@ -211,10 +219,8 @@ static void *wk_loop(void *arg)
         }
         process_ctrl(p);
         p->loops++;
-        if (idle) {
-            struct timespec ts = {0, 50 * 1000};
-            nanosleep(&ts, NULL);
-        }
+        if (idle)
+            pp_ring_ipc_waiter_wait(p->ipc_waiter, p->poll_backoff_us);
     }
     PP_INFO("%s: stopped", m->name);
     return NULL;
@@ -233,7 +239,12 @@ static void wk_stop(pp_module_t *m)
 
 static void wk_destroy(pp_module_t *m)
 {
-    free(m->priv); m->priv = NULL;
+    wk_priv_t *p = m->priv;
+    if (p) {
+        pp_ring_ipc_waiter_destroy(p->ipc_waiter);
+        free(p);
+    }
+    m->priv = NULL;
 }
 
 static void wk_stat(pp_module_t *m, pp_mod_stat_t *s)

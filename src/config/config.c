@@ -13,6 +13,7 @@
 #include "pproxy/log.h"
 #include "pproxy/pkt_io.h"
 #include "pproxy/tunnel.h"
+#include "pproxy/ring_ipc.h"
 #include "../modules/runtime.h"
 #include "config.h"
 
@@ -121,6 +122,16 @@ static void parse_runtime(yyjson_val *root, pp_runtime_t *rt)
         rt->ring_cap_worker_ctrl = (uint32_t)jint(rg, "worker_ctrl_capacity", rt->ring_cap_worker_ctrl);
         rt->ring_cap_right_tx    = (uint32_t)jint(rg, "right_tx_capacity",    rt->ring_cap_right_tx);
         rt->ring_cap_left_tx     = (uint32_t)jint(rg, "left_tx_capacity",     rt->ring_cap_left_tx);
+
+        const char *ipc_s = jstr(rg, "ipc_mode", NULL);
+        if (ipc_s) {
+            bool ok = true;
+            rt->ring_ipc.mode = pp_ring_ipc_mode_parse(ipc_s, &ok);
+            if (!ok)
+                PP_WARN("config: unknown runtime.rings.ipc_mode '%s', fallback polling", ipc_s);
+        }
+        rt->ring_ipc.poll_backoff_us = (uint32_t)jint(rg, "poll_backoff_us",
+                                                       (int64_t)rt->ring_ipc.poll_backoff_us);
     }
 }
 

@@ -20,6 +20,7 @@
 #include "pproxy/log.h"
 #include "pproxy/packet.h"
 #include "pproxy/ring.h"
+#include "pproxy/ring_ipc.h"
 #include "pproxy/session.h"
 #include "pproxy/dpi.h"
 #include "pproxy/pkt_io.h"
@@ -80,6 +81,9 @@ static void apply_defaults(pp_runtime_t *rt)
     rt->ring_cap_worker_ctrl = 256;
     rt->ring_cap_right_tx    = 4096;
     rt->ring_cap_left_tx     = 4096;
+
+    rt->ring_ipc.mode            = PP_RING_IPC_POLLING;
+    rt->ring_ipc.poll_backoff_us = 50;
 
     /* 左手默认 tun pproxy0 */
     rt->left_kind             = PP_IO_TUN;
@@ -152,6 +156,25 @@ static void build_dpi_chain(pp_runtime_t *rt)
 }
 
 /* ---------- 阶段 2：按 rt 中的字段实例化资源 ---------- */
+static int attach_ring_ipc(pp_runtime_t *rt, pp_ring_t *ring, bool ctrl_ring)
+{
+    pp_ring_ipc_cfg_t cfg = rt->ring_ipc;
+    /* polling 时数据面 sleep 无 notify；ctrl 固定 eventfd 以便 timer/mgmt 唤醒 worker */
+    if (ctrl_ring && cfg.mode == PP_RING_IPC_POLLING)
+        cfg.mode = PP_RING_IPC_EVENTFD;
+    pp_ring_ipc_t *ipc = pp_ring_ipc_create(&cfg);
+    if (!ipc) return PP_ERR_NOMEM;
+    pp_ring_attach_ipc(ring, ipc);
+    return PP_OK;
+}
+
+static const char *ctrl_ipc_mode_name(const pp_runtime_t *rt)
+{
+    if (rt->ring_ipc.mode == PP_RING_IPC_POLLING)
+        return "eventfd";
+    return pp_ring_ipc_mode_name(rt->ring_ipc.mode);
+}
+
 static int build_runtime_resources(pp_runtime_t *rt)
 {
     rt->pool = pp_mempool_create(&rt->mempool_cfg);
@@ -203,23 +226,38 @@ static int build_runtime_resources(pp_runtime_t *rt)
         rc.kind = PP_RING_SPSC; rc.name = "worker_rx";
         rc.capacity = rt->ring_cap_worker_rx;
         rt->worker_rx_ring[i] = pp_ring_create(&rc);
+        if (!rt->worker_rx_ring[i]) return PP_ERR_NOMEM;
+        if (attach_ring_ipc(rt, rt->worker_rx_ring[i], false) != PP_OK) return PP_ERR_NOMEM;
 
         rc.kind = PP_RING_MPSC; rc.name = "worker_back";
         rc.capacity = rt->ring_cap_worker_back;
         rt->worker_back_ring[i] = pp_ring_create(&rc);
+        if (!rt->worker_back_ring[i]) return PP_ERR_NOMEM;
+        if (attach_ring_ipc(rt, rt->worker_back_ring[i], false) != PP_OK) return PP_ERR_NOMEM;
 
         rc.kind = PP_RING_MPSC; rc.name = "worker_ctrl";
         rc.capacity = rt->ring_cap_worker_ctrl;
         rt->worker_ctrl_ring[i] = pp_ring_create(&rc);
+        if (!rt->worker_ctrl_ring[i]) return PP_ERR_NOMEM;
+        if (attach_ring_ipc(rt, rt->worker_ctrl_ring[i], true) != PP_OK) return PP_ERR_NOMEM;
     }
     for (int j = 0; j < rt->n_tunnels; j++) {
         rc.kind = PP_RING_MPSC; rc.name = "right_tx";
         rc.capacity = rt->ring_cap_right_tx;
         rt->right_tx_ring[j] = pp_ring_create(&rc);
+        if (!rt->right_tx_ring[j]) return PP_ERR_NOMEM;
+        if (attach_ring_ipc(rt, rt->right_tx_ring[j], false) != PP_OK) return PP_ERR_NOMEM;
     }
     rc.kind = PP_RING_MPSC; rc.name = "left_tx";
     rc.capacity = rt->ring_cap_left_tx;
     rt->left_tx_ring = pp_ring_create(&rc);
+    if (!rt->left_tx_ring) return PP_ERR_NOMEM;
+    if (attach_ring_ipc(rt, rt->left_tx_ring, false) != PP_OK) return PP_ERR_NOMEM;
+
+    PP_INFO("rings: ipc_mode=%s ctrl=%s poll_backoff_us=%u",
+            pp_ring_ipc_mode_name(rt->ring_ipc.mode),
+            ctrl_ipc_mode_name(rt),
+            rt->ring_ipc.poll_backoff_us);
 
     return PP_OK;
 }

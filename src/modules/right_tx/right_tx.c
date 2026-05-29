@@ -8,6 +8,7 @@
 #include "pproxy/module.h"
 #include "pproxy/log.h"
 #include "pproxy/drop.h"
+#include "pproxy/ring_ipc.h"
 #include "../runtime.h"
 #include "../modules.h"
 
@@ -19,6 +20,8 @@ typedef struct rtx_priv {
     void                  *tun_ctx;
     pp_ring_t             *tx_ring;
     const pp_tunnel_cfg_t *tun_cfg;     /* uring 分支按 cfg 决定路径 */
+    pp_ring_ipc_waiter_t  *ipc_waiter;
+    uint32_t               poll_backoff_us;
     /* counters */
     uint64_t loops, in, out, drops;
 } rtx_priv_t;
@@ -45,6 +48,10 @@ static int rtx_init(pp_module_t *m, void *cfg)
     p->tun_ctx = g_rt->tun_ctx[p->idx];
     p->tx_ring = g_rt->right_tx_ring[p->idx];
     p->tun_cfg = &g_rt->tun_cfg[p->idx];
+    p->poll_backoff_us = g_rt->ring_ipc.poll_backoff_us;
+    p->ipc_waiter = pp_ring_ipc_waiter_create();
+    if (!p->ipc_waiter) return PP_ERR_NOMEM;
+    pp_ring_ipc_waiter_add(p->ipc_waiter, p->tx_ring);
     /* 主动 connect 一次（同步）；失败由 send 时再重试 */
     if (p->tun_ops->connect)
         p->tun_ops->connect(p->tun_ctx);
@@ -158,8 +165,7 @@ static void *rtx_loop(void *arg)
         int n = pp_ring_dequeue_burst(p->tx_ring,
                                       (void **)batch, PP_PKT_BURST_MAX);
         if (n <= 0) {
-            struct timespec ts = {0, 200 * 1000};
-            nanosleep(&ts, NULL);
+            pp_ring_ipc_waiter_wait(p->ipc_waiter, p->poll_backoff_us);
             p->loops++; continue;
         }
         p->in += n;
@@ -213,7 +219,15 @@ static void rtx_stop(pp_module_t *m)
     pthread_join(m->tid, NULL);
 }
 
-static void rtx_destroy(pp_module_t *m) { free(m->priv); m->priv = NULL; }
+static void rtx_destroy(pp_module_t *m)
+{
+    rtx_priv_t *p = m->priv;
+    if (p) {
+        pp_ring_ipc_waiter_destroy(p->ipc_waiter);
+        free(p);
+    }
+    m->priv = NULL;
+}
 
 static void rtx_stat(pp_module_t *m, pp_mod_stat_t *s)
 {

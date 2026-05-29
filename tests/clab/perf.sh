@@ -27,6 +27,7 @@ SCENARIO=""
 BASELINE=""
 FAIL_ON_THRESHOLD=0
 UPDATE_DOC=0
+OVERLAY_JSON=""
 EXTRA_DEPLOY=()
 
 usage() {
@@ -47,6 +48,8 @@ while [[ $# -gt 0 ]]; do
     --skip-build)  SKIP_BUILD=1 ;;
     --fail-on-threshold) FAIL_ON_THRESHOLD=1 ;;
     --update-doc)  UPDATE_DOC=1 ;;
+    --overlay=*)   OVERLAY_JSON="${1#--overlay=}" ;;
+    --overlay)     OVERLAY_JSON="$2"; shift ;;
     -h|--help)    usage 0 ;;
     *)            perf_err "unknown arg: $1"; usage 1 ;;
   esac
@@ -303,15 +306,17 @@ fi
 
 FAIL=0
 for item in "${SCENARIOS_TO_RUN[@]}"; do
+  merged_overlay="$OVERLAY_JSON"
   if [[ "$item" == *"__"* ]]; then
     base="${item%%__*}"
     rest="${item#*__}"
     key="${rest%%_*}"
     val="${rest#*_}"
-    overlay=$(python3 -c "import json; k='tunnels[0].io_cfg.${SWEEP_VAR}'; v='${v}'; print(json.dumps({k: int(v) if v.isdigit() else v}))")
-    run_one_scenario "$base" "$overlay" || FAIL=1
+    sweep_overlay=$(python3 -c "import json; k='tunnels[0].io_cfg.${SWEEP_VAR}'; v='${val}'; print(json.dumps({k: int(v) if v.isdigit() else v}))")
+    merged_overlay=$(python3 -c "import json,sys; a=json.loads(sys.argv[1] or '{}'); b=json.loads(sys.argv[2] or '{}'); a.update(b); print(json.dumps(a))" "$OVERLAY_JSON" "$sweep_overlay")
+    run_one_scenario "$base" "$merged_overlay" || FAIL=1
   else
-    run_one_scenario "$item" || FAIL=1
+    run_one_scenario "$item" "$merged_overlay" || FAIL=1
   fi
 done
 

@@ -7,6 +7,7 @@
 #include "pproxy/module.h"
 #include "pproxy/log.h"
 #include "pproxy/drop.h"
+#include "pproxy/ring_ipc.h"
 #include "../runtime.h"
 
 typedef struct ltx_priv {
@@ -15,6 +16,8 @@ typedef struct ltx_priv {
     const pp_pkt_io_ops_t *left_ops;
     void                  *left_ctx;
     pp_ring_t             *left_tx_ring;
+    pp_ring_ipc_waiter_t  *ipc_waiter;
+    uint32_t               poll_backoff_us;
     /* counters */
     uint64_t loops, in, out, drops;
 } ltx_priv_t;
@@ -28,6 +31,13 @@ static int ltx_init(pp_module_t *m, void *cfg)
     p->left_ops     = g_rt->left_ops;
     p->left_ctx     = g_rt->left_ctx;
     p->left_tx_ring = g_rt->left_tx_ring;
+    p->poll_backoff_us = g_rt->ring_ipc.poll_backoff_us;
+    p->ipc_waiter = pp_ring_ipc_waiter_create();
+    if (!p->ipc_waiter) {
+        free(p);
+        return PP_ERR_NOMEM;
+    }
+    pp_ring_ipc_waiter_add(p->ipc_waiter, p->left_tx_ring);
     m->priv = p;
     return PP_OK;
 }
@@ -44,8 +54,7 @@ static void *ltx_loop(void *arg)
         int n = pp_ring_dequeue_burst(p->left_tx_ring,
                                       (void **)batch, PP_PKT_BURST_MAX);
         if (n <= 0) {
-            struct timespec ts = {0, 100 * 1000};   /* 0.1ms */
-            nanosleep(&ts, NULL);
+            pp_ring_ipc_waiter_wait(p->ipc_waiter, p->poll_backoff_us);
             p->loops++; continue;
         }
         p->in += n;
@@ -79,7 +88,12 @@ static void ltx_stop(pp_module_t *m)
 
 static void ltx_destroy(pp_module_t *m)
 {
-    free(m->priv); m->priv = NULL;
+    ltx_priv_t *p = m->priv;
+    if (p) {
+        pp_ring_ipc_waiter_destroy(p->ipc_waiter);
+        free(p);
+    }
+    m->priv = NULL;
 }
 
 static void ltx_stat(pp_module_t *m, pp_mod_stat_t *s)

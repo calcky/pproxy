@@ -54,6 +54,12 @@ int pp_ring_dequeue (pp_ring_t *r, void **elem);
 int pp_ring_enqueue_burst(pp_ring_t *r, void *const *elems, int n);
 int pp_ring_dequeue_burst(pp_ring_t *r, void **elems, int n);
 
+struct pp_ring_ipc;
+typedef struct pp_ring_ipc pp_ring_ipc_t;
+
+void           pp_ring_attach_ipc(pp_ring_t *r, pp_ring_ipc_t *ipc);
+pp_ring_ipc_t *pp_ring_get_ipc(const pp_ring_t *r);
+
 /* ---------- 控制消息（worker ctrl_ring 用） ----------
  * 跨线程下发命令的小型联合体；不分配，按值塞进 ring。
  */

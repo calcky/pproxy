@@ -111,17 +111,30 @@ test_ring = executable('test_ring',
   [
     'tests/test_ring.c',
     'src/core/ring.c',
+    'src/core/ring_ipc.c',
   ],
   include_directories: inc,
   dependencies: deps,
 )
 test('ring', test_ring)
 
+test_ring_ipc = executable('test_ring_ipc',
+  [
+    'tests/test_ring_ipc.c',
+    'src/core/ring.c',
+    'src/core/ring_ipc.c',
+  ],
+  include_directories: inc,
+  dependencies: deps,
+)
+test('ring_ipc', test_ring_ipc)
+
 # ring 多生产者基准：同源码链两次 ring.c，仅 PP_RING_USE_CPU_BACKOFF 不同
 test_ring_bench = executable('test_ring_bench',
   [
     'tests/test_ring_bench.c',
     'src/core/ring.c',
+    'src/core/ring_ipc.c',
   ],
   include_directories: inc,
   dependencies: deps,
@@ -131,6 +144,7 @@ test_ring_bench_nobackoff = executable('test_ring_bench_nobackoff',
   [
     'tests/test_ring_bench.c',
     'src/core/ring.c',
+    'src/core/ring_ipc.c',
   ],
   include_directories: inc,
   dependencies: deps,
@@ -176,6 +190,8 @@ test_config_reload = executable('test_config_reload',
   [
     'tests/test_config_reload.c',
     'src/config/config.c',
+    'src/core/ring_ipc.c',
+    'src/core/ring.c',
     'src/core/dpi.c',
     'src/core/session.c',
     'src/core/flow.c',
@@ -199,6 +215,8 @@ test_mgmt_http = executable('test_mgmt_http',
     'src/modules/mgmt/mgmt.c',
     'src/core/drop.c',
     'src/config/config.c',
+    'src/core/ring_ipc.c',
+    'src/core/ring.c',
     'src/core/module.c',
     'src/core/thread.c',
     'src/core/dpi.c',
