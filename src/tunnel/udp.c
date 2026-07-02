@@ -33,6 +33,9 @@
 #include "io/dpdk.h"
 #include "io/netmap.h"
 #include "pproxy/xsk_filt.h"
+#ifdef PP_HAVE_MEMIF
+#include "io/memif.h"
+#endif
 
 #define UDP_RX_MAX      65535
 #define L4_UDP_HDR_LEN  8   /* 真正的 UDP 头 */
@@ -70,6 +73,9 @@ struct udp_ctx {
 #endif
 #ifdef PP_HAVE_IO_URING
     pp_uring_sock_t        *uring;
+#endif
+#ifdef PP_HAVE_MEMIF
+    struct pp_memif_io     *memif;
 #endif
 };
 
@@ -244,6 +250,13 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         PP_ERROR("udp tunnel: io=netmap requires build with -Dnetmap=true");
         return PP_ERR_NOSUPPORT;
 #endif
+    case PP_TIO_MEMIF:
+#ifdef PP_HAVE_MEMIF
+        break;
+#else
+        PP_ERROR("udp tunnel: io=memif requires build with -Dmemif=true");
+        return PP_ERR_NOSUPPORT;
+#endif
     default:
         PP_ERROR("udp tunnel: unknown io=%d", cfg->io);
         return PP_ERR_INVAL;
@@ -254,7 +267,8 @@ static int udp_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         cfg->io == PP_TIO_PCAP ||
         cfg->io == PP_TIO_AF_XDP ||
         cfg->io == PP_TIO_DPDK ||
-        cfg->io == PP_TIO_NETMAP) {
+        cfg->io == PP_TIO_NETMAP ||
+        cfg->io == PP_TIO_MEMIF) {
         const pp_endpoint_t *ep =
             (cfg->mode == PP_TMODE_SERVER) ? &cfg->listen : &cfg->server;
         if (ep->addr.af != PP_AF_INET) {
@@ -297,6 +311,9 @@ static void udp_close(void *ctx)
 #endif
 #ifdef PP_HAVE_NETMAP
     if (c->cfg.io == PP_TIO_NETMAP) { pp_netmap_io_free(c->nm); c->nm = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) { pp_memif_io_free(c->memif); c->memif = NULL; fd_owned_by_helper = true; }
 #endif
 #ifdef PP_HAVE_IO_URING
     if (c->uring) { pp_uring_sock_free(c->uring); c->uring = NULL; }
@@ -981,6 +998,87 @@ static int nm_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif  /* PP_HAVE_NETMAP */
 
+/* -------------------- memif 路径 -------------------- */
+#ifdef PP_HAVE_MEMIF
+static int mc_connect(struct udp_ctx *c)
+{
+    l3_init_ports(c);
+    if (c->cfg.mode == PP_TMODE_CLIENT && c->src_ip_be == 0)
+        PP_WARN("udp memif client: bind/listen 源 IP 为 0.0.0.0；"
+                "memif 自拼 IP 头需显式 bind（如 172.16.1.2:0）");
+
+    const uint8_t *pmac = c->cfg.io_cfg.memif.has_peer_mac
+                          ? c->cfg.io_cfg.memif.peer_mac : NULL;
+    int rc = pp_memif_io_new(&c->memif,
+                             c->cfg.io_cfg.memif.socket_path,
+                             c->cfg.io_cfg.memif.interface_id,
+                             c->cfg.io_cfg.memif.is_master,
+                             c->cfg.io_cfg.memif.ring_size,
+                             c->cfg.io_cfg.memif.buffer_size,
+                             pmac);
+    if (rc != PP_OK) return rc;
+    /* memif 无 fd；c->fd 保持 -1，dispatch 通过 c->cfg.io == PP_TIO_MEMIF 早期 case 处理 */
+
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        char epstr[64] = "";
+        pp_endpoint_format(&c->cfg.listen, epstr, sizeof epstr);
+        PP_INFO("udp memif tunnel: mode=server socket=%s id=%u listen=%s",
+                c->cfg.io_cfg.memif.socket_path,
+                c->cfg.io_cfg.memif.interface_id, epstr);
+    } else {
+        char sa[INET_ADDRSTRLEN] = "", da[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->src_ip_be, sa, sizeof sa);
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&c->peer_sa)->sin_addr, da, sizeof da);
+        PP_INFO("udp memif tunnel: mode=client socket=%s id=%u %s:%u -> %s:%u",
+                c->cfg.io_cfg.memif.socket_path,
+                c->cfg.io_cfg.memif.interface_id,
+                sa, c->src_port, da, c->dst_port);
+    }
+    return PP_OK;
+}
+
+static int mc_send(struct udp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!pp_memif_io_is_connected(c->memif)) {
+        pp_memif_io_poll(c->memif, 0);
+        return PP_ERR_AGAIN;
+    }
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t frame[65535];
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t ip_tot = build_ip_udp_frame(frame, sizeof frame,
+                                       c->src_ip_be, dst_ip_be,
+                                       c->src_port, c->dst_port,
+                                       c->ip_id++, buf->data, buf->len);
+    if (!ip_tot) return PP_ERR_INVAL;
+    int r = pp_memif_io_inject_ip(c->memif, frame, ip_tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int mc_recv(struct udp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    pp_memif_io_poll(c->memif, 0);   /* 处理控制面事件（握手/断线） */
+    if (!pp_memif_io_is_connected(c->memif)) return 0;
+
+    size_t n = 0;
+    const uint8_t *ip = pp_memif_io_next_ip(c->memif, &n);
+    if (!ip) return 0;
+
+    uint16_t sport; uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    int r = parse_ip_udp_frame(ip, n, c, &sport, &saddr_be, &body, &body_len);
+    if (r != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server(c, saddr_be, sport, "memif");
+    return (int)body_len;
+}
+#endif  /* PP_HAVE_MEMIF */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int udp_connect(void *ctx)
@@ -988,6 +1086,9 @@ static int udp_connect(void *ctx)
     struct udp_ctx *c = ctx;
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? PP_OK : dp_connect(c);
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) return c->memif ? PP_OK : mc_connect(c);
 #endif
     if (c->fd >= 0) return PP_OK;
     switch (c->cfg.io) {
@@ -1011,6 +1112,9 @@ static int udp_send(void *ctx, const pp_tun_buf_t *buf)
     struct udp_ctx *c = ctx;
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? dp_send(c, buf) : PP_ERR_CLOSED;
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) return c->memif ? mc_send(c, buf) : PP_ERR_CLOSED;
 #endif
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
@@ -1037,6 +1141,13 @@ static int udp_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
         if (!c->dpdk) return PP_ERR_CLOSED;
         (void)timeout_us;  /* busy poll；无 fd 可 poll */
         return dp_recv(c, out_buf);
+    }
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) {
+        if (!c->memif) return PP_ERR_CLOSED;
+        (void)timeout_us;  /* busy poll；无 fd 可 poll */
+        return mc_recv(c, out_buf);
     }
 #endif
     if (c->fd < 0) return PP_ERR_CLOSED;
@@ -1071,6 +1182,10 @@ static bool udp_tunnel_ready(const struct udp_ctx *c)
     if (c->cfg.io == PP_TIO_DPDK)
         return c->dpdk != NULL;
 #endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF)
+        return c->memif != NULL && pp_memif_io_is_connected(c->memif);
+#endif
     return c->fd >= 0;
 }
 
@@ -1096,7 +1211,8 @@ const pp_tunnel_ops_t pp_tunnel_udp = {
                        | PP_TIO_MASK_NETMAP
                        | PP_TIO_MASK_PCAP
                        | PP_TIO_MASK_TUN
-                       | PP_TIO_MASK_DPDK,
+                       | PP_TIO_MASK_DPDK
+                       | PP_TIO_MASK_MEMIF,
     .open = udp_open, .close = udp_close,
     .connect = udp_connect, .send = udp_send, .recv = udp_recv,
     .session_close = udp_session_close,

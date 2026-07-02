@@ -35,6 +35,9 @@
 #include "io/dpdk.h"
 #include "io/netmap.h"
 #include "pproxy/xsk_filt.h"
+#ifdef PP_HAVE_MEMIF
+#include "io/memif.h"
+#endif
 
 #define ICMP_HDR_LEN    8
 #define ICMP_TYPE_REQ   8
@@ -72,6 +75,9 @@ struct icmp_ctx {
 #endif
 #ifdef PP_HAVE_NETMAP
     struct pp_netmap_io    *nm;
+#endif
+#ifdef PP_HAVE_MEMIF
+    struct pp_memif_io     *memif;
 #endif
 };
 
@@ -239,6 +245,13 @@ static int ic_open(const pp_tunnel_cfg_t *cfg, void **out_ctx)
         PP_ERROR("icmp tunnel: io=netmap requires build with -Dnetmap=true");
         return PP_ERR_NOSUPPORT;
 #endif
+    case PP_TIO_MEMIF:
+#ifdef PP_HAVE_MEMIF
+        break;
+#else
+        PP_ERROR("icmp tunnel: io=memif requires build with -Dmemif=true");
+        return PP_ERR_NOSUPPORT;
+#endif
     default:
         PP_ERROR("icmp tunnel: unknown io=%d", cfg->io);
         return PP_ERR_INVAL;
@@ -278,6 +291,9 @@ static void ic_close(void *ctx)
 #endif
 #ifdef PP_HAVE_NETMAP
     if (c->cfg.io == PP_TIO_NETMAP) { pp_netmap_io_free(c->nm); c->nm = NULL; fd_owned_by_helper = true; }
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) { pp_memif_io_free(c->memif); c->memif = NULL; fd_owned_by_helper = true; }
 #endif
     if (c->fd >= 0 && !fd_owned_by_helper) close(c->fd);
     free(c);
@@ -718,6 +734,82 @@ static int nm_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
 }
 #endif /* PP_HAVE_NETMAP */
 
+/* -------------------- memif 路径 -------------------- */
+#ifdef PP_HAVE_MEMIF
+static int mc_connect(struct icmp_ctx *c)
+{
+    /* src/dst IP 来自 listen（server）/ server（client）端点 */
+    const uint8_t *pmac = c->cfg.io_cfg.memif.has_peer_mac
+                          ? c->cfg.io_cfg.memif.peer_mac : NULL;
+    int rc = pp_memif_io_new(&c->memif,
+                             c->cfg.io_cfg.memif.socket_path,
+                             c->cfg.io_cfg.memif.interface_id,
+                             c->cfg.io_cfg.memif.is_master,
+                             c->cfg.io_cfg.memif.ring_size,
+                             c->cfg.io_cfg.memif.buffer_size,
+                             pmac);
+    if (rc != PP_OK) return rc;
+
+    if (c->cfg.mode == PP_TMODE_SERVER) {
+        char a[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.listen.addr.u.v4, a, sizeof a);
+        PP_INFO("icmp memif tunnel: mode=server socket=%s id=%u listen=%s id=0x%04x",
+                c->cfg.io_cfg.memif.socket_path,
+                c->cfg.io_cfg.memif.interface_id, a, c->identifier);
+    } else {
+        char a[INET_ADDRSTRLEN] = "";
+        inet_ntop(AF_INET, &c->cfg.server.addr.u.v4, a, sizeof a);
+        PP_INFO("icmp memif tunnel: mode=client socket=%s id=%u -> %s id=0x%04x",
+                c->cfg.io_cfg.memif.socket_path,
+                c->cfg.io_cfg.memif.interface_id, a, c->identifier);
+    }
+    return PP_OK;
+}
+
+static int mc_send(struct icmp_ctx *c, const pp_tun_buf_t *buf)
+{
+    if (!pp_memif_io_is_connected(c->memif)) {
+        pp_memif_io_poll(c->memif, 0);
+        return PP_ERR_AGAIN;
+    }
+    if (!c->peer_known) return PP_ERR_AGAIN;
+    uint8_t body[IC_FRAME_MAX];
+    uint8_t type = (c->cfg.mode == PP_TMODE_SERVER) ? ICMP_TYPE_REPLY : ICMP_TYPE_REQ;
+    size_t blen = build_icmp_body(body, sizeof body, type,
+                                  c->identifier, c->seq++,
+                                  buf->data, buf->len);
+    if (!blen) return PP_ERR_INVAL;
+    uint8_t frame[IC_FRAME_MAX];
+    uint32_t src_ip_be = c->cfg.listen.addr.u.v4.s_addr;
+    uint32_t dst_ip_be = ((struct sockaddr_in *)&c->peer_sa)->sin_addr.s_addr;
+    size_t tot = wrap_ip(frame, sizeof frame, src_ip_be, dst_ip_be,
+                         c->ip_id++, body, blen);
+    if (!tot) return PP_ERR_INVAL;
+    int r = pp_memif_io_inject_ip(c->memif, frame, tot);
+    if (r < 0) return r;
+    return (int)buf->len;
+}
+
+static int mc_recv(struct icmp_ctx *c, pp_tun_mbuf_t *out_buf)
+{
+    pp_memif_io_poll(c->memif, 0);
+    if (!pp_memif_io_is_connected(c->memif)) return 0;
+
+    size_t n = 0;
+    const uint8_t *ip = pp_memif_io_next_ip(c->memif, &n);
+    if (!ip) return 0;
+    uint32_t saddr_be;
+    const uint8_t *body; size_t body_len;
+    if (parse_icmp_rx(ip, n, c, &saddr_be, &body, &body_len) != 1) return 0;
+    if (out_buf->cap < body_len) return PP_ERR_NOMEM;
+    memcpy(out_buf->data, body, body_len);
+    out_buf->len = body_len;
+    if (c->cfg.mode == PP_TMODE_SERVER)
+        learn_peer_server_ic(c, saddr_be, "memif");
+    return (int)body_len;
+}
+#endif /* PP_HAVE_MEMIF */
+
 /* -------------------- 顶层 ops 调度 -------------------- */
 
 static int ic_connect(void *ctx)
@@ -725,6 +817,9 @@ static int ic_connect(void *ctx)
     struct icmp_ctx *c = ctx;
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? PP_OK : dp_connect(c);
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) return c->memif ? PP_OK : mc_connect(c);
 #endif
     if (c->fd >= 0) return PP_OK;
     switch (c->cfg.io) {
@@ -747,6 +842,9 @@ static int ic_send(void *ctx, const pp_tun_buf_t *buf)
     struct icmp_ctx *c = ctx;
 #ifdef PP_HAVE_DPDK
     if (c->cfg.io == PP_TIO_DPDK) return c->dpdk ? dp_send(c, buf) : PP_ERR_CLOSED;
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) return c->memif ? mc_send(c, buf) : PP_ERR_CLOSED;
 #endif
     if (c->fd < 0) return PP_ERR_CLOSED;
     switch (c->cfg.io) {
@@ -772,6 +870,13 @@ static int ic_recv(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us)
         if (!c->dpdk) return PP_ERR_CLOSED;
         (void)timeout_us;
         return dp_recv(c, out_buf);
+    }
+#endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF) {
+        if (!c->memif) return PP_ERR_CLOSED;
+        (void)timeout_us;
+        return mc_recv(c, out_buf);
     }
 #endif
     if (c->fd < 0) return PP_ERR_CLOSED;
@@ -805,6 +910,10 @@ static bool ic_tunnel_ready(const struct icmp_ctx *c)
     if (c->cfg.io == PP_TIO_DPDK)
         return c->dpdk != NULL;
 #endif
+#ifdef PP_HAVE_MEMIF
+    if (c->cfg.io == PP_TIO_MEMIF)
+        return c->memif != NULL && pp_memif_io_is_connected(c->memif);
+#endif
     return c->fd >= 0;
 }
 
@@ -829,7 +938,8 @@ const pp_tunnel_ops_t pp_tunnel_icmp = {
                        | PP_TIO_MASK_NETMAP
                        | PP_TIO_MASK_PCAP
                        | PP_TIO_MASK_TUN
-                       | PP_TIO_MASK_DPDK,
+                       | PP_TIO_MASK_DPDK
+                       | PP_TIO_MASK_MEMIF,
     .open = ic_open, .close = ic_close,
     .connect = ic_connect, .send = ic_send, .recv = ic_recv,
     .session_close = ic_session_close,

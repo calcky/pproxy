@@ -40,6 +40,7 @@ typedef enum pp_tunnel_io {
     PP_TIO_PCAP          = 4,   /* libpcap，BPF 过滤 + pcap_inject */
     PP_TIO_TUN           = 5,   /* 通过 TUN 设备重注入（让内核路由） */
     PP_TIO_DPDK          = 6,   /* DPDK PMD，独占网卡、busy poll、当前为拷贝版 */
+    PP_TIO_MEMIF         = 7,   /* VPP memif，L2 共享内存虚拟网卡，busy poll */
 } pp_tunnel_io_t;
 
 /* I/O 能力位（用于 ops->supported_io_mask） */
@@ -51,6 +52,7 @@ typedef enum pp_tunnel_io {
 #define PP_TIO_MASK_PCAP            PP_TIO_BIT(PP_TIO_PCAP)
 #define PP_TIO_MASK_TUN             PP_TIO_BIT(PP_TIO_TUN)
 #define PP_TIO_MASK_DPDK            PP_TIO_BIT(PP_TIO_DPDK)
+#define PP_TIO_MASK_MEMIF           PP_TIO_BIT(PP_TIO_MEMIF)
 
 /* 判断/字符串化 */
 const char *pp_tunnel_io_name(pp_tunnel_io_t io);
@@ -135,6 +137,15 @@ typedef struct pp_tunnel_cfg {
             uint8_t     peer_mac[6];
             bool        has_peer_mac;     /* 静态 next-hop MAC：DPDK 接管 NIC 后无内核 ARP，必须显式给 */
         } dpdk;
+        struct {
+            const char *socket_path;   /* Unix socket 路径，如 /run/vpp/memif.sock */
+            uint32_t    interface_id;  /* memif 接口 ID（VPP 侧 id 参数） */
+            bool        is_master;     /* true=pproxy 创建 socket（master），false=连接到 VPP（slave） */
+            uint32_t    ring_size;     /* TX/RX ring 槽数，0=默认 1024 */
+            uint32_t    buffer_size;   /* 每个 buffer 字节数，0=默认 2048 */
+            uint8_t     peer_mac[6];   /* 对端 Ethernet MAC；全零时发往 broadcast */
+            bool        has_peer_mac;
+        } memif;
     } io_cfg;
 
     pp_mempool_t *pool;

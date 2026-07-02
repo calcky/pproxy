@@ -72,6 +72,11 @@ if get_option('io_uring')
   add_project_arguments('-DPP_HAVE_IO_URING', language: 'c')
 endif
 
+if get_option('memif')
+  deps += dependency('libmemif')
+  add_project_arguments('-DPP_HAVE_MEMIF', language: 'c')
+endif
+
 # ---------- 源文件（按目录扫描） ----------
 #
 # Meson 官方不支持 glob，理由是"新增文件时构建系统感知不到"。
@@ -176,6 +181,9 @@ _tunnel_loopback_srcs = [
 ]
 if get_option('dpdk')
   _tunnel_loopback_srcs += 'src/io/dpdk.c'
+endif
+if get_option('memif')
+  _tunnel_loopback_srcs += 'src/io/memif.c'
 endif
 test_tunnel_loopback = executable('test_tunnel_loopback',
   _tunnel_loopback_srcs,
@@ -320,6 +328,20 @@ if get_option('dpdk')
     dependencies: deps,
   )
   test('dpdk_io', test_dpdk_io)
+endif
+
+# ---------- 测试：memif 右手 I/O（仅 -Dmemif=true） ----------
+if get_option('memif')
+  test_memif_io = executable('test_memif_io',
+    [
+      'tests/test_memif_io.c',
+      'src/io/memif.c',
+      'src/core/log.c',
+    ],
+    include_directories: inc,
+    dependencies: deps,
+  )
+  test('memif_io', test_memif_io)
 endif
 if get_option('io_uring')
   test_uring_sock = executable('test_uring_sock',

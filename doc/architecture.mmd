@@ -37,7 +37,7 @@ flowchart LR
     subgraph RTUN["④ 右手 tunnel = (proto, io) per-tunnel"]
         direction TB
         RPROTO["proto: tcp / udp / icmp<br/>encode + decode (sid + 框架)"]:::proto
-        RIOX["io: kernel_socket / raw_socket<br/>tun / af_xdp / netmap / pcap"]:::io
+        RIOX["io: kernel_socket / raw_socket<br/>tun / af_xdp / netmap / pcap<br/>dpdk / memif(VPP)"]:::io
         RPROTO ===|"按 cfg.io 派发<br/>tcp 仅 kernel_socket<br/>udp/icmp 任选"| RIOX
     end
 

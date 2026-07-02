@@ -293,6 +293,7 @@ static pp_tunnel_io_t parse_tio(const char *s, bool *ok)
     if (!strcmp(s, "pcap"))              return PP_TIO_PCAP;
     if (!strcmp(s, "tun"))               return PP_TIO_TUN;
     if (!strcmp(s, "dpdk"))              return PP_TIO_DPDK;
+    if (!strcmp(s, "memif"))             return PP_TIO_MEMIF;
     *ok = false;
     return PP_TIO_KERNEL_SOCKET;
 }
@@ -409,6 +410,27 @@ static int parse_one_tunnel(yyjson_val *t, pp_tunnel_cfg_t *cfg, pp_runtime_t *r
                     cfg->io_cfg.dpdk.has_peer_mac = true;
                 } else {
                     PP_WARN("config: tunnel.io_cfg.peer_mac='%s' invalid, ignored", mac);
+                }
+            }
+            break;
+        }
+        case PP_TIO_MEMIF: {
+            cfg->io_cfg.memif.socket_path  = dup_to_rt(rt, jstr(ioc, "socket_path",
+                                                                 "/run/vpp/memif.sock"));
+            cfg->io_cfg.memif.interface_id = (uint32_t)jint(ioc, "interface_id", 0);
+            cfg->io_cfg.memif.is_master    = jbool(ioc, "is_master", false);
+            cfg->io_cfg.memif.ring_size    = (uint32_t)jint(ioc, "ring_size", 0);
+            cfg->io_cfg.memif.buffer_size  = (uint32_t)jint(ioc, "buffer_size", 0);
+            const char *pmac = jstr(ioc, "peer_mac", NULL);
+            if (pmac && pmac[0]) {
+                unsigned m[6] = {0};
+                if (sscanf(pmac, "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    for (int i = 0; i < 6; i++)
+                        cfg->io_cfg.memif.peer_mac[i] = (uint8_t)m[i];
+                    cfg->io_cfg.memif.has_peer_mac = true;
+                } else {
+                    PP_WARN("config: tunnel.io_cfg.peer_mac='%s' invalid, ignored", pmac);
                 }
             }
             break;

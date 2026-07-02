@@ -136,6 +136,7 @@ static const char *mgmt_tunnel_io_name(pp_tunnel_io_t io)
     case PP_TIO_PCAP:          return "pcap";
     case PP_TIO_TUN:           return "tun";
     case PP_TIO_DPDK:          return "dpdk";
+    case PP_TIO_MEMIF:         return "memif";
     default:                   return "unknown";
     }
 }

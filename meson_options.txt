@@ -3,4 +3,5 @@ option('pcap',   type: 'boolean', value: false, description: '启用 pcap I/O �
 option('netmap', type: 'boolean', value: false, description: '启用 netmap I/O 后端')
 option('dpdk',   type: 'boolean', value: false, description: '启用 DPDK I/O 后端 (需 libdpdk pkg-config)')
 option('io_uring', type: 'boolean', value: false, description: '启用 kernel_socket io_cfg.backend=io_uring (需 liburing)')
+option('memif',    type: 'boolean', value: false, description: '启用 VPP memif 右手隧道后端 (需 libmemif)')
 option('host_repo_abs', type: 'string', value: '', description: '非空时加入 -fdebug-prefix-map：容器 /workspace -> 本机仓库绝对路径（本机/VSCode 调试、避免路径为 /workspace/...）')
