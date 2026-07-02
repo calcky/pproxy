@@ -952,13 +952,17 @@ deploy_io_backend_prep() {
     export LEAF1_WAN_DEV LEAF2_WAN_DEV
   elif [[ "$DEPLOY_IO_RIGHT" == "memif" ]]; then
     echo ""
-    echo "=== [3.5/5] memif: probe WAN + router next-hop MAC ==="
-    read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
-    read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
-    echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
-    echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+    echo "=== [3.5/5] memif: probe WAN + static ARP + router next-hop MAC ==="
+    read -r LEAF1_WAN_DEV MEMIF_LEAF1_WAN_MAC _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+    read -r LEAF2_WAN_DEV MEMIF_LEAF2_WAN_MAC _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+    echo "  leaf1: WAN=${LEAF1_WAN_DEV} MAC=${MEMIF_LEAF1_WAN_MAC}"
+    echo "  leaf2: WAN=${LEAF2_WAN_DEV} MAC=${MEMIF_LEAF2_WAN_MAC}"
     if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
       echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+      exit 1
+    fi
+    if [[ -z "$MEMIF_LEAF1_WAN_MAC" || -z "$MEMIF_LEAF2_WAN_MAC" ]]; then
+      echo "  ✗ probe 未拿到 leaf WAN MAC" >&2
       exit 1
     fi
     MEMIF_LEAF1_PEER_MAC=$(router_iface_mac eth1)
@@ -968,6 +972,8 @@ deploy_io_backend_prep() {
       echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2
       exit 1
     fi
+    router_set_static_arp "172.16.0.2" "$MEMIF_LEAF1_WAN_MAC" \
+                          "172.16.1.2" "$MEMIF_LEAF2_WAN_MAC"
     export LEAF1_WAN_DEV LEAF2_WAN_DEV MEMIF_LEAF1_PEER_MAC MEMIF_LEAF2_PEER_MAC
   elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     echo ""
@@ -984,7 +990,8 @@ deploy_io_backend_prep() {
   fi
 }
 
-# router 容器写两条静态 ARP：leaf{1,2} 的 WAN IP → 各自 WAN MAC（DPDK 接管后内核 ARP 学不到）
+# router 容器写两条静态 ARP：leaf{1,2} 的 WAN IP → 各自 WAN MAC
+# DPDK 接管后内核 ARP 学不到；memif/VPP L2 桥场景里 pproxy 也不应答 router ARP。
 # 同时返回 router 在 eth1/eth2 上的 MAC，给 leaf 侧 pproxy 配 peer_mac
 router_set_static_arp() {
   local leaf1_ip=$1
@@ -1621,8 +1628,13 @@ pproxy_smoke() {
         _g2="tcp tunnel connected"
         ;;
       udp)
-        _g1="udp tunnel bound"
-        _g2="udp tunnel connected"
+        if [[ "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+          _g1="udp memif tunnel: mode=server"
+          _g2="udp memif tunnel: mode=client"
+        else
+          _g1="udp tunnel bound"
+          _g2="udp tunnel connected"
+        fi
         ;;
       icmp)
         _g1="icmp raw_socket listening"
