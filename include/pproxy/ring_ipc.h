@@ -4,10 +4,9 @@
  * 模式（runtime.rings.ipc_mode，数据面 ring 统一）:
  *   polling  -- nanosleep(backoff)（默认）
  *   eventfd  -- enqueue 后 eventfd 唤醒；消费者 epoll_wait
- *   futex    -- Linux futex WAIT/WAKE；worker 多 ring 用 futex_waitv(2)
  *
  * worker_ctrl_ring：ipc_mode=polling 时固定 eventfd（控制面需唤醒）；
- * eventfd/futex 时与 ipc_mode 一致。
+ * ipc_mode=eventfd 时与数据面一致。
  */
 #ifndef PPROXY_RING_IPC_H
 #define PPROXY_RING_IPC_H
@@ -25,7 +24,6 @@ typedef struct pp_ring pp_ring_t;
 typedef enum pp_ring_ipc_mode {
     PP_RING_IPC_POLLING = 0,
     PP_RING_IPC_EVENTFD,
-    PP_RING_IPC_FUTEX,
 } pp_ring_ipc_mode_t;
 
 typedef struct pp_ring_ipc_cfg {

@@ -52,7 +52,6 @@ static void *producer(void *arg)
     return NULL;
 }
 
-/* 先入队再 idle：消费者不应丢唤醒 */
 static int test_eventfd_no_lost_wakeup(void)
 {
 #ifndef PP_LINUX
@@ -82,7 +81,6 @@ static int test_eventfd_no_lost_wakeup(void)
 #endif
 }
 
-/* 空环 idle 后由另一线程 notify */
 static int test_eventfd_wake_after_idle(void)
 {
 #ifndef PP_LINUX
@@ -120,23 +118,22 @@ static int test_polling_idle(void)
     return 0;
 }
 
-/* futex 模式：rx/back/ctrl 均为 futex */
-static int test_waiter_all_futex(void)
+static int test_waiter_multi_eventfd(void)
 {
 #ifndef PP_LINUX
-    OK("  waiter all-futex (skip: non-Linux)");
+    OK("  waiter multi-eventfd (skip: non-Linux)");
     return 0;
 #else
-    pp_ring_t *data = new_ring_with_ipc(PP_RING_IPC_FUTEX);
-    pp_ring_t *ctrl = new_ring_with_ipc(PP_RING_IPC_FUTEX);
-    if (!data || !ctrl) FAIL("create rings");
+    pp_ring_t *a = new_ring_with_ipc(PP_RING_IPC_EVENTFD);
+    pp_ring_t *b = new_ring_with_ipc(PP_RING_IPC_EVENTFD);
+    if (!a || !b) FAIL("create rings");
 
     pp_ring_ipc_waiter_t *w = pp_ring_ipc_waiter_create();
     if (!w) FAIL("waiter_create");
-    pp_ring_ipc_waiter_add(w, data);
-    pp_ring_ipc_waiter_add(w, ctrl);
+    pp_ring_ipc_waiter_add(w, a);
+    pp_ring_ipc_waiter_add(w, b);
 
-    prod_arg_t pa = { .ring = ctrl, .delay_ms = 0 };
+    prod_arg_t pa = { .ring = b, .delay_ms = 0 };
     pthread_t th;
     if (pthread_create(&th, NULL, producer, &pa) != 0) FAIL("pthread_create");
     pthread_join(th, NULL);
@@ -144,57 +141,26 @@ static int test_waiter_all_futex(void)
     pp_ring_ipc_waiter_wait(w, 50000);
 
     void *p = NULL;
-    if (pp_ring_dequeue(ctrl, &p) != 1 || p != (void *)(uintptr_t)42)
-        FAIL("futex ctrl dequeue after waiter");
+    if (pp_ring_dequeue(b, &p) != 1 || p != (void *)(uintptr_t)42)
+        FAIL("eventfd ring b dequeue after waiter");
 
     pp_ring_ipc_waiter_destroy(w);
-    pp_ring_destroy(data);
-    pp_ring_destroy(ctrl);
-    OK("  waiter all-futex");
+    pp_ring_destroy(a);
+    pp_ring_destroy(b);
+    OK("  waiter multi-eventfd");
     return 0;
 #endif
 }
 
-/* 混合拓扑（polling 模式下 ctrl=eventfd + 数据=futex 仍可能出现于测试） */
-static int test_waiter_futex_plus_eventfd(void)
+static int test_ipc_mode_parse(void)
 {
-#ifndef PP_LINUX
-    OK("  waiter futex+eventfd (skip: non-Linux)");
+    bool ok;
+    if (pp_ring_ipc_mode_parse("futex", &ok) != PP_RING_IPC_POLLING || ok)
+        FAIL("futex 应解析失败并回退 polling");
+    if (pp_ring_ipc_mode_parse("eventfd", &ok) != PP_RING_IPC_EVENTFD || !ok)
+        FAIL("eventfd parse");
+    OK("  ipc_mode parse");
     return 0;
-#else
-    pp_ring_t *data = new_ring_with_ipc(PP_RING_IPC_FUTEX);
-    pp_ring_t *ctrl = new_ring_with_ipc(PP_RING_IPC_EVENTFD);
-    if (!data || !ctrl) FAIL("create rings");
-
-    pp_ring_ipc_waiter_t *w = pp_ring_ipc_waiter_create();
-    if (!w) FAIL("waiter_create");
-    pp_ring_ipc_waiter_add(w, data);
-    pp_ring_ipc_waiter_add(w, ctrl);
-
-    prod_arg_t pa = { .ring = data, .delay_ms = 0 };
-    pthread_t th;
-    if (pthread_create(&th, NULL, producer, &pa) != 0) FAIL("pthread_create");
-    pthread_join(th, NULL);
-
-    pp_ring_ipc_waiter_wait(w, 50000);
-
-    void *p = NULL;
-    if (pp_ring_dequeue(data, &p) != 1 || p != (void *)(uintptr_t)42)
-        FAIL("futex ring dequeue after waiter");
-
-    pa.ring = ctrl;
-    if (pthread_create(&th, NULL, producer, &pa) != 0) FAIL("pthread_create ctrl");
-    pp_ring_ipc_waiter_wait(w, 50000);
-    pthread_join(th, NULL);
-    if (pp_ring_dequeue(ctrl, &p) != 1 || p != (void *)(uintptr_t)42)
-        FAIL("eventfd ctrl dequeue after waiter");
-
-    pp_ring_ipc_waiter_destroy(w);
-    pp_ring_destroy(data);
-    pp_ring_destroy(ctrl);
-    OK("  waiter futex+eventfd");
-    return 0;
-#endif
 }
 
 int main(void)
@@ -203,7 +169,7 @@ int main(void)
     rc |= test_polling_idle();
     rc |= test_eventfd_no_lost_wakeup();
     rc |= test_eventfd_wake_after_idle();
-    rc |= test_waiter_all_futex();
-    rc |= test_waiter_futex_plus_eventfd();
+    rc |= test_waiter_multi_eventfd();
+    rc |= test_ipc_mode_parse();
     return rc ? 1 : 0;
 }
