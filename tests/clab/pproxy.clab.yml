@@ -27,13 +27,13 @@ topology:
       # 勿在此加 ports: 想映射 gdbserver(2345) 到宿主机：该 kind 下 ports 是「外层容器」与宿主机的映射，
       # 而 gdb/ssh 跑在 **QEMU 虚拟机里** 且常绑 127.0.0.1，不会出现在外层容器的 2345 上，故映射无效。
       # 从宿主连 VM 内 gdbserver：用 tests/clab/gdb-tunnel.sh（ssh -L 转到 VM 的 127.0.0.1:2345）或本机只 ssh 再 gdb。
-      image: vrnetlab/canonical_ubuntu:noble
+      image: pproxy/ubuntu-noble-leaf:latest
       env:
         QEMU_SMP: 4
         QEMU_MEMORY: 1024
     leaf2:
       kind: generic_vm
-      image: vrnetlab/canonical_ubuntu:noble
+      image: pproxy/ubuntu-noble-leaf:latest
       env:
         QEMU_SMP: 4
         QEMU_MEMORY: 1024

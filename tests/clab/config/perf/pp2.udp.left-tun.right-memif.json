@@ -1,0 +1,48 @@
+{
+  "log": {
+    "level": "warn"
+  },
+  "runtime": {
+    "workers": 4,
+    "rings": {
+      "right_tx_capacity": 8192
+    }
+  },
+  "left": {
+    "kind": "tun",
+    "name": "pp2",
+    "tun": {
+      "ifname": "ppclab2",
+      "cidr": "192.168.0.0/24",
+      "mtu": 1500,
+      "no_pi": true
+    }
+  },
+  "tunnels": [
+    {
+      "name": "cli",
+      "proto": "udp",
+      "io": "memif",
+      "mode": "client",
+      "server": "172.16.0.2:19900",
+      "bind": "172.16.1.2:0",
+      "udp": {
+        "mtu": 1500
+      },
+      "io_cfg": {
+        "socket_path": "/opt/pproxy/run/memif.sock",
+        "interface_id": 0,
+        "is_master": false,
+        "ring_size": 1024,
+        "buffer_size": 2048
+      }
+    }
+  ],
+  "mgmt": {
+    "unix_socket": "/opt/pproxy/run/pp.sock",
+    "metrics": {
+      "enable": true,
+      "listen": "127.0.0.1:19992"
+    }
+  }
+}

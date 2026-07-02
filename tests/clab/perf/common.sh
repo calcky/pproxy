@@ -155,12 +155,14 @@ perf_cleanup_stale() {
     "$CLAB_DIR/gdb-tunnel.sh" stop 2>/dev/null || true
   fi
   perf_stop_iperf_clients
-  for host in "$LEAF1_HOST" "$LEAF2_HOST"; do
-    if sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" true 2>/dev/null; then
-      perf_log "cleanup: pproxy/gdb on ${host}"
-      perf_stop_pproxy_on_leaf "$host"
-    fi
-  done
+  if [[ "${SKIP_DEPLOY:-0}" != "1" ]]; then
+    for host in "$LEAF1_HOST" "$LEAF2_HOST"; do
+      if sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" true 2>/dev/null; then
+        perf_log "cleanup: pproxy/gdb on ${host}"
+        perf_stop_pproxy_on_leaf "$host"
+      fi
+    done
+  fi
   perf_log "cleanup: done"
 }
 

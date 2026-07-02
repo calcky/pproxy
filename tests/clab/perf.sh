@@ -82,7 +82,7 @@ PY
 matrix_scenarios() {
   python3 - "$SCENARIOS_FILE" <<'PY'
 import sys, yaml
-want = {'udp_kernel','udp_uring_batch32','udp_af_xdp','udp_netmap','udp_dpdk'}
+want = {'udp_kernel','udp_uring_batch32','udp_af_xdp','udp_netmap','udp_dpdk','udp_memif'}
 for s in yaml.safe_load(open(sys.argv[1], encoding='utf-8')):
     if s['name'] in want:
         print(s['name'])
@@ -188,12 +188,15 @@ PY
     else
       [[ $SKIP_BUILD -eq 1 ]] && export PPROXY_SKIP_BUILD=1
     fi
-    PPROXY_SKIP_SMOKE=1 \
-    PPROXY_CFG_DIR="$cfg_dir" \
-      "$CLAB_DIR/deploy.sh" "${deploy_args[@]}"
+    if ! PPROXY_SKIP_SMOKE=1 \
+      PPROXY_CFG_DIR="$cfg_dir" \
+      "$CLAB_DIR/deploy.sh" "${deploy_args[@]}"; then
+      perf_err "deploy failed for scenario ${name}"
+      return 1
+    fi
   fi
 
-  perf_wait_connectivity 60
+  perf_wait_connectivity 60 || return 1
 
   EXPECT_PROTO="$tunnel" EXPECT_LEFT="$left" EXPECT_RIGHT="$right"
   perf_check_tunnel 15 || return 1

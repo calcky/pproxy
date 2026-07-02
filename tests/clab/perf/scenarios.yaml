@@ -110,3 +110,21 @@
     warmup: 2
   thresholds:
     min_mbps: 30
+
+- name: udp_memif
+  ci: false
+  deploy:
+    tunnel: udp
+    left_io: tun
+    right_io: memif
+  config_overlay:
+    log.level: warn
+    runtime.workers: 4
+    runtime.rings.right_tx_capacity: 8192
+  traffic:
+    proto: tcp
+    duration: 10
+    parallel_runs: [1, 10]
+    warmup: 2
+  thresholds:
+    min_mbps: 30

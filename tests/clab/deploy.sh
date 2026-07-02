@@ -8,7 +8,7 @@
 #   PPROXY_BIN=/path/to/pproxy ./deploy.sh
 #   ./deploy.sh --tunnel=tcp        # 隧道协议：默认 udp；可选 tcp、icmp
 #   ./deploy.sh --left-io=tun --right-io=kernel_socket   # 左右手 I/O，见 --help
-#   ./deploy.sh --left-io=tun --right-io=dpdk            # 右手 DPDK；需 hugepages + vfio-pci 已绑数据网卡（DPDK 接管后内核不可见）
+#   ./deploy.sh --left-io=tun --right-io=memif          # 右手 memif + VPP sidecar（af_packet↔memif L2 桥到 WAN）
 #   ./deploy.sh --left-io=tun --right-io=netmap          # 右手 netmap；pproxy 用户态 ARP 学习/应答（勿依赖 leaf 内核 ARP）
 #   ./deploy.sh --left-io=tun --right-io=io_uring        # 右手 kernel_socket + io_cfg.backend=io_uring（仍走内核协议栈）
 #   ./deploy.sh --left-io=tun --right-io=io_uring --io-uring-zc   # 同上 + io_cfg.tx_zc（SEND_ZC）
@@ -40,14 +40,15 @@
 #   关闭: PPROXY_COREDUMP=0 ./deploy.sh
 #
 # 未设 PPROXY_SKIP_BUILD=1 且非 --no-pproxy 时，本脚本会在「[1/5]」前自动在仓库根执行
-#   ./build.sh --xdp --pcap [--dpdk] [--netmap] [--io-uring]（随 --left-io / --right-io / --ks-backend 追加）
+#   ./build.sh --xdp --pcap [--dpdk] [--memif] [--netmap] [--io-uring]（随 --left-io / --right-io / --ks-backend 追加）
 # 以生成与 leaf 上依赖一致的 build/pproxy。
 #
 # 命令行帮助:  ./deploy.sh --help
 #
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
 
 TOPO="pproxy.clab.yml"
 UBUNTU_USER="clab"
@@ -56,6 +57,9 @@ UBUNTU_PASS='clab@123'
 LEAF1_WAN_IP="172.16.0.2"
 LEAF2_WAN_IP="172.16.1.2"
 TUNNEL_PORT=19900
+MEMIF_SOCKET_PATH="/opt/pproxy/run/memif.sock"
+MEMIF_SOCKET_ID=1
+MEMIF_INTERFACE_ID=0
 PP1_METRICS=19991
 PP2_METRICS=19992
 
@@ -63,8 +67,8 @@ PP2_METRICS=19992
 LEAF1_HOST="leaf1"
 LEAF2_HOST="leaf2"
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-CLAB_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+CLAB_DIR="$SCRIPT_DIR"
 PPROXY_CFG_DIR="${PPROXY_CFG_DIR:-$CLAB_DIR/config}"
 PPROXY_BIN="${PPROXY_BIN:-$REPO_ROOT/build/pproxy}"
 # 隧道模式：udp（默认）| tcp | icmp → 见 resolve_tunnel_cfgs；与 listen 端口 19900（tcp/udp）一致
@@ -113,12 +117,13 @@ tests/clab/deploy.sh — 部署 containerlab 拓扑、配置 leaf、可选编译
   --no-pproxy              只部署拓扑与 leaf 网络，不编译、不装 pproxy
   --tunnel=tcp|udp|icmp    隧道协议（默认 udp；也可 PPROXY_TUNNEL_MODE，命令行优先）
   --left-io=KIND           左手 I/O: tun, raw_socket, af_xdp, netmap, pcap, dpdk（默认同环境或 tun）
-  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, io_uring
+  --right-io=KIND|auto     隧道 I/O: kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, memif, io_uring
                            省略或 auto 时：tcp/udp→kernel_socket，icmp→raw_socket
                            io_uring：等价 kernel_socket + io_cfg.backend=io_uring（需 ./build.sh --io-uring）
                            --io-uring-zc / --no-io-uring-zc  强制开启/关闭 io_cfg.tx_zc（SEND_ZC；默认沿用 JSON 模板）
                            注意：dpdk 需要 hugepages + vfio-pci 已绑指定数据网卡；DPDK 接管后内核不可见，
                                  不能与 kernel_socket 共用同一张卡；router 需静态 ARP
+                           memif 需 leaf 上 VPP（memif master）+ libmemif；pproxy 为 slave，经 af_packet 桥到 WAN
                            netmap 需内核 netmap 模块；入向 ARP 由 pproxy 用户态处理，router 可动态 ARP
                            （netmap.ko 在宿主机 Docker 编一次，见 tests/clab/build-netmap-ko.sh）
   --perf-config-dir=DIR    性能测试 JSON 模板目录（等价 PPROXY_PERF_CONFIG_DIR）
@@ -270,9 +275,9 @@ resolve_tunnel_cfgs() {
       ;;
   esac
   case "$r" in
-    kernel_socket|raw_socket|tun|af_xdp|netmap|pcap|dpdk) ;;
+    kernel_socket|raw_socket|tun|af_xdp|netmap|pcap|dpdk|memif) ;;
     *)
-      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, io_uring, auto)" >&2
+      echo "Invalid --right-io / PPROXY_RIGHT_IO: $r (kernel_socket, raw_socket, tun, af_xdp, netmap, pcap, dpdk, memif, io_uring, auto)" >&2
       exit 1
       ;;
   esac
@@ -378,10 +383,13 @@ require containerlab "containerlab (https://containerlab.dev)"
 if [[ "$PPROXY_ONLY" -eq 0 && "$SKIP_PPROXY" -eq 0 && "${PPROXY_SKIP_BUILD:-0}" != "1" ]]; then
   BUILD_ARGS=(--xdp --pcap --debug)
   if [[ "$MATRIX_PREP" -eq 1 ]]; then
-    BUILD_ARGS+=(--dpdk --netmap --io-uring)
+    BUILD_ARGS+=(--dpdk --memif --netmap --io-uring)
   else
     if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
       BUILD_ARGS+=(--dpdk)
+    fi
+    if [[ "$DEPLOY_IO_LEFT" == "memif" || "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+      BUILD_ARGS+=(--memif)
     fi
     if [[ "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
       BUILD_ARGS+=(--netmap)
@@ -464,10 +472,11 @@ elif [[ \${#DATA[@]} -lt 2 ]]; then
   echo "Could not find two data interfaces (have: \${ALL[*]})" >&2
   exit 1
 fi
-WAN="\${DATA[0]}"
-LAN="\${DATA[1]}"
+	WAN="\${DATA[0]}"
+	LAN="\${DATA[1]}"
+	printf 'WAN=%s\nLAN=%s\n' "\$WAN" "\$LAN" | s tee /run/pproxy-devices.env >/dev/null
 
-if [[ "\$WAN_FOR_DPDK" == "1" ]]; then
+	if [[ "\$WAN_FOR_DPDK" == "1" ]]; then
   s ip addr flush dev "\$WAN" 2>/dev/null || true
   s ip link set "\$WAN" up
   echo "OK \${LABEL}: WAN=\$WAN (leave for DPDK; no IP/route/MASQ) LAN=\$LAN"
@@ -540,13 +549,15 @@ pproxy_apt_deps() {
   local host=$1
   local need_dpdk="${2:-0}"
   local need_uring="${3:-0}"
-  echo "  pproxy: installing runtime libs on ${host} (dpdk=${need_dpdk}, io_uring=${need_uring}) …"
+  local need_memif="${4:-0}"
+  echo "  pproxy: installing runtime libs on ${host} (dpdk=${need_dpdk}, io_uring=${need_uring}, memif=${need_memif}) …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" "$need_dpdk" "$need_uring" <<'EOA'
+    bash -s -- "$UBUNTU_PASS" "$need_dpdk" "$need_uring" "$need_memif" <<'EOA'
 set -euo pipefail
 SUDO_PASS="$1"
 NEED_DPDK="$2"
 NEED_IO_URING="$3"
+NEED_MEMIF="$4"
 s() { printf '%s\n' "$SUDO_PASS" | sudo -S -p '' "$@"; }
 export DEBIAN_FRONTEND=noninteractive
 s apt-get update -qq
@@ -571,6 +582,42 @@ if [[ "$NEED_DPDK" == "1" ]]; then
   s apt-get install -y -qq dpdk dpdk-kmods-dkms 2>/dev/null \
     || s apt-get install -y -qq dpdk \
     || echo "  ✗ DPDK 包安装失败（请人工执行 apt install dpdk）" >&2
+fi
+if [[ "$NEED_MEMIF" == "1" ]]; then
+  s apt-get install -y -qq git cmake make g++ pkg-config 2>/dev/null || true
+  if ! command -v vpp >/dev/null 2>&1; then
+    if ! test -f /etc/apt/sources.list.d/fdio_release.list; then
+      tmp_fdio=$(mktemp)
+      if curl -fsSL https://packagecloud.io/install/repositories/fdio/release/script.deb.sh -o "$tmp_fdio"; then
+        s bash "$tmp_fdio" || echo "  ✗ FD.io apt repo 安装失败" >&2
+      else
+        echo "  ✗ FD.io apt repo 脚本下载失败" >&2
+      fi
+      rm -f "$tmp_fdio"
+      test -f /etc/apt/sources.list.d/fdio_release.list \
+        || echo "  ✗ FD.io apt repo 安装失败" >&2
+    fi
+    s apt-get update -qq
+    # VPP packages enable/start a systemd service and apply 1024 hugepages by
+    # default. In the 1GB clab leaf VM that can starve later apt/cmake work.
+    s sh -c 'printf "%s\n%s\n" "#!/bin/sh" "exit 101" > /usr/sbin/policy-rc.d'
+    s chmod 755 /usr/sbin/policy-rc.d
+    s sh -c 'mkdir -p /etc/sysctl.d && printf "%s\n%s\n" "vm.nr_hugepages = 0" "vm.hugetlb_shm_group = 0" > /etc/sysctl.d/80-vpp.conf'
+    s apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold vpp vpp-plugin-core 2>/dev/null \
+      || s apt-get install -y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold vpp \
+      || echo "  ✗ VPP 包安装失败（请人工 apt install vpp vpp-plugin-core）" >&2
+    s rm -f /usr/sbin/policy-rc.d
+    s systemctl disable --now vpp 2>/dev/null || true
+    s pkill -x vpp_main 2>/dev/null || true
+    s pkill -f '^vpp -c ' 2>/dev/null || true
+    s sh -c 'printf "%s\n%s\n" "vm.nr_hugepages = 0" "vm.hugetlb_shm_group = 0" > /etc/sysctl.d/99-pproxy-vpp.conf'
+    s sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
+  fi
+  if ! pkg-config --exists libmemif 2>/dev/null; then
+    if [[ -x /opt/pproxy/install_libmemif.sh ]]; then
+      s /opt/pproxy/install_libmemif.sh /usr/local || true
+    fi
+  fi
 fi
 EOA
 }
@@ -616,6 +663,14 @@ probe_leaf_wan_info() {
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" bash -s <<'EOI'
 set -euo pipefail
 MGT_DEV=$(ip -4 route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
+SAVED_WAN=$(sed -n 's/^WAN=//p' /run/pproxy-devices.env 2>/dev/null | head -1 || true)
+if [[ -n "$SAVED_WAN" && -d "/sys/class/net/$SAVED_WAN" ]]; then
+  WAN="$SAVED_WAN"
+elif WAN=$(ip -o -4 addr show scope global 2>/dev/null | awk '$4 ~ /^172[.]16[.]/ { print $2; exit }') && [[ -n "$WAN" ]]; then
+  :
+else
+  WAN=""
+fi
 readarray -t ALL < <(ip -br link | awk '$1 != "lo" { print $1 }' | sort)
 DATA=()
 for i in "${ALL[@]}"; do
@@ -623,7 +678,7 @@ for i in "${ALL[@]}"; do
   DATA+=("$i")
 done
 [[ ${#DATA[@]} -lt 2 && ${#ALL[@]} -ge 3 ]] && DATA=("${ALL[1]}" "${ALL[2]}")
-WAN="${DATA[0]}"
+: "${WAN:=${DATA[0]}}"
 MAC=$(cat "/sys/class/net/$WAN/address")
 # /sys/class/net/<if>/device 对 virtio 来说是 virtio<N>（不是 PCI 地址）；向上走找第一个 PCI 节点
 P=$(readlink -f "/sys/class/net/$WAN/device" 2>/dev/null || echo "")
@@ -674,37 +729,38 @@ pproxy_dpdk_restore_kernel_wan() {
 set -euo pipefail
 PASS="$1"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s pkill -f '/opt/pproxy/pproxy' 2>/dev/null || true
+s pkill -f '/opt/pproxy/pp1.json' 2>/dev/null || true
+s pkill -f '/opt/pproxy/pp2.json' 2>/dev/null || true
+sleep 0.5
 MGT=$(ip -4 route show default 2>/dev/null | head -1 | sed -n 's/.* dev \([^ ]*\).*/\1/p' || true)
-WAN=""
-while read -r name _; do
-  [[ "$name" == "lo" ]] && continue
-  [[ -n "$MGT" && "$name" == "$MGT" ]] && continue
-  WAN="$name"
-  break
-done < <(ip -br link | awk '{print $1}')
-[[ -n "$WAN" ]] || exit 0
-P=$(readlink -f "/sys/class/net/$WAN/device" 2>/dev/null || echo "")
-PCI=""
-while [[ -n "$P" && "$P" != "/" ]]; do
-  B=$(basename "$P")
-  if [[ "$B" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
-    PCI="$B"
-    break
-  fi
-  P=$(dirname "$P")
-done
-[[ -n "$PCI" ]] || exit 0
 DEVBIND=""
 for p in /usr/share/dpdk/usertools/dpdk-devbind.py /usr/bin/dpdk-devbind.py /usr/local/bin/dpdk-devbind.py; do
   [[ -x "$p" || -f "$p" ]] && DEVBIND="$p" && break
 done
 [[ -n "$DEVBIND" ]] || exit 0
-if s python3 "$DEVBIND" --status-dev net 2>/dev/null | grep -q "drv=vfio-pci.*${PCI}"; then
-  s python3 "$DEVBIND" --bind=virtio-pci "$PCI" 2>/dev/null \
-    || s python3 "$DEVBIND" --bind=virtio_net "$PCI" 2>/dev/null \
+mapfile -t VFIO_PCIS < <(s python3 "$DEVBIND" --status-dev net 2>/dev/null | awk '/drv=vfio-pci/ { print $1 }')
+[[ ${#VFIO_PCIS[@]} -gt 0 ]] || exit 0
+for PCI in "${VFIO_PCIS[@]}"; do
+  s timeout 15s python3 "$DEVBIND" --bind=virtio-pci "$PCI" 2>/dev/null \
+    || s timeout 15s python3 "$DEVBIND" --bind=virtio_net "$PCI" 2>/dev/null \
     || true
+done
+WAN=$(sed -n 's/^WAN=//p' /run/pproxy-devices.env 2>/dev/null | head -1 || true)
+for _ in $(seq 1 20); do
+  [[ -z "$WAN" || -d "/sys/class/net/$WAN" ]] && break
+  sleep 0.2
+done
+if [[ -n "$WAN" && -d "/sys/class/net/$WAN" ]]; then
   s ip link set "$WAN" up 2>/dev/null || true
-  echo "  ✓ ${host}: WAN ${WAN} (${PCI}) back to kernel driver"
+  echo "  ✓ ${host}: WAN ${WAN} (${VFIO_PCIS[*]}) back to kernel driver"
+else
+  while read -r name _; do
+    [[ "$name" == "lo" ]] && continue
+    [[ -n "$MGT" && "$name" == "$MGT" ]] && continue
+    s ip link set "$name" up 2>/dev/null || true
+  done < <(ip -br link | awk '{print $1}')
+  echo "  ✓ ${host}: vfio net device(s) ${VFIO_PCIS[*]} back to kernel driver"
 fi
 EOR
 }
@@ -715,12 +771,143 @@ router_clear_static_arp() {
     ip neigh del 172.16.1.2 dev eth2 2>/dev/null || true" >/dev/null 2>&1 || true
 }
 
+# memif 场景：停 leaf 上 VPP sidecar（切换离开 memif 时调用）
+pproxy_vpp_memif_stop() {
+  local host=$1
+  echo "  pproxy: stopping VPP memif sidecar on ${host} …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" <<'EOV'
+set -euo pipefail
+PASS="$1"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s systemctl stop vpp 2>/dev/null || true
+s pkill -x vpp_main 2>/dev/null || true
+s pkill -f '^vpp -c ' 2>/dev/null || true
+sleep 0.3
+EOV
+}
+
+# memif 场景：起 VPP（memif master + af_packet↔WAN L2 xconnect），供 pproxy slave 连接
+pproxy_vpp_memif_setup() {
+  local host=$1
+  local wan_dev=$2
+  echo "  pproxy: VPP memif sidecar on ${host} (WAN=${wan_dev}, socket=${MEMIF_SOCKET_PATH}) …"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" "$wan_dev" "$MEMIF_SOCKET_PATH" "$MEMIF_SOCKET_ID" "$MEMIF_INTERFACE_ID" <<'EOV'
+set -euo pipefail
+PASS="$1"
+WAN="$2"
+SOCK="$3"
+SID="$4"
+IFID="$5"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s systemctl stop vpp 2>/dev/null || true
+s pkill -x vpp_main 2>/dev/null || true
+s pkill -f '^vpp -c ' 2>/dev/null || true
+sleep 0.3
+s install -d -m 0755 /opt/pproxy/run /opt/pproxy/log /run/vpp /etc/vpp
+s rm -f "$SOCK" /run/vpp/cli.sock /run/vpp/api.sock /run/vpp/stats.sock /run/vpp/memif.sock 2>/dev/null || true
+cat >/tmp/pproxy-vpp-startup.conf <<VPP
+unix {
+  log /opt/pproxy/log/vpp.log
+  full-coredump
+  cli-listen /run/vpp/cli.sock
+  gid root
+}
+api-segment {
+  gid root
+}
+plugins {
+  plugin default { disable }
+  plugin memif_plugin.so { enable }
+  plugin af_packet_plugin.so { enable }
+}
+memory {
+  main-heap-size 256M
+  main-heap-page-size 4K
+}
+statseg {
+  size 16M
+}
+buffers {
+  buffers-per-numa 1024
+}
+cpu {
+  main-core 1
+}
+VPP
+s install -m 0644 /tmp/pproxy-vpp-startup.conf /etc/vpp/startup.conf
+rm -f /tmp/pproxy-vpp-startup.conf
+cat >/tmp/pproxy-vpp-init.cli <<CLI
+create memif socket id ${SID} filename ${SOCK}
+create interface memif socket-id ${SID} id ${IFID} master
+set interface state memif${SID}/${IFID} up
+create host-interface name ${WAN}
+set interface state host-${WAN} up
+set interface l2 xconnect memif${SID}/${IFID} host-${WAN}
+set interface l2 xconnect host-${WAN} memif${SID}/${IFID}
+CLI
+s install -m 0644 /tmp/pproxy-vpp-init.cli /opt/pproxy/vpp-init.cli
+rm -f /tmp/pproxy-vpp-init.cli
+if ! command -v vpp >/dev/null 2>&1; then
+  echo "  ✗ vpp 未安装（apt install vpp vpp-plugin-core）" >&2
+  exit 1
+fi
+s nohup vpp -c /etc/vpp/startup.conf >> /opt/pproxy/log/vpp.log 2>&1 < /dev/null &
+for i in $(seq 1 30); do
+  if s test -S /run/vpp/cli.sock 2>/dev/null; then
+    break
+  fi
+  sleep 0.2
+done
+if ! s test -S /run/vpp/cli.sock 2>/dev/null; then
+  echo "  ✗ VPP cli.sock 未就绪" >&2
+  s tail -n 40 /opt/pproxy/log/vpp.log 2>/dev/null || true
+  exit 1
+fi
+vpp_cli() {
+  local cmd="$1"
+  if ! s vppctl -s /run/vpp/cli.sock "$cmd"; then
+    echo "  ✗ VPP CLI failed: $cmd" >&2
+    s tail -n 80 /opt/pproxy/log/vpp.log 2>/dev/null || true
+    s vppctl -s /run/vpp/cli.sock show log 2>/dev/null || true
+    s vppctl -s /run/vpp/cli.sock show interface 2>/dev/null || true
+    exit 1
+  fi
+}
+vpp_cli "create memif socket id ${SID} filename ${SOCK}"
+vpp_cli "create interface memif socket-id ${SID} id ${IFID} master"
+vpp_cli "set interface state memif${SID}/${IFID} up"
+vpp_cli "create host-interface name ${WAN}"
+vpp_cli "set interface state host-${WAN} up"
+vpp_cli "set interface l2 xconnect memif${SID}/${IFID} host-${WAN}"
+vpp_cli "set interface l2 xconnect host-${WAN} memif${SID}/${IFID}"
+if ! s test -S "$SOCK" 2>/dev/null; then
+  echo "  ✗ memif socket 未创建: $SOCK" >&2
+  s vppctl -s /run/vpp/cli.sock show memif 2>/dev/null || true
+  s vppctl -s /run/vpp/cli.sock show interface 2>/dev/null || true
+  exit 1
+fi
+iface_out="$(s vppctl -s /run/vpp/cli.sock show interface 2>/dev/null || true)"
+grep -q "host-${WAN}" <<< "$iface_out" || {
+  echo "  ✗ VPP host interface 未创建: host-${WAN}" >&2
+  printf '%s\n' "$iface_out" >&2
+  exit 1
+}
+echo "  ✓ VPP memif ready on $(hostname) (socket=$SOCK)"
+EOV
+}
+
 # [3.5/5] 按右手 I/O 探测/绑卡（--pproxy-only 与完整 deploy 共用）
 deploy_io_backend_prep() {
   if [[ "$DEPLOY_IO_RIGHT" != "dpdk" ]]; then
     pproxy_dpdk_restore_kernel_wan "$LEAF1_HOST"
     pproxy_dpdk_restore_kernel_wan "$LEAF2_HOST"
     router_clear_static_arp
+  fi
+  if [[ "$DEPLOY_IO_RIGHT" != "memif" ]]; then
+    pproxy_vpp_memif_stop "$LEAF1_HOST"
+    pproxy_vpp_memif_stop "$LEAF2_HOST"
   fi
 
   if [[ "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
@@ -762,6 +949,25 @@ deploy_io_backend_prep() {
       exit 1
     fi
     export LEAF1_WAN_DEV LEAF2_WAN_DEV
+  elif [[ "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+    echo ""
+    echo "=== [3.5/5] memif: probe WAN + router next-hop MAC ==="
+    read -r LEAF1_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF1_HOST")
+    read -r LEAF2_WAN_DEV _ _ < <(probe_leaf_wan_info "$LEAF2_HOST")
+    echo "  leaf1: WAN=${LEAF1_WAN_DEV}"
+    echo "  leaf2: WAN=${LEAF2_WAN_DEV}"
+    if [[ -z "$LEAF1_WAN_DEV" || -z "$LEAF2_WAN_DEV" ]]; then
+      echo "  ✗ probe 未拿到 WAN 网卡名" >&2
+      exit 1
+    fi
+    MEMIF_LEAF1_PEER_MAC=$(router_iface_mac eth1)
+    MEMIF_LEAF2_PEER_MAC=$(router_iface_mac eth2)
+    echo "  router: eth1 MAC=${MEMIF_LEAF1_PEER_MAC}; eth2 MAC=${MEMIF_LEAF2_PEER_MAC}"
+    if [[ -z "$MEMIF_LEAF1_PEER_MAC" || -z "$MEMIF_LEAF2_PEER_MAC" ]]; then
+      echo "  ✗ 取 router eth1/eth2 MAC 失败" >&2
+      exit 1
+    fi
+    export LEAF1_WAN_DEV LEAF2_WAN_DEV MEMIF_LEAF1_PEER_MAC MEMIF_LEAF2_PEER_MAC
   elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     echo ""
     echo "=== [3.5/5] io_uring: probe WAN ifname for io_cfg.ifname (SO_BINDTODEVICE) ==="
@@ -894,7 +1100,7 @@ PATTERN="${ROOT}/core-%e-%p-%t"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
 s install -d -m 0755 "$ROOT" 2>/dev/null || true
 if ! s sysctl -w "kernel.core_pattern=$PATTERN" 2>/dev/null; then
-  printf '%s' "$PATTERN" | s tee /proc/sys/kernel/core_pattern >/dev/null
+  s sh -c 'printf "%s" "$1" > /proc/sys/kernel/core_pattern' sh "$PATTERN"
 fi
 EOC
 }
@@ -903,6 +1109,24 @@ pproxy_scp_bin() {
   local host=$1
   sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$PPROXY_BIN" "${UBUNTU_USER}@${host}:${VM_PPROXY_BIN}"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" "chmod 755 ${VM_PPROXY_BIN}"
+}
+
+pproxy_scp_memif_support() {
+  local host=$1
+  local src="${REPO_ROOT}/scripts/install_libmemif.sh"
+  [[ -f "$src" ]] || { echo "  ✗ 缺少 $src" >&2; return 1; }
+  echo "  pproxy: scp install_libmemif.sh → ${host}:/opt/pproxy/ …"
+  sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$src" \
+    "${UBUNTU_USER}@${host}:/tmp/install_libmemif.sh"
+  sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
+    bash -s -- "$UBUNTU_PASS" <<'EOM'
+set -euo pipefail
+PASS="$1"
+s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
+s install -d -m 0755 /opt/pproxy
+s install -m 0755 /tmp/install_libmemif.sh /opt/pproxy/install_libmemif.sh
+rm -f /tmp/install_libmemif.sh
+EOM
 }
 
 pproxy_scp_xdpcap_bpf() {
@@ -1009,6 +1233,34 @@ with open(dst, 'w', encoding='utf-8') as f:
 PY
 }
 
+# memif：注入 socket_path / peer_mac / listen|bind
+memif_render_cfg() {
+  local src=$1
+  local dst=$2
+  local socket_path=$3
+  local peer_mac=$4
+  local local_ep=${5:-}
+  python3 - "$src" "$dst" "$socket_path" "$peer_mac" "$local_ep" <<'PY'
+import json, sys
+src, dst, sock, mac, local_ep = sys.argv[1:6]
+with open(src, encoding='utf-8') as f:
+    d = json.load(f)
+t = d['tunnels'][0]
+io = t.setdefault('io_cfg', {})
+io['socket_path'] = sock
+io['interface_id'] = io.get('interface_id', 0)
+io['is_master'] = False
+io['peer_mac'] = mac
+if local_ep:
+    if t.get('mode', 'client') == 'server':
+        t['listen'] = local_ep
+    else:
+        t['bind'] = local_ep
+with open(dst, 'w', encoding='utf-8') as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
 # io_uring：io 仍为 kernel_socket；注入 backend/ifname/listen|bind；可选 tx_zc
 # 第 6 参 tx_zc：空=沿用模板；1=强制 zerocopy；0=强制关闭
 uring_render_cfg() {
@@ -1101,6 +1353,17 @@ PY
     pp2_src=$tmp2
     echo "  pproxy: netmap 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t["io_cfg"]["ifname"])')"
     echo "  pproxy: netmap 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; print(t.get("io"), t.get("bind"), t["io_cfg"]["ifname"])')"
+  elif [[ "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+    : "${MEMIF_LEAF1_PEER_MAC:?memif push: MEMIF_LEAF1_PEER_MAC 未设置 (先跑 [3.5/5] probe?)}"
+    : "${MEMIF_LEAF2_PEER_MAC:?memif push: MEMIF_LEAF2_PEER_MAC 未设置}"
+    local tmp1=$(mktemp --suffix=.json)
+    local tmp2=$(mktemp --suffix=.json)
+    memif_render_cfg "$PP1_JSON" "$tmp1" "$MEMIF_SOCKET_PATH" "$MEMIF_LEAF1_PEER_MAC" "${LEAF1_WAN_IP}:${TUNNEL_PORT}"
+    memif_render_cfg "$PP2_JSON" "$tmp2" "$MEMIF_SOCKET_PATH" "$MEMIF_LEAF2_PEER_MAC" "${LEAF2_WAN_IP}:0"
+    pp1_src=$tmp1
+    pp2_src=$tmp2
+    echo "  pproxy: memif 渲染后 pp1: $(cat "$tmp1" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t["io_cfg"]; print(t.get("listen"), ic.get("socket_path"), ic.get("peer_mac"))')"
+    echo "  pproxy: memif 渲染后 pp2: $(cat "$tmp2" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=d["tunnels"][0]; ic=t["io_cfg"]; print(t.get("bind"), ic.get("socket_path"), ic.get("peer_mac"))')"
   elif [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     : "${LEAF1_WAN_DEV:?io_uring push: LEAF1_WAN_DEV 未设置 (先跑 [3.5/5] probe?)}"
     : "${LEAF2_WAN_DEV:?io_uring push: LEAF2_WAN_DEV 未设置}"
@@ -1121,7 +1384,7 @@ PY
   sshpass -p "$UBUNTU_PASS" scp "${SSH_OPTS[@]}" -q "$pp2_src" \
     "${UBUNTU_USER}@${LEAF2_HOST}:${VM_PP2_CFG}"
 
-  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "netmap" || "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
+  if [[ "$DEPLOY_IO_RIGHT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "netmap" || "$DEPLOY_IO_RIGHT" == "memif" || "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
     rm -f "${pp1_src}" "${pp2_src}"
   fi
 }
@@ -1135,7 +1398,7 @@ set -euo pipefail
 PASS="$1"
 CFG="$2"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
-s pkill -f "pproxy -c $CFG" 2>/dev/null || true
+s sh -c 'pgrep -f "[/]opt/pproxy/pproxy -c $1" 2>/dev/null | xargs -r kill 2>/dev/null || true' sh "$CFG"
 sleep 0.5
 EOST
 }
@@ -1166,9 +1429,9 @@ GDBPORT="${6:-0}"
 XDPON="${7:-0}"
 XDPBF="${8:-}"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
-s pkill -f "pproxy -c $CFG" 2>/dev/null || true
+s sh -c 'pgrep -f "[/]opt/pproxy/pproxy -c $1" 2>/dev/null | xargs -r kill 2>/dev/null || true' sh "$CFG"
 if [[ "$GDBPORT" != "0" ]]; then
-  s pkill -f "gdbserver 127.0.0.1:${GDBPORT}" 2>/dev/null || true
+  s sh -c 'pgrep -f "[g]dbserver 127.0.0.1:$1" 2>/dev/null | xargs -r kill 2>/dev/null || true' sh "$GDBPORT"
 fi
 sleep 0.5
 # TUN 需 root；标准输出/错入日志（见 /opt/pproxy/log/）
@@ -1254,12 +1517,17 @@ pproxy_smoke() {
 
   local NEED_DPDK=0
   local NEED_IO_URING=0
+  local NEED_MEMIF=0
   if [[ "$MATRIX_PREP" -eq 1 ]]; then
     NEED_DPDK=1
     NEED_IO_URING=1
+    NEED_MEMIF=1
   else
     if [[ "$DEPLOY_IO_LEFT" == "dpdk" || "$DEPLOY_IO_RIGHT" == "dpdk" ]]; then
       NEED_DPDK=1
+    fi
+    if [[ "$DEPLOY_IO_LEFT" == "memif" || "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+      NEED_MEMIF=1
     fi
     if [[ "${DEPLOY_KS_BACKEND:-syscall}" == "io_uring" ]]; then
       NEED_IO_URING=1
@@ -1269,8 +1537,14 @@ pproxy_smoke() {
       NEED_IO_URING=1
     fi
   fi
-  pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK" "$NEED_IO_URING"
-  pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK" "$NEED_IO_URING"
+  pproxy_apt_deps "$LEAF1_HOST" "$NEED_DPDK" "$NEED_IO_URING" "$NEED_MEMIF"
+  pproxy_apt_deps "$LEAF2_HOST" "$NEED_DPDK" "$NEED_IO_URING" "$NEED_MEMIF"
+  if [[ "$NEED_MEMIF" -eq 1 ]]; then
+    pproxy_scp_memif_support "$LEAF1_HOST"
+    pproxy_scp_memif_support "$LEAF2_HOST"
+    pproxy_apt_deps "$LEAF1_HOST" 0 0 1
+    pproxy_apt_deps "$LEAF2_HOST" 0 0 1
+  fi
   if [[ "$MATRIX_PREP" -eq 1 || "$DEPLOY_IO_LEFT" == "netmap" || "$DEPLOY_IO_RIGHT" == "netmap" ]]; then
     pproxy_install_netmap
   fi
@@ -1304,6 +1578,13 @@ pproxy_smoke() {
   pproxy_stop_leaf "$LEAF1_HOST" "$VM_PP1_CFG"
   pproxy_stop_leaf "$LEAF2_HOST" "$VM_PP2_CFG"
   pproxy_push_cfgs
+
+  if [[ "$DEPLOY_IO_RIGHT" == "memif" ]]; then
+    : "${LEAF1_WAN_DEV:?memif: LEAF1_WAN_DEV 未设置}"
+    : "${LEAF2_WAN_DEV:?memif: LEAF2_WAN_DEV 未设置}"
+    pproxy_vpp_memif_setup "$LEAF1_HOST" "$LEAF1_WAN_DEV"
+    pproxy_vpp_memif_setup "$LEAF2_HOST" "$LEAF2_WAN_DEV"
+  fi
 
   g1=0
   g2=0

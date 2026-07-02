@@ -47,24 +47,64 @@ check_leaf() {
     return 1
   fi
 
-  case "$EXPECT_RIGHT" in
-    io_uring)
-      if ! grep -q 'io=kernel_socket' <<< "$line" || ! grep -q 'ks_backend=io_uring' <<< "$line"; then
-        perf_err "${host}: expected io_uring (kernel_socket+io_uring), got: ${line}"
-        return 1
-      fi
-      ;;
-    *)
-      if ! grep -q "io=${EXPECT_RIGHT} " <<< "$line"; then
-        perf_err "${host}: expected io=${EXPECT_RIGHT}, got: ${line}"
-        return 1
-      fi
-      ;;
-  esac
+  local tjson
+  tjson=$(grep -E '^  \{' <<< "$out" | sed 's/^  //' | head -n 1 || true)
+  if [[ -n "$tjson" ]]; then
+    if ! EXPECT_RIGHT="$EXPECT_RIGHT" TUNNEL_LINE="$line" python3 - "$host" "$tjson" <<'PY'; then
+import json
+import os
+import sys
 
-  if ! grep -q 'ready=yes' <<< "$line"; then
-    perf_err "${host}: tunnel not ready: ${line}"
-    return 1
+host, raw = sys.argv[1:3]
+want = os.environ["EXPECT_RIGHT"]
+line = os.environ.get("TUNNEL_LINE", "")
+try:
+    got = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"!!! {host}: bad tunnel JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+io = got.get("io")
+backend = got.get("backend")
+ks_backend = got.get("ks_backend") or got.get("kernel_socket_backend")
+ready = got.get("ready") is True
+if want == "io_uring":
+    ok = io == "kernel_socket" and (
+        ks_backend == "io_uring"
+        or backend == "io_uring"
+        or "ks_backend=io_uring" in line
+    )
+else:
+    ok = io == want
+if not ok:
+    print(f"!!! {host}: expected io={want}, got JSON: {raw}", file=sys.stderr)
+    sys.exit(1)
+if not ready:
+    print(f"!!! {host}: tunnel not ready JSON: {raw}", file=sys.stderr)
+    sys.exit(1)
+PY
+      return 1
+    fi
+  else
+    case "$EXPECT_RIGHT" in
+      io_uring)
+        if ! grep -q 'io=kernel_socket' <<< "$line" || ! grep -q 'ks_backend=io_uring' <<< "$line"; then
+          perf_err "${host}: expected io_uring (kernel_socket+io_uring), got: ${line}"
+          return 1
+        fi
+        ;;
+      *)
+        if ! grep -q "io=${EXPECT_RIGHT} " <<< "$line"; then
+          perf_err "${host}: expected io=${EXPECT_RIGHT}, got: ${line}"
+          return 1
+        fi
+        ;;
+    esac
+
+    if ! grep -q 'ready=yes' <<< "$line"; then
+      perf_err "${host}: tunnel not ready: ${line}"
+      return 1
+    fi
   fi
 
   perf_log "${host}: tunnel OK (proto=${EXPECT_PROTO} right=${EXPECT_RIGHT} ready=yes)"
