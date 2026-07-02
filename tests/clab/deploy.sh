@@ -725,9 +725,10 @@ pproxy_dpdk_restore_kernel_wan() {
   local host=$1
   echo "  pproxy: restore kernel WAN on ${host} (if vfio-bound) …"
   sshpass -p "$UBUNTU_PASS" ssh "${SSH_OPTS[@]}" "${UBUNTU_USER}@${host}" \
-    bash -s -- "$UBUNTU_PASS" <<'EOR'
+    bash -s -- "$UBUNTU_PASS" "$host" <<'EOR'
 set -euo pipefail
 PASS="$1"
+HOST="$2"
 s() { printf '%s\n' "$PASS" | sudo -S -p '' "$@"; }
 s pkill -f '/opt/pproxy/pproxy' 2>/dev/null || true
 s pkill -f '/opt/pproxy/pp1.json' 2>/dev/null || true
@@ -753,14 +754,14 @@ for _ in $(seq 1 20); do
 done
 if [[ -n "$WAN" && -d "/sys/class/net/$WAN" ]]; then
   s ip link set "$WAN" up 2>/dev/null || true
-  echo "  ✓ ${host}: WAN ${WAN} (${VFIO_PCIS[*]}) back to kernel driver"
+  echo "  ✓ ${HOST}: WAN ${WAN} (${VFIO_PCIS[*]}) back to kernel driver"
 else
   while read -r name _; do
     [[ "$name" == "lo" ]] && continue
     [[ -n "$MGT" && "$name" == "$MGT" ]] && continue
     s ip link set "$name" up 2>/dev/null || true
   done < <(ip -br link | awk '{print $1}')
-  echo "  ✓ ${host}: vfio net device(s) ${VFIO_PCIS[*]} back to kernel driver"
+  echo "  ✓ ${HOST}: vfio net device(s) ${VFIO_PCIS[*]} back to kernel driver"
 fi
 EOR
 }
