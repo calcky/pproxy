@@ -17,6 +17,8 @@
 | [`tests/clab/perf/check-tunnel.sh`](../tests/clab/perf/check-tunnel.sh) | iperf 前校验 tunnel ready / proto / io |
 | [`tests/clab/perf/collect-cpu.sh`](../tests/clab/perf/collect-cpu.sh) | 正式 iperf 起/止 CPU 快照 |
 
+当前已整理的全后端样例报告：[`tests/clab/reports/20260702-matrix.md`](../tests/clab/reports/20260702-matrix.md)。该次 matrix 覆盖 `kernel_socket`、`io_uring`、`af_xdp`、`netmap`、`dpdk`、`memif`，六个场景均通过。
+
 ### iperf3 参数
 
 - 协议：**TCP only**（`-P` 并行流，非 UDP）
@@ -42,8 +44,8 @@
 # 扫 batch_tx
 ./tests/clab/perf.sh --sweep batch_tx=1,8,32,64 --scenario udp_uring_batch32
 
-# 全后端 matrix（首次 bootstrap 会编译全后端；之后 --skip-build 只跳过编译）
-./tests/clab/perf.sh --matrix --skip-build
+# 全后端 matrix（首次 bootstrap 会编译全后端二进制；后续场景只切配置/重启 pproxy）
+./tests/clab/perf.sh --matrix
 
 # 无 pproxy 直连基线
 ./tests/clab/perf.sh --baseline direct
@@ -52,7 +54,20 @@
 ./tests/clab/perf.sh --ci --fail-on-threshold
 ```
 
-结果写入 `tests/clab/results/`。可选 `--update-doc` 将 Markdown 表追加到本文件。
+结果写入 `tests/clab/results/`。可选 `--update-doc` 将 Markdown 表追加到本文件。需要长期保留的结果建议整理到 `tests/clab/reports/`。
+
+### 2026-07-02 matrix 样例
+
+| scenario | right I/O | P1 Mbps | P10 Mbps | status |
+| --- | --- | ---: | ---: | --- |
+| `udp_kernel` | `kernel_socket` | 615.053 | 719.887 | pass |
+| `udp_uring_batch32` | `io_uring` | 507.100 | 551.783 | pass |
+| `udp_af_xdp` | `af_xdp` | 585.304 | 709.166 | pass |
+| `udp_netmap` | `netmap` | 893.103 | 1179.392 | pass |
+| `udp_dpdk` | `dpdk` | 1552.125 | 629.658 | pass |
+| `udp_memif` | `memif` | 653.225 | 659.389 | pass |
+
+本次 memif 通过依赖 `deploy.sh` 在 memif 分支给 router 写静态 ARP：leaf WAN IP → leaf WAN MAC。修复前 VPP memif bridge 已创建，但 router 对 leaf WAN IP 的 ARP 未解析，跨网段 ping 会在等待窗口内失败。
 
 ### 流量路径
 

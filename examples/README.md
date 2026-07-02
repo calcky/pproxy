@@ -1,8 +1,6 @@
 # pproxy 配置示例
 
-> 当前主线代码（MVP）仍是命令行 `-s host:port` 启动并使用硬编码默认值；
-> 本目录的 JSON 仅作为 **配置 schema 设计稿**，等 Phase-2 加入 `parse_config()`
-> 之后可直接 `pproxy -c examples/config.example.json` 运行。
+本目录里的 JSON 可直接作为 `pproxy -c` 配置使用，也可作为不同 I/O 后端的片段参考。
 
 ## 文件清单
 
@@ -37,32 +35,32 @@
 - `rings.*_capacity`：每条 SPSC/MPSC ring 槽位数（必须是 2 的幂）
 
 ### `left`
-左手包 I/O，`kind` 二选一：
-`tun` / `raw_socket` / `af_xdp` / `netmap` / `pcap`，各自子段见 `config.snippets.json`。
+左手包 I/O，`kind` 选择：
+`tun` / `raw_socket` / `af_xdp` / `netmap` / `pcap` / `dpdk`，各自子段见 `config.snippets.json`。
 
 ### `tunnels[]`
 右手隧道数组，每条 = `(proto, io)` 组合，独立 `right_tx + right_rx` 线程对：
 - `proto`：协议编码 —— `tcp` / `udp` / `icmp`（未来 `kcp` / `quic`）
-- `io`：I/O 后端 —— `kernel_socket`（默认）/ `raw_socket` / `af_xdp` / `netmap`
+- `io`：I/O 后端 —— `kernel_socket`（默认）/ `raw_socket` / `tun` / `af_xdp` / `netmap` / `pcap` / `dpdk` / `memif`
 - `server`：远端 `host:port`（client 模式）
 - `listen`：本地绑定 `host:port`（server 模式）
 - `mode`：`client`（默认）/ `server`
 - `bind`：客户端可选本地绑定
 - `max_sessions`：本条 tunnel 上承载 session 上限
 - 协议字段：`tcp.nodelay` / `tcp.reconnect_ms` / `udp.mtu` / `icmp.identifier_base` / `icmp.reply_only`
-- `io_cfg.*`：I/O 后端参数（仅当 `io != kernel_socket` 时填）
+- `io_cfg.*`：I/O 后端参数。`kernel_socket` 也可通过 `io_cfg.backend="io_uring"` 切到 io_uring 路径。
 
 兼容矩阵：
 
-| proto \ io | kernel_socket | raw_socket | af_xdp | netmap |
-|---|---|---|---|---|
-| tcp  | ✅ | ❌ | ❌ | ❌ |
-| udp  | ✅ | ✅ | ✅ | ✅ |
-| icmp | ⚠️ | ✅ | ✅ | ✅ |
-| kcp  | ✅ | ✅ | ✅ | ✅ |
-| quic | ✅ | ✅ | ✅ | ✅ |
+| proto \ io | kernel_socket | raw_socket | tun | pcap | af_xdp | netmap | dpdk | memif |
+|---|---|---|---|---|---|---|---|---|
+| tcp  | yes | no | no | no | no | no | no | no |
+| udp  | yes | yes | yes | yes | yes | yes | yes | yes |
+| icmp | no | yes | yes | yes | yes | yes | yes | yes |
+| kcp  | future | future | future | future | future | future | future | future |
+| quic | future | future | future | future | future | future | future | future |
 
-不支持的组合在 `tunnel_open()` 里返回 `PP_ERR_NOSUPPORT`。
+不支持的组合会在对应 `pp_tunnel_ops_t.open()` 里返回 `PP_ERR_NOSUPPORT`。
 
 ### `session`
 - `max_per_shard`：单 shard 容量；总容量 = `workers × max_per_shard`
@@ -78,14 +76,14 @@
 - 数组：多线程按下标取核（`worker[i]` 绑到 `affinity.worker[i % len]`）
 - `-1`：不绑定，由内核调度
 
-## 运行（待 Phase-2 实现 `-c`）
+## 运行
 
 ```bash
 sudo ./build/pproxy -c examples/config.example.json -L info
 ```
 
-调试某条配置：
+用命令行覆盖第一条 client tunnel 的 server：
 
 ```bash
-sudo ./build/pproxy -c examples/config.example.json -L debug --dry-run
+sudo ./build/pproxy -c examples/config.example.json -s 127.0.0.1:9000 -L debug
 ```

@@ -1,36 +1,41 @@
-%% pproxy 会话状态机
-%% 适用 TCP；UDP/ICMP 仅用 NEW / EST / TIMEOUT 简化路径
-stateDiagram-v2
-    direction LR
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif","background":"#ffffff","primaryTextColor":"#0f172a","lineColor":"#64748b"},"flowchart":{"curve":"linear","htmlLabels":true,"nodeSpacing":48,"rankSpacing":58,"padding":12}}}%%
+%% pproxy 会话生命周期
+%% TCP 走 SYN/FIN 主路径；UDP/ICMP 从 NEW 直接进入 ESTABLISHED。
+flowchart LR
+    classDef start fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-width:1.3px;
+    classDef wait fill:#fef9c3,stroke:#ca8a04,color:#713f12,stroke-width:1.5px;
+    classDef live fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:1.7px;
+    classDef stop fill:#fee2e2,stroke:#dc2626,color:#7f1d1d,stroke-width:1.5px;
+    classDef done fill:#f1f5f9,stroke:#64748b,color:#334155,stroke-width:1.3px;
+    classDef note fill:#f8fafc,stroke:#cbd5e1,color:#475569,stroke-dasharray:4 3;
 
-    [*] --> NEW: 首包到达<br/>分配 sid + tunnel
+    START(("packet")):::start
+    NEW["NEW<br/><span style='font-size:12px'>alloc sid<br/>select tunnel</span>"]:::wait
+    SYN["SYN_SENT<br/><span style='font-size:12px'>TCP only</span>"]:::wait
+    EST["ESTABLISHED<br/><span style='font-size:12px'>forward data<br/>update stats + DPI</span>"]:::live
+    FIN["CLOSE_WAIT<br/><span style='font-size:12px'>FIN observed<br/>wait peer close</span>"]:::wait
+    CLOSED["CLOSED<br/><span style='font-size:12px'>release dpi_ctx<br/>return sid</span>"]:::done
 
-    NEW --> SYN_SENT: 客户端 SYN 转发
-    SYN_SENT --> EST: 收到 SYN+ACK + ACK
-    NEW --> EST: 非 TCP（UDP / ICMP）
+    ABORT["Abort<br/><span style='font-size:12px'>RST / connect refused</span>"]:::stop
+    TIMEOUT["Timeout GC<br/><span style='font-size:12px'>syn_ttl / idle_ttl / fin_ttl<br/>timer -> worker ctrl_ring</span>"]:::stop
 
-    EST --> EST: 数据传输<br/>更新 stats + DPI
+    DPI_NOTE["DPI window<br/><span style='font-size:12px'>inspect first N packets only;<br/>later packets update counters</span>"]:::note
 
-    EST --> CLOSE_WAIT: 收到 FIN（任一向）
-    CLOSE_WAIT --> CLOSED: 双向 FIN+ACK 完成
+    START --> NEW
+    NEW -->|TCP SYN| SYN
+    SYN -->|SYN+ACK + ACK| EST
+    NEW -->|UDP / ICMP| EST
+    EST -->|data| EST
+    EST -->|FIN| FIN
+    FIN -->|both FIN/ACK done| CLOSED
 
-    EST --> RST: 收到 RST
-    SYN_SENT --> RST: 连接拒绝
-    RST --> CLOSED: 立即清理
+    SYN -.->|refused / RST| ABORT
+    EST -.->|RST| ABORT
+    ABORT -.->|cleanup| CLOSED
 
-    EST --> TIMEOUT: 超过 idle_ttl
-    SYN_SENT --> TIMEOUT: 超过 syn_ttl
-    CLOSE_WAIT --> TIMEOUT: 超过 fin_ttl
-    TIMEOUT --> CLOSED: timer 线程清理
+    SYN -.->|syn_ttl| TIMEOUT
+    EST -.->|idle_ttl| TIMEOUT
+    FIN -.->|fin_ttl| TIMEOUT
+    TIMEOUT -.->|cleanup| CLOSED
 
-    CLOSED --> [*]: 释放 dpi_ctx / 归还 sid<br/>从 SessionTable 摘除
-
-    note right of EST
-      DPI 在前 N 个包内识别完
-      之后只更新统计，不再 deep parse
-    end note
-
-    note right of TIMEOUT
-      timer 线程通过 ctrl_ring
-      下发清理指令到对应 worker
-    end note
+    EST -.-> DPI_NOTE

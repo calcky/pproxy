@@ -158,14 +158,16 @@ ssh clab@leaf1 tail -n 100 /opt/pproxy/log/vpp.log
 - `*.json`：每次 iperf 结果和采集到的 metrics
 - `matrix_*.md`：矩阵汇总
 
+已整理入仓库的样例报告见 [`tests/clab/reports/20260702-matrix.md`](reports/20260702-matrix.md)。这次完整矩阵的六个场景均通过，`udp_memif` 也包含在内。
+
 ## 后端说明
 
 - `kernel_socket`：稳定基线，走内核 UDP/TCP socket。
-- `io_uring`：仍是 kernel socket I/O，配置为 `ks_backend=io_uring`，可通过 overlay 调 `batch_tx`、`tx_zc` 等参数。
+- `io_uring`：仍是 kernel socket I/O，配置为 `io_cfg.backend=io_uring`，可通过 overlay 调 `batch_tx`、`tx_zc` 等参数。
 - `af_xdp`：使用 AF_XDP；如果宿主机有 `xsk_xdpcap.bpf.o`，部署脚本会一起推到 VM，否则只跳过抓包 hook。
 - `netmap`：需要 leaf 内加载 `netmap.ko`；宿主机可用 `tests/clab/build-netmap-ko.sh` 构建并缓存。
 - `dpdk`：需要 hugepages 和 `vfio-pci`，会临时把 WAN 网卡从内核解绑给 DPDK；脚本会尽量恢复，异常时建议重新 deploy。
-- `memif`：使用 VPP sidecar 作为 memif master，pproxy 作为 slave，再由 VPP 通过 af_packet 桥到 WAN。当前 clab 下 memif 仍是实验项，VPP `memif_plugin` 偶发 crash 时会导致 tunnel `ready=no`，建议调试时先单跑 `udp_memif`，不要把它当作稳定 CI 场景。
+- `memif`：使用 VPP sidecar 作为 memif master，pproxy 作为 slave，再由 VPP 通过 `af_packet` 桥到 WAN。部署脚本会给 router 写 leaf WAN IP 的静态 ARP，因为 VPP/memif 桥接路径不会由 pproxy 应答 router ARP。当前 `udp_memif` 已在 2026-07-02 的完整 matrix 中通过；相比 kernel socket 仍多一个 VPP sidecar，排障时优先看 `/opt/pproxy/log/vpp.log`、`vppctl show memif` 和 router `ip neigh`。
 
 ## 清理和调试
 

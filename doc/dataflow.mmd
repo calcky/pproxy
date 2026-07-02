@@ -1,41 +1,64 @@
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif","background":"#ffffff","primaryTextColor":"#0f172a","actorBkg":"#f8fafc","actorBorder":"#94a3b8","actorTextColor":"#0f172a","signalColor":"#475569","signalTextColor":"#334155","activationBkgColor":"#e0f2fe","activationBorderColor":"#0284c7","noteBkgColor":"#fef9c3","noteBorderColor":"#ca8a04","noteTextColor":"#713f12","sequenceNumberColor":"#64748b"}}}%%
 sequenceDiagram
     autonumber
-    participant APP as 本机应用
-    participant K as Linux Kernel
-    participant TUN as tun0
-    participant LRX as left_rx
-    participant WK as worker_k
-    participant ST as SessionTable_k
-    participant DPI as DPI 插件
-    participant RTX as right_tx_j
-    participant RIO as tunnel socket
-    participant SRV as Remote Server
-    participant RRX as right_rx_j
-    participant LTX as left_tx
+    box rgb(248,250,252) Host
+        participant APP as App
+        participant K as Linux kernel
+        participant TUN as left I/O
+    end
+    box rgb(255,247,237) pproxy data plane
+        participant LRX as left_rx
+        participant WK as worker[k]
+        participant ST as SessionTable[k]
+        participant DPI as DPI chain
+        participant RTX as right_tx[j]
+        participant RRX as right_rx[j]
+        participant LTX as left_tx
+    end
+    box rgb(239,246,255) Tunnel path
+        participant RIO as proto × io
+        participant SRV as Remote server
+    end
 
     APP->>K: connect / send
-    K->>TUN: 路由命中，写 IP 包
-    LRX->>TUN: rx_burst 读包
-    LRX->>LRX: 计算 hash(flow_key) mod N = k
-    LRX->>WK: enqueue rx_ring (SPSC)
-    WK->>WK: 解析 IP/TCP 头
-    WK->>ST: lookup_or_create(flow_key)
-    Note over ST: 新 session：分配 sid<br/>state=NEW, tunnel_idx=j
-    WK->>DPI: feed(payload) 前 N 个包
-    DPI-->>WK: app_proto = TLS / HTTP / ...
-    WK->>WK: 封装隧道头 sid + meta + payload
-    WK->>RTX: enqueue tx_ring (MPSC)
-    RTX->>RIO: sendmmsg 批量
-    RIO->>SRV: TCP/UDP/ICMP 报文
+    K->>TUN: route hit, emit IP packet
+    TUN->>LRX: rx_burst
+    activate LRX
+    LRX->>LRX: hash(flow_key) mod N = k
+    LRX->>WK: enqueue rx_ring[k]
+    deactivate LRX
 
-    SRV->>RIO: 响应报文
-    RRX->>RIO: 读包并解隧道头
-    RRX->>RRX: sid 算出 worker shard k
-    RRX->>WK: enqueue back_ring (MPSC)
+    activate WK
+    WK->>WK: parse L3/L4 headers
+    WK->>ST: lookup_or_create(flow_key)
+    Note over ST,WK: new session allocates sid<br/>state=NEW, tunnel_idx=j
+    WK->>DPI: feed first N payload packets
+    DPI-->>WK: app_proto result
+    WK->>WK: wrap sid + metadata + payload
+    WK->>RTX: enqueue tx_ring[j]
+    deactivate WK
+
+    activate RTX
+    RTX->>RIO: encode + send burst
+    RIO->>SRV: TCP / UDP / ICMP on wire
+    deactivate RTX
+
+    SRV-->>RIO: response frame
+    RIO-->>RRX: recv + decode tunnel header
+    activate RRX
+    RRX->>RRX: map sid to worker shard k
+    RRX->>WK: enqueue back_ring[k]
+    deactivate RRX
+
+    activate WK
     WK->>ST: lookup(sid)
-    WK->>WK: 重建 IP/TCP 头 NAT 回原五元组
-    WK->>WK: 更新 stats / state
-    WK->>LTX: enqueue left_tx.ring (MPSC)
-    LTX->>TUN: tx_burst 写回
-    TUN->>K: 内核协议栈处理
-    K->>APP: recv 返回数据
+    WK->>WK: restore original 5-tuple
+    WK->>WK: update state and counters
+    WK->>LTX: enqueue left_tx.ring
+    deactivate WK
+
+    activate LTX
+    LTX->>TUN: tx_burst
+    TUN->>K: reinject packet
+    K-->>APP: recv returns data
+    deactivate LTX

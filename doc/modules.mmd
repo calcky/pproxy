@@ -1,84 +1,41 @@
-%% pproxy 源码模块依赖
-%% 视角：编译/调用依赖；A --> B 表示 A 依赖 B
-%% 颜色：线程=橙  I/O=蓝  tunnel=浅蓝  DPI=黄  core=绿  控制面=紫
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif","background":"#ffffff","primaryTextColor":"#0f172a","lineColor":"#64748b","clusterBkg":"#ffffff","clusterBorder":"#cbd5e1"},"flowchart":{"curve":"linear","htmlLabels":true,"nodeSpacing":52,"rankSpacing":58,"padding":12}}}%%
+%% pproxy 源码模块分层图
+%% 这张图展示模块边界和主要依赖；细粒度线程/队列关系见 doc/threads.mmd。
 flowchart TD
-    classDef th fill:#FFF3E0,stroke:#F57C00,color:#E65100;
-    classDef io fill:#E3F2FD,stroke:#1976D2,color:#0D47A1;
-    classDef tn fill:#E1F5FE,stroke:#0288D1,color:#01579B;
-    classDef dp fill:#FFF8E1,stroke:#F9A825,color:#795548;
-    classDef co fill:#E8F5E9,stroke:#388E3C,color:#1B5E20;
-    classDef ct fill:#F3E5F5,stroke:#7B1FA2,color:#4A148C;
+    classDef entry fill:#f3e8ff,stroke:#9333ea,color:#581c87,stroke-width:1.6px;
+    classDef modules fill:#fff7ed,stroke:#f97316,color:#7c2d12,stroke-width:1.7px;
+    classDef plugin fill:#dbeafe,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px;
+    classDef io fill:#e0f2fe,stroke:#0284c7,color:#075985,stroke-width:1.5px;
+    classDef cfg fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:1.5px;
+    classDef core fill:#f1f5f9,stroke:#64748b,color:#334155,stroke-width:1.4px;
 
-    MAIN["src/main.c<br/>argv + 模块注册 + 主循环"]:::ct
+    MAIN["Program entry<br/><span style='font-size:12px'>src/main.c<br/>argv, config load, backend registration,<br/>module lifecycle</span>"]:::entry
 
-    subgraph MODS["src/modules/ 每目录一个线程模块"]
-        direction LR
-        LRX[left_rx]:::th
-        WK[worker]:::th
-        LTX[left_tx]:::th
-        RTX[right_tx]:::th
-        RRX[right_rx]:::th
-        TM[timer]:::ct
-        MG[mgmt]:::ct
-    end
+    CFG["Configuration<br/><span style='font-size:12px'>src/config/config.c<br/>yyjson parse, reload diff,<br/>runtime structs</span>"]:::cfg
 
-    subgraph IO["src/io/ pp_pkt_io_ops_t 实现"]
-        direction LR
-        TUN[tun.c]:::io
-        RAW[raw_sock.c]:::io
-        XDP[xsk.c]:::io
-        NM[netmap.c]:::io
-        PC[pcap.c]:::io
-    end
+    THREADS["Thread modules<br/><span style='font-size:12px'>left_rx / worker / left_tx<br/>right_tx / right_rx<br/>timer / mgmt</span>"]:::modules
 
-    subgraph TUNNEL["src/tunnel/ pp_tunnel_ops_t 实现"]
-        direction LR
-        TCP[tcp.c]:::tn
-        UDP[udp.c]:::tn
-        ICMP[icmp.c]:::tn
-    end
+    PROTO["Tunnel protocols<br/><span style='font-size:12px'>src/tunnel/tcp.c<br/>src/tunnel/udp.c<br/>src/tunnel/icmp.c</span>"]:::plugin
 
-    subgraph DPI["src/dpi/ DPI 插件"]
-        direction LR
-        TLS[tls.c]:::dp
-        HTTP[http.c]:::dp
-        DNS[dns.c]:::dp
-    end
+    IO["I/O backends<br/><span style='font-size:12px'>tun / raw_sock / ks_sock / uring_sock<br/>xsk / netmap / pcap / dpdk / memif</span>"]:::io
 
-    subgraph CORE["src/core/ + include/pproxy/"]
-        direction LR
-        PKT["packet / mempool"]:::co
-        RING[ring]:::co
-        FLOW["flow / hash"]:::co
-        SESS[session_table]:::co
-        TWHL[timer_wheel]:::co
-        LOG[log]:::co
-    end
+    DPI["DPI plugins<br/><span style='font-size:12px'>dns / tls / http<br/>called from worker</span>"]:::plugin
 
-    subgraph CFG["src/config/"]
-        direction LR
-        CFGC["config.c<br/>yyjson 解析 + 热重载"]:::co
-    end
+    CORE["Core library<br/><span style='font-size:12px'>packet, ring, ring_ipc, flow,<br/>session, endpoint, timer, log, error</span>"]:::core
 
-    MAIN --> MODS
     MAIN --> CFG
+    MAIN --> THREADS
     MAIN --> CORE
 
-    LRX --> IO
-    LTX --> IO
-    RTX --> TUNNEL
-    RRX --> TUNNEL
+    THREADS -->|"left_rx / left_tx"| IO
+    THREADS -->|"right_tx / right_rx"| PROTO
+    THREADS -->|"worker classify"| DPI
+    THREADS -->|"session + queues"| CORE
 
-    WK --> DPI
-    WK --> SESS
-
-    TM --> TWHL
-    TM --> SESS
-    MG --> SESS
-    MG --> CFG
-
-    MODS --> CORE
+    PROTO -->|"send / recv bytes"| IO
+    PROTO --> CORE
     IO --> CORE
-    TUNNEL --> CORE
     DPI --> CORE
     CFG --> CORE
+
+    style MAIN fill:#faf5ff,stroke:#e9d5ff,stroke-width:1px,color:#581c87

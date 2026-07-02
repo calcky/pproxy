@@ -1,12 +1,12 @@
 /*
  * pkt_io.h -- 左手 I/O 后端抽象（vtable）
  *
- * 后端实现：tun / raw_socket / xdp / netmap / pcap
+ * 后端实现：tun / raw_socket / xdp / netmap / pcap / dpdk
  *
  * 由 left_rx 线程持有 ctx 调用 rx_burst；
  * 由 left_tx 线程持有同一个 ctx（或对称的 tx 端）调用 tx_burst。
  *
- * 部分后端（XDP / netmap）rx 与 tx 必须同核绑定，需要 split_rx_tx=false；
+ * 部分后端（XDP / netmap / DPDK）rx 与 tx 必须同核绑定，需要 split_rx_tx=false；
  * 部分后端（tun socket）可以分两个 fd，互不影响。
  */
 #ifndef PPROXY_PKT_IO_H

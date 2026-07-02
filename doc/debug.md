@@ -6,8 +6,8 @@
 
 ```bash
 # 看最近输出
-tail -f /opt/pproxy/log/pp1.log
-tail -f /opt/pproxy/log/pp2.log
+tail -f /opt/pproxy/log/pp.log
+tail -f /opt/pproxy/log/vpp.log   # memif 场景才有
 
 # 提高详细度：配置里 "log": { "level": "debug" } 后重启进程
 ```
@@ -63,6 +63,22 @@ ip -br a
 ip route show | head -20
 ```
 
+## VPP / memif 路径
+
+memif 场景下，pproxy 是 memif slave，VPP sidecar 是 memif master，并把 `memif1/0` 与 leaf WAN 的 `host-<wan>` 做 L2 xconnect。router 侧需要静态 ARP，`deploy.sh` 会自动写入。
+
+```bash
+# leaf：VPP memif 与 L2 bridge 状态
+sudo vppctl -s /run/vpp/cli.sock show memif
+sudo vppctl -s /run/vpp/cli.sock show interface
+sudo vppctl -s /run/vpp/cli.sock show mode
+tail -n 100 /opt/pproxy/log/vpp.log
+
+# router：确认 leaf WAN IP 已有 permanent neighbor
+docker exec router ip neigh show dev eth1
+docker exec router ip neigh show dev eth2
+```
+
 ## TCP 隧道是否通
 
 `pp1` 监听、对端 `server` 应对准 **leaf1 的 WAN IP:隧道端口**（例 `172.16.0.2:19900`）。
@@ -86,8 +102,8 @@ sudo tcpdump -i ppclab1 -n -c 30
 在**能 ssh 到 leaf** 的环境（见 `tests/clab/deploy.sh` 里 `LEAF1_WAN_IP`、端口与 `pp2.json` 中 `tunnels[0].server` 保持一致）：
 
 ```bash
-ssh clab@leaf1 'ip route get 192.168.1.2; tail -n 20 /opt/pproxy/log/pp1.log'
-ssh clab@leaf2 'ip route get 192.168.0.2; tail -n 20 /opt/pproxy/log/pp2.log'
+ssh clab@leaf1 'ip route get 192.168.1.2; tail -n 20 /opt/pproxy/log/pp.log'
+ssh clab@leaf2 'ip route get 192.168.0.2; tail -n 20 /opt/pproxy/log/pp.log'
 ```
 
 ## Core 文件（segfault 后用 gdb 分析）

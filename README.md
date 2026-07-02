@@ -4,7 +4,7 @@
 
 - **左手侧（Ingress）**：劫持本机/旁路流量，后端可选 `tun / raw_socket(AF_PACKET) / AF_XDP / netmap / pcap / dpdk`
 - **DPI 中间层**：五元组会话跟踪、应用层协议识别（TLS SNI / HTTP Host / DNS / QUIC …），对外提供查询接口
-- **右手侧（Egress）**：`(proto, io)` 正交两层。proto = `TCP / UDP / ICMP`（可扩展 KCP / QUIC）；io = `kernel_socket / raw_socket / tun / af_xdp / netmap / pcap / dpdk`。tcp 只能配 kernel_socket（TCP 状态机在内核），udp/icmp 可任选
+- **右手侧（Egress）**：`(proto, io)` 正交两层。proto = `TCP / UDP / ICMP`（可扩展 KCP / QUIC）；io = `kernel_socket(syscall/io_uring) / raw_socket / tun / af_xdp / netmap / pcap / dpdk / memif`。tcp 只能配 kernel_socket（TCP 状态机在内核），udp/icmp 可任选
 - **数据平面**：分片无锁、per-CPU mempool、批量收发、SPSC ring，线程之间不持锁
 
 > 本项目仅支持 **Linux**（推荐 5.10+，AF_XDP zero-copy 推荐 5.15+）。不考虑跨平台。
@@ -16,8 +16,8 @@
 1. **按线程粒度模块化**：每个长生命周期线程 = 一个模块，模块边界清晰、职责单一。
 2. **模块间通信只走 ring**：SPSC / MPSC 无锁环，绝不共享可变状态。
 3. **共享数据走 RCU 或快照**：Session 查询、配置热更新均不阻塞数据平面。
-4. **I/O 后端可插拔**：通过统一 `pkt_io_t` vtable，编译期或运行期挑选。
-5. **C99 + GNU 扩展**，无 C++/Rust 依赖；外部依赖最小化（libbpf / libpcap / libnetmap 按需）。
+4. **I/O 后端可插拔**：通过统一 `pp_pkt_io_ops_t` vtable，编译期或运行期挑选。
+5. **C99 + GNU 扩展**，无 C++/Rust 依赖；外部依赖按后端启用（libbpf/libxdp、libpcap、libdpdk、liburing、libmemif）。netmap 使用 vendored 用户态头文件。
 
 ---
 
@@ -92,11 +92,16 @@ pproxy/
 │   │   └── mgmt/
 │   ├── io/                        # I/O 后端（左手 vtable + 右手薄封装合并同文件）
 │   │   ├── tun.c / tun.h          # L3 TUN：左手 pp_io_tun + 右手 pp_tun_io_*
-│   │   ├── raw_sock.c / raw_sock.h# 左手 AF_PACKET (stub) + 右手 AF_INET SOCK_RAW
+│   │   ├── raw_sock.c / raw_sock.h# 左手 AF_PACKET + 右手 AF_INET SOCK_RAW
 │   │   ├── ks_sock.c / ks_sock.h  # 右手 kernel socket (UDP/TCP)
+│   │   ├── uring_sock.c / .h      # kernel_socket 的 io_uring 后端
 │   │   ├── xsk.c / xsk.h          # AF_XDP
+│   │   ├── xsk_xdpcap.c / .h      # 可选 XDP 抓包 hook
 │   │   ├── netmap.c / netmap.h    # netmap（vendored 头，nm_open API）
-│   │   └── pcap.c / pcap.h        # libpcap
+│   │   ├── pcap.c / pcap.h        # libpcap
+│   │   ├── dpdk.c / dpdk.h        # DPDK PMD
+│   │   └── memif.c / memif.h      # VPP memif 右手 I/O helper
+│   ├── config/                    # JSON 配置加载与热重载
 │   ├── tunnel/                    # 右手 transport（被 right_rx/right_tx 调用）
 │   │   ├── tcp.c
 │   │   ├── udp.c
@@ -118,6 +123,9 @@ pproxy/
 │   ├── dataflow.mmd               # 端到端时序
 │   └── session-state.mmd          # 会话状态机
 ├── tests/
+│   └── clab/                      # containerlab 拓扑、leaf 镜像、性能矩阵
+├── scripts/
+│   └── install_libmemif.sh        # 从 FD.io VPP extras 构建 libmemif
 └── examples/
 ```
 
@@ -148,43 +156,57 @@ typedef struct pp_module {
 
 ## 关键抽象（C 接口）
 
-### `pkt_io_t` —— 左手 I/O 后端（vtable）
+### `pp_pkt_io_ops_t` —— 左手 I/O 后端（vtable）
 
 ```c
-typedef struct pkt_io_ops {
-    int  (*open)(const char *cfg, void **ctx);
-    int  (*close)(void *ctx);
-    int  (*rx_burst)(void *ctx, pp_pkt_t **pkts, int max, int timeout_us);
-    int  (*tx_burst)(void *ctx, pp_pkt_t **pkts, int n);
-    int  (*get_fd)(void *ctx);          /* -1 表示 busy poll */
-    uint32_t caps;                       /* L2/L3, zero_copy, batched */
-} pkt_io_ops_t;
+typedef struct pp_pkt_io_ops {
+    const char *name;
+    pp_io_kind_t kind;
+    uint32_t     caps;
+
+    int   (*open)  (const pp_io_cfg_t *cfg, void **out_ctx);
+    void  (*close) (void *ctx);
+    int   (*rx_burst)(void *ctx, pp_pkt_t **pkts, int max, int timeout_us);
+    int   (*tx_burst)(void *ctx, pp_pkt_t **pkts, int n);
+    int   (*get_rx_fd)(void *ctx);
+    int   (*get_tx_fd)(void *ctx);
+    int   (*stat)(void *ctx, char *json, size_t cap);
+} pp_pkt_io_ops_t;
 ```
 
-后端实现：`io/tun.c` `io/raw_sock.c` `io/xsk.c` `io/netmap.c` `io/pcap.c`
+后端实现：`io/tun.c` `io/raw_sock.c` `io/xsk.c` `io/netmap.c` `io/pcap.c` `io/dpdk.c`
 
-### `tunnel_t` —— 右手 transport（vtable）
+### `pp_tunnel_ops_t` —— 右手 transport（vtable）
 
 ```c
-typedef struct tunnel_ops {
-    int  (*connect)(void *ctx, const pp_endpoint_t *ep);
-    int  (*send)(void *ctx, uint64_t sid, const void *buf, size_t len);
-    int  (*recv)(void *ctx, uint64_t *sid, void *buf, size_t cap);
-    void (*close_session)(void *ctx, uint64_t sid);
-    int  (*get_fd)(void *ctx);
-} tunnel_ops_t;
+typedef struct pp_tunnel_ops {
+    const char       *name;
+    pp_tunnel_proto_t proto;
+    uint32_t          supported_io_mask;
+    uint32_t          caps;
+
+    int   (*open)  (const pp_tunnel_cfg_t *cfg, void **out_ctx);
+    void  (*close) (void *ctx);
+    int   (*connect)(void *ctx);
+    int   (*send)(void *ctx, const pp_tun_buf_t *buf);
+    int   (*recv)(void *ctx, pp_tun_mbuf_t *out_buf, int timeout_us);
+    void  (*session_close)(void *ctx, uint64_t sid);
+    int   (*get_rx_fd)(void *ctx);
+    int   (*get_tx_fd)(void *ctx);
+    int   (*stat)(void *ctx, char *json, size_t cap);
+} pp_tunnel_ops_t;
 ```
 
 实现：`tunnel/tcp.c` `tunnel/udp.c` `tunnel/icmp.c`
 
-`tunnel_ops_t` 只负责 **proto 编码**（怎么把 `sid + payload` 装成 TCP/UDP/ICMP 报文）；
+`pp_tunnel_ops_t` 只负责 **proto 编码**（怎么把 `sid + payload` 装成 TCP/UDP/ICMP 报文）；
 具体怎么把字节发出去由 `cfg.io` 决定，proto 实现内部按 `io` 派发到下面这层：
 
-| proto \ io  | kernel_socket | raw_socket | tun       | pcap        | af_xdp       | netmap        | dpdk            |
-|-------------|:-------------:|:----------:|:---------:|:-----------:|:------------:|:-------------:|:---------------:|
-| `tcp`       | ✓ 已实现       | —          | —         | —           | —            | —             | —               |
-| `udp`       | ✓ 已实现       | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) |
-| `icmp`      | —             | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) |
+| proto \ io  | kernel_socket | raw_socket | tun       | pcap        | af_xdp       | netmap        | dpdk            | memif           |
+|-------------|:-------------:|:----------:|:---------:|:-----------:|:------------:|:-------------:|:---------------:|:---------------:|
+| `tcp`       | ✓ 已实现       | —          | —         | —           | —            | —             | —               | —               |
+| `udp`       | ✓ 已实现       | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) | ✓ 已实现\*\*\*\*\* |
+| `icmp`      | —             | ✓ 已实现    | ✓ 已实现   | ✓ 已实现\*   | ✓ 已实现\*\*  | ✓ 已实现\*\*\* | ✓ 已实现\*\*\*\* (拷贝版) | ✓ 已实现\*\*\*\*\* |
 
 图例：`✓` 已落地（带回环测试或冒烟测试）；`○` `supported_io_mask` 里挂了位，但 `open()` 会
 返回 `PP_ERR_NOSUPPORT` 直到具体实现补上；`—` 架构上不支持。
@@ -196,14 +218,19 @@ typedef struct tunnel_ops {
 `****`    = 需要 `./build.sh --dpdk`（启用 libdpdk pkg-config 链接）+ 运行时 hugepages + 已 vfio-pci 绑定的数据网卡。
             当前是「拷贝版」（rx 把 rte_mbuf memcpy 进 pp_pkt_t，tx 反向），未实现零拷贝。
             DPDK 接管网卡后内核不可见，不能与 `kernel_socket` 共用同一张卡。
+`*****`   = 需要 `./build.sh --memif`（启用 libmemif 链接）。pproxy 作为 memif slave，通常配 VPP sidecar
+            做 memif master，再通过 `af_packet` 桥到物理/虚拟 WAN。
 
 > - `tcp` 只能走 `kernel_socket`：TCP 状态机在内核里，除非自带用户态 TCP 栈。
+> - `kernel_socket` 默认走传统 syscall；构建 `./build.sh --io-uring` 后，可在 `io_cfg.backend="io_uring"` 下使用
+>   io_uring socket 路径（支持 `batch_tx`，`tx_zc` 在内核/硬件不支持时自动回退）。
 > - `udp` / `icmp` 的 `kernel_socket` 省事、`raw_socket` 绕过 UDP socket 缓存且可自定义端口/IP 头；
 >   `tun` 把自建帧写回虚拟设备让内核路由；`pcap` 通过 libpcap 抓包+注入（支持 BPF 过滤）；
->   `af_xdp` / `netmap` 做零拷贝极低延迟。
+>   `af_xdp` / `netmap` / `dpdk` / `memif` 面向低延迟或旁路数据面。
 > - `pp_tunnel_ops_t.supported_io_mask` 在 `open()` 时校验 `(proto, io)` 是否合法，
 >   不合法直接返回 `PP_ERR_NOSUPPORT`。
-> - `raw_socket` / `pcap` 需要 `CAP_NET_RAW`，`tun` 需要 `CAP_NET_ADMIN`；UDP `raw_socket` 目前仅 IPv4。
+> - `raw_socket` / `pcap` 需要 `CAP_NET_RAW`，`tun` 需要 `CAP_NET_ADMIN`；DPDK 需要 hugepages + vfio-pci；
+>   memif 需要 libmemif 与 VPP/对端 socket；UDP `raw_socket` 目前仅 IPv4。
 
 #### 右手 io 示例配置片段
 
@@ -334,8 +361,10 @@ cd pproxy
 
 ./build.sh                       # release 构建（默认 -O2）
 ./build.sh --debug               # buildtype=debug
-./build.sh --xdp --pcap          # 启用可选后端
-./build.sh --dpdk                # 启用 DPDK 后端（需 libdpdk-dev）
+./build.sh --xdp --pcap --netmap # 启用 AF_XDP / pcap / netmap
+./build.sh --dpdk                # 启用 DPDK 后端（需 libdpdk-dev + 运行时 hugepages/vfio）
+./build.sh --io-uring            # 启用 kernel_socket 的 io_uring 后端（需 liburing）
+./build.sh --memif               # 启用 VPP memif 右手后端（需 libmemif）
 ./build.sh -j 8                  # 并行
 ./build.sh clean                 # 删除 build/
 ./build.sh --shell               # 进容器调试
@@ -375,16 +404,21 @@ curl -s http://127.0.0.1:9091/          # 简单索引页
 
 | 测试                          | 类型                     | 是否需 root |
 |-------------------------------|--------------------------|-------------|
+| `test_ring` / `test_ring_ipc` | ring / ring IPC 单测     | 否          |
 | `test_tunnel_loopback`        | 进程内 TCP/UDP/ICMP 回环 | 否          |
 | `test_config_reload`          | 配置热重载单元测试       | 否          |
 | `test_mgmt_http`              | Unix socket + HTTP 导出  | 否          |
+| `test_af_packet_io`           | AF_PACKET 左手 I/O       | 需要 `CAP_NET_RAW`，不满足时 skip |
+| 可选后端测试                  | `pcap` / `xsk` / `netmap` / `dpdk` / `memif` / `uring_sock` | 取决于构建选项与运行环境 |
 | `tests/e2e.sh`                | 双进程端到端             | **是**      |
 
 ```bash
-# 进程内单元测试（不需要特权）：
+# 单元测试（部分 I/O 测试缺权限或缺内核模块时会 exit 77 skip）：
 ./build.sh --native              # 或 ./build.sh，确保已构建
-meson test -C build               # 三个 C 测试一起跑
-# 或单独：
+meson test -C build
+# 或单独跑核心测试：
+./build/test_ring
+./build/test_ring_ipc
 ./build/test_tunnel_loopback
 ./build/test_config_reload
 ./build/test_mgmt_http
@@ -433,7 +467,9 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 
 镜像内（`Dockerfile` 自动安装）：
 - `gcc` + `libc6-dev` + `meson` + `ninja-build` + `pkg-config`
-- `libbpf-dev` + `libxdp-dev` + `libpcap-dev` + `libdpdk-dev`（可选后端用）
+- `libbpf-dev` + `libxdp-dev` + `libpcap-dev` + `libdpdk-dev` + `liburing-dev`（可选后端用）
+- `libmemif`：Ubuntu 默认仓库通常没有 `libmemif-dev`；`Dockerfile` 通过
+  [`scripts/install_libmemif.sh`](scripts/install_libmemif.sh) 从 FD.io VPP `extras/libmemif` 构建安装。
 - netmap 不依赖系统包：`./build.sh --netmap` 直接复用 `third_party/netmap/` 下 vendored
   的 `<net/netmap_user.h>` (BSD-2-Clause)，无 `-lnetmap`。
 
@@ -444,6 +480,8 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 - AF_XDP：`CAP_BPF`（5.8+）或 root
 - netmap：`CAP_NET_ADMIN` + 内核加载 `netmap` 模块（提供 `/dev/netmap`）
 - DPDK：root（或 vfio-pci 配好 + 用户在 vfio 设备组）；运行时需 hugepages（`echo N > /proc/sys/vm/nr_hugepages`）和已绑定到 `vfio-pci` 的网卡。`./build.sh --dpdk` 启用编译
+- io_uring：`./build.sh --io-uring` 启用编译；运行时仍走 kernel socket 权限模型
+- memif：`./build.sh --memif` 启用编译；运行时需要 libmemif 和 VPP/其他 memif master，clab 里由 VPP sidecar 提供
 
 #### 构建文件说明
 
@@ -451,7 +489,7 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 |---|---|
 | `Dockerfile`         | 构建环境镜像（debian-slim + 工具链） |
 | `meson.build`        | 工程描述：源码列表、依赖、编译选项 |
-| `meson_options.txt`  | 可选构建选项（`xdp` / `pcap` / `netmap`） |
+| `meson_options.txt`  | 可选构建选项（`xdp` / `pcap` / `netmap` / `dpdk` / `io_uring` / `memif`） |
 | `build.sh`           | 解析 flags → 调 `meson setup` → 调度 docker → 跑 `ninja` |
 | `.dockerignore`      | 缩小 build context |
 
@@ -465,9 +503,10 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 - [x] DPI 插件框架（`dns` / `tls` / `http` 占位，可通过 config 热启停/改优先级）
 - [x] `right_*` 后端：
   - TCP：`kernel_socket`
-  - UDP：`kernel_socket` / `raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap`
-  - ICMP：`raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap`
-  - 三者都有 client + server 模式；`pcap` 需 `./build.sh --pcap`，`af_xdp` 需 `./build.sh --xdp`，`netmap` 需 `./build.sh --netmap`
+  - UDP：`kernel_socket` / `raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap` / `dpdk` / `memif`
+  - ICMP：`raw_socket` / `tun` / `pcap` / `af_xdp` / `netmap` / `dpdk` / `memif`
+  - 三者都有 client + server 模式；`kernel_socket` 可选 `io_cfg.backend=io_uring`（需 `./build.sh --io-uring`）；
+    `pcap` 需 `--pcap`，`af_xdp` 需 `--xdp`，`netmap` 需 `--netmap`，`dpdk` 需 `--dpdk`，`memif` 需 `--memif`
 - [x] timer wheel + 会话老化（简化版）
 - [x] mgmt：Unix socket 文本接口（`help` / `stat` / `sessions` / `reload [path]` / `quit`）
 - [x] JSON 配置加载（yyjson）+ CPU 亲和性
@@ -476,11 +515,13 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 - [x] 右手侧剩余 io：netmap（vendored header-only，nm\_open API；UDP/ICMP client+server）
 - [x] 左/右手 DPDK 后端（拷贝版、单 queue；`./build.sh --dpdk`）；
       待办：零拷贝（让 `pp_pkt_t` 挂载 `rte_mbuf`）、多 queue / RSS、用户态 ARP（当前需 `peer_mac` 静态配置）
+- [x] 右手侧 memif 后端（libmemif + VPP sidecar；clab matrix 已覆盖 UDP/memif）
+- [x] kernel_socket io_uring 后端（`io_cfg.backend=io_uring`，支持 batch_tx / tx_zc 回退）
 - [ ] netmap / AF\_XDP 优化：多 ring 聚合、zero-copy 直通（当前左手 rx 仍拷贝到 mempool）、
       真实 peer MAC 学习改进
-- [x] 左手侧 I/O 后端 vtable：`tun` / `raw_socket` / `af_xdp` / `pcap` / `netmap` 均已注册
+- [x] 左手侧 I/O 后端 vtable：`tun` / `raw_socket` / `af_xdp` / `pcap` / `netmap` / `dpdk` 均已注册
 - [ ] 左手侧 left_rx/left_tx 端到端打通剩余后端的 e2e 测试
-- [ ] 左手侧 I/O 后端：raw\_socket（AF\_PACKET）完整实现 → AF\_XDP → netmap → pcap
+- [ ] 左手侧 I/O 后端：继续补齐 AF\_XDP / netmap / pcap / DPDK 的更完整 e2e 与性能验证
 - [ ] tunnel 协议：KCP / QUIC 封装（目前只有 TCP/UDP/ICMP 的 `proto`）
 - [x] mgmt：Prometheus exporter（`mgmt.metrics.enable`，HTTP `/metrics`）
 - [ ] RCU 化 session 快照（当前 snapshot 直接读 worker 槽位，理论上有撕裂）
@@ -498,6 +539,10 @@ docker run --rm --cap-add=NET_ADMIN --device /dev/net/tun \
 - [`doc/modules.mmd`](doc/modules.mmd) — 源码模块依赖
 - [`doc/dataflow.mmd`](doc/dataflow.mmd) — 端到端时序
 - [`doc/session-state.mmd`](doc/session-state.mmd) — 会话状态机
+- [`doc/perf.md`](doc/perf.md) — clab 性能测试框架与矩阵记录
+- [`doc/debug.md`](doc/debug.md) — clab / 本地常用排障命令
+- [`tests/clab/README.md`](tests/clab/README.md) — containerlab 拓扑、leaf 预热镜像、matrix 用法
+- [`tests/clab/reports/20260702-matrix.md`](tests/clab/reports/20260702-matrix.md) — 当前全后端 matrix 样例结果
 
 > Mermaid 文档可在 GitHub / VSCode（带 mermaid 插件）/ Obsidian 直接预览。
 

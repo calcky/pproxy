@@ -3,11 +3,13 @@
  *
  * 一条 tunnel = (proto, io) 组合：
  *   proto = 协议编码     —— TCP/UDP/ICMP/KCP/QUIC，决定 wire format
- *   io    = I/O 后端     —— kernel_socket / raw_socket / af_xdp / netmap
+ *   io    = I/O 后端     —— kernel_socket(syscall/io_uring) / raw_socket / tun /
+ *                           af_xdp / netmap / pcap / dpdk / memif
  *
  * proto 与 io 在概念上正交：
  *   - tcp 必须配 kernel_socket（除非自带用户态 TCP 栈）
- *   - udp / icmp / kcp / quic 都可以选 kernel_socket（默认）或 raw_socket / af_xdp / netmap
+ *   - udp / icmp 可以选 kernel_socket（默认）或 raw_socket / tun / pcap /
+ *     af_xdp / netmap / dpdk / memif；kcp / quic 仍是未来扩展
  *
  * 每个 proto 实现注册一份 ops；ops->open() 内根据 cfg->io 选具体 I/O 路径。
  * 不支持的 (proto, io) 组合在 open() 中返回 PP_ERR_NOSUPPORT。

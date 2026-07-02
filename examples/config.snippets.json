@@ -33,6 +33,18 @@
     "netmap": { "ifname": "netmap:eth0", "nrings": 1 }
   },
 
+  "left_dpdk": {
+    "kind": "dpdk",
+    "name": "left0",
+    "dpdk": {
+      "port_id": 0,
+      "queue_id": 0,
+      "nframes": 8192,
+      "eal_args": "--no-pci --vdev=net_null0",
+      "peer_mac": "02:00:00:00:00:02"
+    }
+  },
+
   "_right_proto_io": "==== 右手隧道：(proto, io) 组合 ====",
 
   "tunnel_tcp_kernel": {
@@ -51,6 +63,16 @@
     "server": "203.0.113.10:9001",
     "max_sessions": 4096,
     "udp":    { "mtu": 1400 }
+  },
+
+  "tunnel_udp_kernel_io_uring": {
+    "name":   "udp-uring",
+    "proto":  "udp",
+    "io":     "kernel_socket",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 },
+    "io_cfg": { "backend": "io_uring", "batch_tx": 32, "tx_zc": false, "sq_entries": 256 }
   },
 
   "tunnel_udp_xdp": {
@@ -74,6 +96,39 @@
     "max_sessions": 4096,
     "udp":    { "mtu": 1400 },
     "io_cfg": { "ifname": "netmap:eth0", "nrings": 1 }
+  },
+
+  "tunnel_udp_dpdk": {
+    "name":   "udp-dpdk",
+    "proto":  "udp",
+    "io":     "dpdk",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 },
+    "io_cfg": {
+      "port_id": 0,
+      "queue_id": 0,
+      "nframes": 8192,
+      "eal_args": "--no-pci --vdev=net_null0",
+      "peer_mac": "02:00:00:00:00:02"
+    }
+  },
+
+  "tunnel_udp_memif": {
+    "name":   "udp-memif",
+    "proto":  "udp",
+    "io":     "memif",
+    "server": "203.0.113.10:9001",
+    "max_sessions": 4096,
+    "udp":    { "mtu": 1400 },
+    "io_cfg": {
+      "socket_path": "/run/vpp/memif.sock",
+      "interface_id": 0,
+      "is_master": false,
+      "ring_size": 0,
+      "buffer_size": 0,
+      "peer_mac": "02:00:00:00:00:02"
+    }
   },
 
   "tunnel_icmp_raw": {
