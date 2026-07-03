@@ -1,0 +1,54 @@
+{
+  "run_id": "20260703T030624Z_udp_dpdk_p10",
+  "duration_sec": 5.0,
+  "freq_hz": 99.0,
+  "viewer": "https://www.speedscope.app/",
+  "leaves": {
+    "leaf1": {
+      "summary": {
+        "host": "leaf1",
+        "pid": 10556,
+        "duration_sec": 5.0,
+        "freq_hz": 99.0,
+        "samples": 370,
+        "files": {
+          "perf_data": "perf.data",
+          "perf_script": "perf.script",
+          "perf_record_log": "perf-record.log",
+          "perf_script_log": "perf-script.log"
+        }
+      },
+      "speedscope-summary": {
+        "samples": 370,
+        "frames": 229,
+        "output": "tests/clab/results/flamegraphs/20260703T030624Z_udp_dpdk_p10/leaf1/leaf1.speedscope.json"
+      },
+      "speedscope": "leaf1/leaf1.speedscope.json",
+      "perf_script": "leaf1/perf.script",
+      "perf_data": "leaf1/perf.data"
+    },
+    "leaf2": {
+      "summary": {
+        "host": "leaf2",
+        "pid": 10552,
+        "duration_sec": 5.0,
+        "freq_hz": 99.0,
+        "samples": 370,
+        "files": {
+          "perf_data": "perf.data",
+          "perf_script": "perf.script",
+          "perf_record_log": "perf-record.log",
+          "perf_script_log": "perf-script.log"
+        }
+      },
+      "speedscope-summary": {
+        "samples": 370,
+        "frames": 257,
+        "output": "tests/clab/results/flamegraphs/20260703T030624Z_udp_dpdk_p10/leaf2/leaf2.speedscope.json"
+      },
+      "speedscope": "leaf2/leaf2.speedscope.json",
+      "perf_script": "leaf2/perf.script",
+      "perf_data": "leaf2/perf.data"
+    }
+  }
+}

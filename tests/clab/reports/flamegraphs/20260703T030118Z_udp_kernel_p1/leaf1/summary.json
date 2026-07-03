@@ -1,0 +1,13 @@
+{
+  "host": "leaf1",
+  "pid": 3349,
+  "duration_sec": 5.0,
+  "freq_hz": 99.0,
+  "samples": 428,
+  "files": {
+    "perf_data": "perf.data",
+    "perf_script": "perf.script",
+    "perf_record_log": "perf-record.log",
+    "perf_script_log": "perf-script.log"
+  }
+}

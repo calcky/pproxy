@@ -17,7 +17,12 @@
 | [`tests/clab/perf/check-tunnel.sh`](../tests/clab/perf/check-tunnel.sh) | iperf 前校验 tunnel ready / proto / io |
 | [`tests/clab/perf/collect-cpu.sh`](../tests/clab/perf/collect-cpu.sh) | 正式 iperf 起/止 CPU 快照 |
 
-当前已整理的全后端样例报告：[`tests/clab/reports/20260702-matrix.md`](../tests/clab/reports/20260702-matrix.md)。该次 matrix 覆盖 `kernel_socket`、`io_uring`、`af_xdp`、`netmap`、`dpdk`、`memif`，六个场景均通过。
+当前已整理的全后端样例报告：
+
+- [`tests/clab/reports/20260703-matrix-flame.md`](../tests/clab/reports/20260703-matrix-flame.md)：matrix + leaf1/leaf2 perf speedscope 链接
+- [`tests/clab/reports/20260702-matrix.md`](../tests/clab/reports/20260702-matrix.md)：matrix 基线报告
+
+这些报告覆盖 `kernel_socket`、`io_uring`、`af_xdp`、`netmap`、`dpdk`、`memif`。
 
 ### iperf3 参数
 
@@ -52,9 +57,41 @@
 
 # CI 固定场景（self-hosted + KVM）
 ./tests/clab/perf.sh --ci --fail-on-threshold
+
+# 正式 iperf 窗口内在 leaf1/leaf2 各抓 5s perf，并导出 speedscope JSON
+./tests/clab/perf.sh --scenario udp_kernel --flamegraph
 ```
 
 结果写入 `tests/clab/results/`。可选 `--update-doc` 将 Markdown 表追加到本文件。需要长期保留的结果建议整理到 `tests/clab/reports/`。
+
+### Flamegraph / speedscope
+
+`--flamegraph` 会在每个正式 iperf run 同时在 leaf1 和 leaf2 上执行 `perf record`，默认延迟 1 秒后抓 5 秒、99Hz。可用环境变量或参数调整：
+
+```bash
+./tests/clab/perf.sh --scenario udp_memif --flamegraph --flame-duration 5 --flame-freq 99 --flame-delay 1
+```
+
+输出目录：
+
+```text
+tests/clab/results/flamegraphs/<run-id>/
+├── manifest.json
+├── README.md
+├── leaf1/leaf1.speedscope.json
+└── leaf2/leaf2.speedscope.json
+```
+
+把 `leaf*.speedscope.json` 上传到 <https://www.speedscope.app/> 即可交互查看。GitHub Actions 的 `clab-perf-results` artifact 已上传整个 `tests/clab/results/`，因此也会包含这些 speedscope JSON 和原始 `perf.data` / `perf.script`。
+
+已入仓的报告可直接从 [`20260703-matrix-flame.md`](../tests/clab/reports/20260703-matrix-flame.md) 点击 `L1 flame` / `L2 flame` 打开 speedscope；这些链接使用 raw GitHub JSON 作为 speedscope `profileURL`。如果要生成同类报告，先把 flamegraph 目录整理到报告目录下，再设置 raw URL 前缀：
+
+```bash
+PPROXY_SPEEDSCOPE_RAW_BASE=https://raw.githubusercontent.com/calcky/pproxy/main/tests/clab/reports \
+  ./tests/clab/perf.sh --matrix --flamegraph
+```
+
+未设置 `PPROXY_SPEEDSCOPE_RAW_BASE` 时，报告仍输出本地相对 JSON 链接。
 
 ### 2026-07-02 matrix 样例
 

@@ -150,15 +150,23 @@ ssh clab@leaf1 tail -n 100 /opt/pproxy/log/vpp.log
 
 - `--skip-build`：跳过宿主机 `./build.sh`
 - `--skip-deploy`：复用已经部署好的拓扑
+- `--flamegraph`：正式 iperf 窗口内在 leaf1/leaf2 各抓 5s `perf record`，并导出 speedscope JSON
 - `PERF_RESULTS_DIR=/path/to/results`：指定结果目录
 - `PERF_SCENARIOS=/path/to/scenarios.yaml`：指定场景文件
+- `PERF_FLAME_DURATION=5` / `PERF_FLAME_FREQ=99` / `PERF_FLAME_DELAY=1`：调整 flamegraph 采样参数
 
 结果写到 `tests/clab/results/`：
 
 - `*.json`：每次 iperf 结果和采集到的 metrics
 - `matrix_*.md`：矩阵汇总
+- `flamegraphs/<run-id>/leaf{1,2}/*.speedscope.json`：`--flamegraph` 生成的 speedscope 火焰图数据，可在 <https://www.speedscope.app/> 打开
 
-已整理入仓库的样例报告见 [`tests/clab/reports/20260702-matrix.md`](reports/20260702-matrix.md)。这次完整矩阵的六个场景均通过，`udp_memif` 也包含在内。
+已入仓报告中的 `L1 flame` / `L2 flame` 链接会打开 speedscope 并自动加载 raw GitHub JSON；`L1 json` / `L2 json` 保留原始 JSON 下载链接。生成需要自动打开 speedscope 的 Markdown 时，可设置 `PPROXY_SPEEDSCOPE_RAW_BASE=https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<report-dir>`；未设置时默认输出本地相对 JSON 链接。
+
+已整理入仓库的样例报告：
+
+- [`tests/clab/reports/20260703-matrix-flame.md`](reports/20260703-matrix-flame.md)：matrix + leaf1/leaf2 perf speedscope 链接
+- [`tests/clab/reports/20260702-matrix.md`](reports/20260702-matrix.md)：matrix 基线报告
 
 ## 后端说明
 
