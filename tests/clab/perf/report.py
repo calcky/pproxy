@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 
 def parse_iperf(data: dict, proto: str = "tcp") -> dict:
@@ -144,6 +146,41 @@ def fmt_cpp(cpp: float | None) -> str:
     return f"{cpp:.1f}"
 
 
+def flamegraph_link(result: dict, leaf: str) -> str:
+    flame = result.get("flamegraph") or {}
+    run_id = flame.get("run_id")
+    leaves = flame.get("leaves") or {}
+    item = leaves.get(leaf) or {}
+    rel = item.get("speedscope")
+    if not run_id or not rel:
+        return "-"
+    summary = item.get("summary") or {}
+    samples = summary.get("samples")
+    text = f"{samples} samples" if samples is not None else "speedscope"
+    path = f"flamegraphs/{run_id}/{rel}"
+    raw_base = os.environ.get("PPROXY_SPEEDSCOPE_RAW_BASE", "").rstrip("/")
+    if not raw_base:
+        return f"[{text}]({path})"
+    profile_url = f"{raw_base}/{path}"
+    title = f"{run_id} {leaf}"
+    viewer = (
+        "https://www.speedscope.app/"
+        f"#profileURL={quote(profile_url, safe='')}&title={quote(title, safe='')}"
+    )
+    return f"[{text}]({viewer})"
+
+
+def flamegraph_json_link(result: dict, leaf: str) -> str:
+    flame = result.get("flamegraph") or {}
+    run_id = flame.get("run_id")
+    leaves = flame.get("leaves") or {}
+    item = leaves.get(leaf) or {}
+    rel = item.get("speedscope")
+    if not run_id or not rel:
+        return "-"
+    return f"[json](flamegraphs/{run_id}/{rel})"
+
+
 def check_thresholds(iperf: dict, thresholds: dict) -> list[str]:
     errs = []
     if not thresholds:
@@ -226,7 +263,9 @@ def matrix_markdown_row(result: dict, json_name: str = "") -> str:
         f"{i.get('parallel', '-')} | {i.get('bitrate_mbps', 0)} | "
         f"{fmt_pps(float(pc.get('pps') or 0))} | "
         f"{l1[0]} | {l1[1]} | {fmt_cpp(cpp_pp.get('leaf1'))} | "
-        f"{l2[0]} | {l2[1]} | {fmt_cpp(cpp_pp.get('leaf2'))} |"
+        f"{l2[0]} | {l2[1]} | {fmt_cpp(cpp_pp.get('leaf2'))} | "
+        f"{flamegraph_link(result, 'leaf1')} | {flamegraph_link(result, 'leaf2')} | "
+        f"{flamegraph_json_link(result, 'leaf1')} | {flamegraph_json_link(result, 'leaf2')} |"
     )
 
 
@@ -235,6 +274,7 @@ def matrix_md_header(started: str) -> str:
         "scenario", "right_io", "P", "Mbps", "PPS",
         "L1 pp", "L1 sys", "L1 core-us",
         "L2 pp", "L2 sys", "L2 core-us",
+        "L1 flame", "L2 flame", "L1 json", "L2 json",
     ]
     hdr = "| " + " | ".join(headers) + " |"
     sep = "| " + " | ".join("---" for _ in headers) + " |"
@@ -279,6 +319,7 @@ def main() -> int:
     ap.add_argument("--mode", default="pproxy")
     ap.add_argument("--iperf-proto", default="tcp")
     ap.add_argument("--cpu", default="", help="CPU sample JSON from collect-cpu.sh")
+    ap.add_argument("--flamegraph", default="", help="flamegraph manifest JSON")
     ap.add_argument("--update-doc", default="")
     ap.add_argument("--matrix-md", default="", help="matrix*.md path; append row after each run")
     ap.add_argument("--fail-on-threshold", action="store_true")
@@ -312,6 +353,10 @@ def main() -> int:
         cpu_path = Path(args.cpu)
         if cpu_path.is_file():
             result["cpu"] = json.loads(cpu_path.read_text(encoding="utf-8"))
+    if args.flamegraph:
+        flame_path = Path(args.flamegraph)
+        if flame_path.is_file():
+            result["flamegraph"] = json.loads(flame_path.read_text(encoding="utf-8"))
 
     result["pps_cpp"] = compute_pps_cpp(result)
 

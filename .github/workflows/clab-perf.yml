@@ -3,6 +3,17 @@ name: clab-perf
 
 on:
   workflow_dispatch:
+    inputs:
+      flamegraph:
+        description: 'Collect leaf1/leaf2 perf profiles and speedscope JSON'
+        required: false
+        type: boolean
+        default: false
+      flame_duration:
+        description: 'perf record duration in seconds when flamegraph is enabled'
+        required: false
+        type: string
+        default: '5'
   schedule:
     - cron: '0 4 * * 0'
 
@@ -36,7 +47,39 @@ jobs:
       - name: Run clab perf CI scenarios
         run: |
           chmod +x tests/clab/perf.sh tests/clab/perf/*.sh
-          tests/clab/perf.sh --ci --fail-on-threshold
+          extra=()
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.flamegraph }}" == "true" ]]; then
+            extra+=(--flamegraph --flame-duration "${{ inputs.flame_duration }}")
+          fi
+          tests/clab/perf.sh --ci --fail-on-threshold "${extra[@]}"
+
+      - name: Summarize flamegraphs
+        if: always()
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          manifests = sorted(Path("tests/clab/results/flamegraphs").glob("*/manifest.json"))
+          if not manifests:
+              raise SystemExit(0)
+
+          print("## Flamegraphs")
+          print()
+          print("Download the `clab-perf-results` artifact and open each `*.speedscope.json` in https://www.speedscope.app/.")
+          print()
+          print("| run | leaf1 samples | leaf2 samples | manifest |")
+          print("| --- | ---: | ---: | --- |")
+          for manifest in manifests:
+              data = json.loads(manifest.read_text(encoding="utf-8"))
+              leaves = data.get("leaves") or {}
+              row = [data.get("run_id") or manifest.parent.name]
+              for leaf in ("leaf1", "leaf2"):
+                  summary = (leaves.get(leaf) or {}).get("summary") or {}
+                  row.append(str(summary.get("samples", 0)))
+              row.append(str(manifest))
+              print(f"| {row[0]} | {row[1]} | {row[2]} | `{row[3]}` |")
+          PY
 
       - name: Upload results
         if: always()

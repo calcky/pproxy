@@ -8,6 +8,7 @@
 #   ./tests/clab/perf.sh --sweep batch_tx=1,8,32,64 --right-io=io_uring
 #   ./tests/clab/perf.sh --baseline direct       # 无 pproxy 基线
 #   ./tests/clab/perf.sh --scenario udp_uring_batch32 --skip-deploy  # 已 deploy
+#   ./tests/clab/perf.sh --scenario udp_kernel --flamegraph  # iperf 正式窗口抓 leaf1/leaf2 perf 5s
 set -euo pipefail
 
 PERF_DIR="$(cd "$(dirname "$0")/perf" && pwd)"
@@ -28,6 +29,10 @@ BASELINE=""
 FAIL_ON_THRESHOLD=0
 UPDATE_DOC=0
 OVERLAY_JSON=""
+FLAMEGRAPH=0
+FLAME_DURATION="${PERF_FLAME_DURATION:-5}"
+FLAME_FREQ="${PERF_FLAME_FREQ:-99}"
+FLAME_DELAY="${PERF_FLAME_DELAY:-1}"
 EXTRA_DEPLOY=()
 
 usage() {
@@ -48,6 +53,13 @@ while [[ $# -gt 0 ]]; do
     --skip-build)  SKIP_BUILD=1 ;;
     --fail-on-threshold) FAIL_ON_THRESHOLD=1 ;;
     --update-doc)  UPDATE_DOC=1 ;;
+    --flamegraph)  FLAMEGRAPH=1 ;;
+    --flame-duration=*) FLAME_DURATION="${1#--flame-duration=}" ;;
+    --flame-duration)   FLAME_DURATION="$2"; shift ;;
+    --flame-freq=*) FLAME_FREQ="${1#--flame-freq=}" ;;
+    --flame-freq)   FLAME_FREQ="$2"; shift ;;
+    --flame-delay=*) FLAME_DELAY="${1#--flame-delay=}" ;;
+    --flame-delay)   FLAME_DELAY="$2"; shift ;;
     --overlay=*)   OVERLAY_JSON="${1#--overlay=}" ;;
     --overlay)     OVERLAY_JSON="$2"; shift ;;
     -h|--help)    usage 0 ;;
@@ -57,6 +69,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 chmod +x "$PERF_DIR"/run-iperf.sh "$PERF_DIR"/collect-metrics.sh "$PERF_DIR"/collect-cpu.sh \
+  "$PERF_DIR"/collect-flamegraph.sh "$PERF_DIR"/perf-to-speedscope.py \
   "$PERF_DIR"/check-tunnel.sh "$PERF_DIR"/baseline-direct.sh "$PERF_DIR"/cleanup.sh 2>/dev/null || true
 mkdir -p "$RESULTS_DIR"
 ensure_python_yaml || exit 1
@@ -201,6 +214,10 @@ PY
   EXPECT_PROTO="$tunnel" EXPECT_LEFT="$left" EXPECT_RIGHT="$right"
   perf_check_tunnel 15 || return 1
 
+  if [[ "$FLAMEGRAPH" -eq 1 ]]; then
+    "$PERF_DIR/collect-flamegraph.sh" --prepare
+  fi
+
   local traffic thresholds traffic_proto traffic_duration traffic_warmup
   traffic=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('traffic',{})))" "$meta_json")
   thresholds=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('thresholds',{})))" "$meta_json")
@@ -241,11 +258,23 @@ else:
     export IPERF_WARMUP="$traffic_warmup"
     export IPERF_CPU_OUT="$cpu_out"
 
+    deploy_meta=$(python3 -c "import json; print(json.dumps({'tunnel':'$tunnel','left_io':'$left','right_io':'$right','batch_tx':'$batch_tx','parallel':int('$par'),'duration':int('$traffic_duration')}))")
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_${name}_p${par}"
+    local flame_dir=""
+    if [[ "$FLAMEGRAPH" -eq 1 ]]; then
+      flame_dir="$RESULTS_DIR/flamegraphs/$RUN_ID"
+      export IPERF_FLAMEGRAPH_OUT="$flame_dir"
+      export IPERF_FLAMEGRAPH_RUN_ID="$RUN_ID"
+      export IPERF_FLAME_DURATION="$FLAME_DURATION"
+      export IPERF_FLAME_FREQ="$FLAME_FREQ"
+      export IPERF_FLAME_DELAY="$FLAME_DELAY"
+    else
+      unset IPERF_FLAMEGRAPH_OUT IPERF_FLAMEGRAPH_RUN_ID IPERF_FLAME_DURATION IPERF_FLAME_FREQ IPERF_FLAME_DELAY
+    fi
+
     "$PERF_DIR/run-iperf.sh" > "$iperf_out"
     "$PERF_DIR/collect-metrics.sh" "$met_run_after"
 
-    deploy_meta=$(python3 -c "import json; print(json.dumps({'tunnel':'$tunnel','left_io':'$left','right_io':'$right','batch_tx':'$batch_tx','parallel':int('$par'),'duration':int('$traffic_duration')}))")
-    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)_${name}_p${par}"
     OUT="$RESULTS_DIR/${RUN_ID}.json"
     local report_args=(
       --scenario "$name"
@@ -258,6 +287,9 @@ else:
       --thresholds-json "$thresholds"
       --iperf-proto "$traffic_proto"
     )
+    if [[ -n "$flame_dir" && -f "$flame_dir/manifest.json" ]]; then
+      report_args+=(--flamegraph "$flame_dir/manifest.json")
+    fi
     [[ "$FAIL_ON_THRESHOLD" -eq 1 ]] && report_args+=(--fail-on-threshold)
     [[ "$UPDATE_DOC" -eq 1 ]] && report_args+=(--update-doc "$REPO_ROOT/doc/perf.md")
     [[ -n "$MATRIX_MD" ]] && report_args+=(--matrix-md "$MATRIX_MD")
