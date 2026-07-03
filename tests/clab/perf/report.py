@@ -43,9 +43,59 @@ def sum_module_events(m: dict, mod_match: str) -> float:
         if not k.startswith("pp_module_events_out|"):
             continue
         mod = k.split("|", 1)[1]
+        if "=" in mod:
+            continue
         if mod_match in mod:
             total += float(v)
     return total
+
+
+def parse_metric_labels(key: str) -> tuple[str, dict[str, str]]:
+    if "|" not in key:
+        return key, {}
+    name, label_text = key.split("|", 1)
+    if "=" not in label_text:
+        return name, {}
+    labels = {}
+    for part in label_text.split(","):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        labels[k] = v
+    return name, labels
+
+
+def metric_sum(m: dict, metric: str, **want: str) -> float:
+    total = 0.0
+    for k, v in m.items():
+        name, labels = parse_metric_labels(k)
+        if name != metric or not labels:
+            continue
+        if any(labels.get(wk) != wv for wk, wv in want.items() if wv is not None):
+            continue
+        total += float(v)
+    return total
+
+
+def metric_max(m: dict, metric: str, **want: str) -> float:
+    vals = []
+    for k, v in m.items():
+        name, labels = parse_metric_labels(k)
+        if name != metric or not labels:
+            continue
+        if any(labels.get(wk) != wv for wk, wv in want.items() if wv is not None):
+            continue
+        vals.append(float(v))
+    return max(vals) if vals else 0.0
+
+
+def metric_label_values(m: dict, metric: str, label: str) -> list[str]:
+    vals = set()
+    for k in m:
+        name, labels = parse_metric_labels(k)
+        if name == metric and label in labels:
+            vals.add(labels[label])
+    return sorted(vals)
 
 
 def metrics_delta(before: dict, after: dict) -> dict:
@@ -53,21 +103,43 @@ def metrics_delta(before: dict, after: dict) -> dict:
         total = 0.0
         for k, v in m.items():
             if k.startswith(f"pp_module_{suffix}|"):
+                if "=" in k.split("|", 1)[1]:
+                    continue
                 total += float(v)
         return total
 
     out: dict[str, Any] = {}
     out["right_tx_out_delta"] = 0.0
+    ipc_metrics = {
+        "notifies": "pp_ring_ipc_notifies",
+        "waits": "pp_ring_ipc_waits",
+        "ready": "pp_ring_ipc_ready",
+        "wakes": "pp_ring_ipc_wakes",
+        "timeouts": "pp_ring_ipc_timeouts",
+        "sleeps": "pp_ring_ipc_sleeps",
+        "epolls": "pp_ring_ipc_epolls",
+        "adaptive_spins": "pp_ring_ipc_adaptive_spins",
+        "adaptive_yields": "pp_ring_ipc_adaptive_yields",
+        "enqueue_fail": "pp_ring_enqueue_fail",
+        "dequeue_empty": "pp_ring_dequeue_empty",
+    }
     for leaf in ("leaf1", "leaf2"):
         b = before.get(leaf, {})
         a = after.get(leaf, {})
         worker_out = sum_module_events(a, "worker") - sum_module_events(b, "worker")
         right_tx_out = sum_module_events(a, "right_tx") - sum_module_events(b, "right_tx")
+        ipc_delta = {
+            key: metric_sum(a, metric) - metric_sum(b, metric)
+            for key, metric in ipc_metrics.items()
+        }
+        ipc_delta["high_watermark"] = metric_max(a, "pp_ring_high_watermark")
+        ipc_delta["modes"] = metric_label_values(a, "pp_ring_ipc_waits", "mode")
         out[leaf] = {
             "events_out_delta": sum_module(a, "events_out") - sum_module(b, "events_out"),
             "drops_delta": sum_module(a, "drops") - sum_module(b, "drops"),
             "worker_out_delta": worker_out,
             "right_tx_out_delta": right_tx_out,
+            "ipc_delta": ipc_delta,
         }
         out["right_tx_out_delta"] += right_tx_out
     out["drops_delta"] = out["leaf1"]["drops_delta"] + out["leaf2"]["drops_delta"]
@@ -144,6 +216,23 @@ def fmt_cpp(cpp: float | None) -> str:
     if cpp is None:
         return "-"
     return f"{cpp:.1f}"
+
+
+def fmt_rate(v: float, duration: float) -> str:
+    if duration <= 0:
+        return "-"
+    return fmt_pps(float(v or 0) / duration)
+
+
+def ipc_leaf_delta(result: dict, leaf: str) -> dict[str, Any]:
+    return ((result.get("metrics_delta") or {}).get(leaf) or {}).get("ipc_delta") or {}
+
+
+def ipc_sum(result: dict, field: str) -> float:
+    total = 0.0
+    for leaf in ("leaf1", "leaf2"):
+        total += float(ipc_leaf_delta(result, leaf).get(field) or 0)
+    return total
 
 
 def flamegraph_link(result: dict, leaf: str) -> str:
@@ -269,6 +358,49 @@ def matrix_markdown_row(result: dict, json_name: str = "") -> str:
     )
 
 
+def ipc_matrix_markdown_row(result: dict, json_name: str = "") -> str:
+    i = result.get("iperf", {})
+    d = result.get("deploy", {})
+    cpu = result.get("cpu") or {}
+    pc = result.get("pps_cpp") or compute_pps_cpp(result)
+    cpp_pp = pc.get("cpp_pp") or pc.get("cpp") or {}
+    duration = iperf_duration_sec(d)
+    l1_cpu = fmt_leaf_cpu_cols(cpu.get("leaf1"))[0]
+    l2_cpu = fmt_leaf_cpu_cols(cpu.get("leaf2"))[0]
+    ipc_cfg = d.get("ipc") or {}
+    mode = ipc_cfg.get("mode", "-")
+    backoff = ipc_cfg.get("poll_backoff_us", "-")
+    spin = ipc_cfg.get("adaptive_spin", "-")
+    yld = ipc_cfg.get("adaptive_yield", "-")
+    return (
+        f"| {result.get('scenario', '?')} | {mode} | {backoff} | {spin} | {yld} | "
+        f"{i.get('parallel', '-')} | {i.get('bitrate_mbps', 0)} | "
+        f"{fmt_pps(float(pc.get('pps') or 0))} | "
+        f"{l1_cpu} | {fmt_cpp(cpp_pp.get('leaf1'))} | "
+        f"{l2_cpu} | {fmt_cpp(cpp_pp.get('leaf2'))} | "
+        f"{fmt_rate(ipc_sum(result, 'waits'), duration)} | "
+        f"{fmt_rate(ipc_sum(result, 'ready'), duration)} | "
+        f"{fmt_rate(ipc_sum(result, 'wakes'), duration)} | "
+        f"{fmt_rate(ipc_sum(result, 'timeouts'), duration)} | "
+        f"{fmt_rate(ipc_sum(result, 'notifies'), duration)} | "
+        f"{int(ipc_sum(result, 'high_watermark'))} | "
+        f"{int(ipc_sum(result, 'enqueue_fail'))} | "
+        f"[json]({json_name}) |"
+    )
+
+
+def ipc_matrix_md_header(started: str) -> str:
+    headers = [
+        "scenario", "ipc", "backoff_us", "spin", "yield", "P", "Mbps", "PPS",
+        "L1 pp", "L1 core-us", "L2 pp", "L2 core-us",
+        "waits/s", "ready/s", "wakes/s", "timeouts/s", "notifies/s",
+        "high_water_sum", "enqueue_fail", "result",
+    ]
+    hdr = "| " + " | ".join(headers) + " |"
+    sep = "| " + " | ".join("---" for _ in headers) + " |"
+    return f"# pproxy IPC impact matrix\n\nStarted: {started}\n\n{hdr}\n{sep}\n"
+
+
 def matrix_md_header(started: str) -> str:
     headers = [
         "scenario", "right_io", "P", "Mbps", "PPS",
@@ -306,6 +438,16 @@ def update_matrix_md(md_path: Path, result: dict, json_name: str) -> None:
         f.write(row + "\n")
 
 
+def update_ipc_matrix_md(md_path: Path, result: dict, json_name: str) -> None:
+    row = ipc_matrix_markdown_row(result, json_name)
+    if not md_path.is_file():
+        started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        md_path.write_text(ipc_matrix_md_header(started) + row + "\n", encoding="utf-8")
+        return
+    with md_path.open("a", encoding="utf-8") as f:
+        f.write(row + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", required=True)
@@ -322,6 +464,7 @@ def main() -> int:
     ap.add_argument("--flamegraph", default="", help="flamegraph manifest JSON")
     ap.add_argument("--update-doc", default="")
     ap.add_argument("--matrix-md", default="", help="matrix*.md path; append row after each run")
+    ap.add_argument("--ipc-matrix-md", default="", help="ipc_matrix*.md path; append IPC row after each run")
     ap.add_argument("--fail-on-threshold", action="store_true")
     args = ap.parse_args()
 
@@ -370,6 +513,9 @@ def main() -> int:
 
     if args.matrix_md:
         update_matrix_md(Path(args.matrix_md), result, out_path.name)
+
+    if args.ipc_matrix_md:
+        update_ipc_matrix_md(Path(args.ipc_matrix_md), result, out_path.name)
 
     if args.fail_on_threshold:
         errs = check_thresholds(iperf, thresholds)

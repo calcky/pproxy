@@ -134,6 +134,22 @@ ssh clab@leaf1 tail -n 100 /opt/pproxy/log/vpp.log
 
 矩阵会先完整部署一次 lab，然后用 `--pproxy-only` 切换后端。每个场景默认跑 TCP iperf3，`-P 1` 和 `-P 10` 各 10 秒，外加 2 秒 warmup。
 
+IPC 影响矩阵：
+
+```bash
+./tests/clab/perf.sh --ipc-matrix
+./tests/clab/perf.sh --ipc-matrix --ipc-scenario udp_uring_batch32
+```
+
+IPC 矩阵默认基于 `udp_kernel`，扫 `runtime.rings.ipc_mode` 的 `polling`、`eventfd`、`adaptive`，并覆盖几组 `poll_backoff_us` / `adaptive_spin` / `adaptive_yield`。结果写到 `tests/clab/results/ipc_matrix_<timestamp>.md`，每行包含吞吐、PPS、pproxy CPU、core-us/包，以及 IPC waits/ready/wakes/timeouts/notifies 速率。
+
+手动指定 IPC 配置也可以直接用 overlay：
+
+```bash
+./tests/clab/perf.sh --scenario udp_kernel \
+  --overlay '{"runtime.rings.ipc_mode":"adaptive","runtime.rings.poll_backoff_us":50,"runtime.rings.adaptive_spin":64,"runtime.rings.adaptive_yield":8}'
+```
+
 直连基线，不经过 pproxy：
 
 ```bash
@@ -151,6 +167,7 @@ ssh clab@leaf1 tail -n 100 /opt/pproxy/log/vpp.log
 - `--skip-build`：跳过宿主机 `./build.sh`
 - `--skip-deploy`：复用已经部署好的拓扑
 - `--flamegraph`：正式 iperf 窗口内在 leaf1/leaf2 各抓 5s `perf record`，并导出 speedscope JSON
+- `--ipc-matrix`：扫 IPC 模式和等待参数，生成 `ipc_matrix_*.md`
 - `PERF_RESULTS_DIR=/path/to/results`：指定结果目录
 - `PERF_SCENARIOS=/path/to/scenarios.yaml`：指定场景文件
 - `PERF_FLAME_DURATION=5` / `PERF_FLAME_FREQ=99` / `PERF_FLAME_DELAY=1`：调整 flamegraph 采样参数
@@ -159,7 +176,14 @@ ssh clab@leaf1 tail -n 100 /opt/pproxy/log/vpp.log
 
 - `*.json`：每次 iperf 结果和采集到的 metrics
 - `matrix_*.md`：矩阵汇总
+- `ipc_matrix_*.md`：IPC 影响矩阵汇总
 - `flamegraphs/<run-id>/leaf{1,2}/*.speedscope.json`：`--flamegraph` 生成的 speedscope 火焰图数据，可在 <https://www.speedscope.app/> 打开
+
+每个结果 JSON 的 `metrics_delta.leaf*.ipc_delta` 会记录 ring/IPC 计数的窗口差值，包括：
+
+- `waits` / `ready` / `wakes` / `timeouts` / `notifies`
+- `sleeps` / `epolls` / `adaptive_spins` / `adaptive_yields`
+- `enqueue_fail` / `dequeue_empty` / `high_watermark`
 
 已入仓报告中的 `L1 flame` / `L2 flame` 链接会打开 speedscope 并自动加载 raw GitHub JSON；`L1 json` / `L2 json` 保留原始 JSON 下载链接。生成需要自动打开 speedscope 的 Markdown 时，可设置 `PPROXY_SPEEDSCOPE_RAW_BASE=https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<report-dir>`；未设置时默认输出本地相对 JSON 链接。
 

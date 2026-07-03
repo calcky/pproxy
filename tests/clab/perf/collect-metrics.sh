@@ -22,6 +22,15 @@ MET2=$(fetch_leaf "$LEAF2_HOST" "$PP2_METRICS")
 python3 - "$MET1" "$MET2" "$OUT" <<'PY'
 import json, re, sys
 
+def parse_labels(text):
+    labels = {}
+    for m in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"])*)"', text or ""):
+        labels[m.group(1)] = bytes(m.group(2), "utf-8").decode("unicode_escape")
+    return labels
+
+def labels_key(labels):
+    return ",".join(f"{k}={labels[k]}" for k in sorted(labels))
+
 def parse_prom(text):
     out = {}
     for line in (text or "").splitlines():
@@ -30,12 +39,12 @@ def parse_prom(text):
         m = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+([0-9.eE+-]+)$', line)
         if m:
             name, labels, val = m.group(1), m.group(2), float(m.group(3))
-            mod = ""
-            for part in labels.split(","):
-                if part.startswith('module="'):
-                    mod = part.split('"')[1]
-            key = f"{name}|{mod}" if mod else name
-            out[key] = val
+            parsed = parse_labels(labels)
+            lkey = labels_key(parsed)
+            if lkey:
+                out[f"{name}|{lkey}"] = val
+            if "module" in parsed:
+                out[f"{name}|{parsed['module']}"] = val
             continue
         m = re.match(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([0-9.eE+-]+)$', line)
         if m:

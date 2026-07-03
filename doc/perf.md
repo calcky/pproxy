@@ -52,6 +52,9 @@
 # 全后端 matrix（首次 bootstrap 会编译全后端二进制；后续场景只切配置/重启 pproxy）
 ./tests/clab/perf.sh --matrix
 
+# IPC 影响矩阵（polling/eventfd/adaptive + backoff/spin/yield）
+./tests/clab/perf.sh --ipc-matrix
+
 # 无 pproxy 直连基线
 ./tests/clab/perf.sh --baseline direct
 
@@ -63,6 +66,61 @@
 ```
 
 结果写入 `tests/clab/results/`。可选 `--update-doc` 将 Markdown 表追加到本文件。需要长期保留的结果建议整理到 `tests/clab/reports/`。
+
+### IPC 模式和影响报告
+
+pproxy 当前支持三种 ring IPC 模式：
+
+| 模式 | 行为 | 适用观察点 |
+|------|------|------------|
+| `polling` | 空 ring 时 `nanosleep(poll_backoff_us)` | 低 CPU、较高 wake 延迟 |
+| `eventfd` | enqueue 由空变非空时写 eventfd，消费者 `epoll_wait` | 唤醒明确，syscall 成本可见 |
+| `adaptive` | 先 `pause/yield` 短等，再退到 eventfd/epoll | 在吞吐和 wake 延迟之间折中 |
+
+配置字段位于 `runtime.rings`：
+
+```json
+{
+  "runtime": {
+    "rings": {
+      "ipc_mode": "adaptive",
+      "poll_backoff_us": 50,
+      "adaptive_spin": 64,
+      "adaptive_yield": 8
+    }
+  }
+}
+```
+
+`/metrics` 会暴露 ring/IPC 指标，带 `ring`、`index`、`mode` label，例如：
+
+- `pp_ring_ipc_waits`
+- `pp_ring_ipc_ready`
+- `pp_ring_ipc_wakes`
+- `pp_ring_ipc_timeouts`
+- `pp_ring_ipc_notifies`
+- `pp_ring_ipc_adaptive_spins`
+- `pp_ring_enqueue_fail`
+- `pp_ring_high_watermark`
+
+生成 IPC 影响报告：
+
+```bash
+./tests/clab/perf.sh --ipc-matrix
+```
+
+默认基于 `udp_kernel`，扫 `polling`、`eventfd`、`adaptive` 及几组代表性 `poll_backoff_us` / `adaptive_spin` / `adaptive_yield`。输出为 `tests/clab/results/ipc_matrix_<timestamp>.md`，列包含吞吐、PPS、pproxy CPU、core-us/包，以及 IPC waits/ready/wakes/timeouts/notifies 速率。要换基准场景：
+
+```bash
+./tests/clab/perf.sh --ipc-matrix --ipc-scenario udp_uring_batch32
+```
+
+单点对比可用 overlay：
+
+```bash
+./tests/clab/perf.sh --scenario udp_kernel \
+  --overlay '{"runtime.rings.ipc_mode":"eventfd","runtime.rings.poll_backoff_us":50}'
+```
 
 ### Flamegraph / speedscope
 
