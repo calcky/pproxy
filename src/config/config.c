@@ -132,6 +132,10 @@ static void parse_runtime(yyjson_val *root, pp_runtime_t *rt)
         }
         rt->ring_ipc.poll_backoff_us = (uint32_t)jint(rg, "poll_backoff_us",
                                                        (int64_t)rt->ring_ipc.poll_backoff_us);
+        rt->ring_ipc.adaptive_spin = (uint32_t)jint(rg, "adaptive_spin",
+                                                     (int64_t)rt->ring_ipc.adaptive_spin);
+        rt->ring_ipc.adaptive_yield = (uint32_t)jint(rg, "adaptive_yield",
+                                                      (int64_t)rt->ring_ipc.adaptive_yield);
     }
 }
 

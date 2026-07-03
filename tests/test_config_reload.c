@@ -13,6 +13,7 @@
 #include "pproxy/pproxy.h"
 #include "pproxy/log.h"
 #include "pproxy/dpi.h"
+#include "pproxy/ring_ipc.h"
 #include "pproxy/session.h"
 #include "../src/modules/runtime.h"
 #include "../src/config/config.h"
@@ -151,6 +152,28 @@ int main(void)
     assert(r == PP_OK);
     ASSERT_HAS(resp, "0 applied, 0 notes");
     unlink(tmp2);
+
+    /* ---- 6) 启动配置解析：runtime.rings.ipc_mode/adaptive 参数 ---- */
+    const char *tmp3 = "/tmp/pproxy_config_ipc_test.json";
+    const char *body3 =
+        "{\n"
+        "  \"runtime\": {\n"
+        "    \"rings\": {\n"
+        "      \"ipc_mode\": \"adaptive\",\n"
+        "      \"poll_backoff_us\": 17,\n"
+        "      \"adaptive_spin\": 128,\n"
+        "      \"adaptive_yield\": 4\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    write_file(tmp3, body3);
+    r = pp_config_load(tmp3, &rt);
+    assert(r == PP_OK);
+    assert(rt.ring_ipc.mode == PP_RING_IPC_ADAPTIVE);
+    assert(rt.ring_ipc.poll_backoff_us == 17);
+    assert(rt.ring_ipc.adaptive_spin == 128);
+    assert(rt.ring_ipc.adaptive_yield == 4);
+    unlink(tmp3);
 
     pp_dpi_chain_destroy(rt.dpi);
     pp_session_shard_destroy(rt.shards[0]);

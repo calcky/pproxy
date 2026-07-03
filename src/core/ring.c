@@ -56,6 +56,9 @@ struct pp_ring {
     atomic_size_t    prod_tail PP_CACHELINE_ALIGN;
     atomic_size_t    cons_head PP_CACHELINE_ALIGN;
     atomic_size_t    cons_tail PP_CACHELINE_ALIGN;
+    atomic_uint_fast64_t enqueue_fail;
+    atomic_uint_fast64_t dequeue_empty;
+    atomic_uint_fast64_t high_watermark;
     pp_ring_ipc_t   *ipc;
     void *slots[] PP_CACHELINE_ALIGN;
 };
@@ -79,6 +82,9 @@ pp_ring_t *pp_ring_create(const pp_ring_cfg_t *cfg)
     atomic_init(&r->prod_tail, 0);
     atomic_init(&r->cons_head, 0);
     atomic_init(&r->cons_tail, 0);
+    atomic_init(&r->enqueue_fail, 0);
+    atomic_init(&r->dequeue_empty, 0);
+    atomic_init(&r->high_watermark, 0);
     return r;
 }
 
@@ -104,6 +110,18 @@ size_t pp_ring_size(const pp_ring_t *r)
 bool pp_ring_empty(const pp_ring_t *r) { return pp_ring_size(r) == 0; }
 bool pp_ring_full (const pp_ring_t *r) { return pp_ring_size(r) >= r->capacity; }
 
+const char *pp_ring_name(const pp_ring_t *r) { return r ? r->name : ""; }
+
+void pp_ring_stats(const pp_ring_t *r, pp_ring_stats_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    if (!r) return;
+    out->enqueue_fail = atomic_load_explicit(&r->enqueue_fail, memory_order_relaxed);
+    out->dequeue_empty = atomic_load_explicit(&r->dequeue_empty, memory_order_relaxed);
+    out->high_watermark = atomic_load_explicit(&r->high_watermark, memory_order_relaxed);
+}
+
 void pp_ring_attach_ipc(pp_ring_t *r, pp_ring_ipc_t *ipc)
 {
     if (!r) return;
@@ -119,6 +137,13 @@ pp_ring_ipc_t *pp_ring_get_ipc(const pp_ring_t *r)
 
 static void ring_post_enqueue(pp_ring_t *r, bool was_empty, int n)
 {
+    size_t sz = pp_ring_size(r);
+    uint_fast64_t old = atomic_load_explicit(&r->high_watermark, memory_order_relaxed);
+    while ((uint_fast64_t)sz > old
+           && !atomic_compare_exchange_weak_explicit(
+               &r->high_watermark, &old, (uint_fast64_t)sz,
+               memory_order_relaxed, memory_order_relaxed)) {
+    }
     if (n > 0 && was_empty && r->ipc)
         pp_ring_ipc_notify(r->ipc);
 }
@@ -130,7 +155,10 @@ int pp_ring_enqueue(pp_ring_t *r, void *elem)
     do {
         old_ph = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
         old_ct = atomic_load_explicit(&r->cons_tail, memory_order_acquire);
-        if (r->capacity - (old_ph - old_ct) < 1) return 0;
+        if (r->capacity - (old_ph - old_ct) < 1) {
+            atomic_fetch_add_explicit(&r->enqueue_fail, 1, memory_order_relaxed);
+            return 0;
+        }
         new_ph = old_ph + 1;
     } while (!atomic_compare_exchange_weak_explicit(
                 &r->prod_head, &old_ph, new_ph,
@@ -153,7 +181,10 @@ int pp_ring_enqueue_burst(pp_ring_t *r, void *const *elems, int n)
     do {
         old_ph = atomic_load_explicit(&r->prod_head, memory_order_relaxed);
         old_ct = atomic_load_explicit(&r->cons_tail, memory_order_acquire);
-        if (r->capacity - (old_ph - old_ct) < entries) return 0;
+        if (r->capacity - (old_ph - old_ct) < entries) {
+            atomic_fetch_add_explicit(&r->enqueue_fail, 1, memory_order_relaxed);
+            return 0;
+        }
         new_ph = old_ph + entries;
     } while (!atomic_compare_exchange_weak_explicit(
                 &r->prod_head, &old_ph, new_ph,
@@ -175,7 +206,10 @@ int pp_ring_dequeue(pp_ring_t *r, void **elem)
     do {
         old_ch = atomic_load_explicit(&r->cons_head, memory_order_relaxed);
         old_pt = atomic_load_explicit(&r->prod_tail, memory_order_acquire);
-        if (old_pt - old_ch < 1) return 0;
+        if (old_pt - old_ch < 1) {
+            atomic_fetch_add_explicit(&r->dequeue_empty, 1, memory_order_relaxed);
+            return 0;
+        }
         new_ch = old_ch + 1;
     } while (!atomic_compare_exchange_weak_explicit(
                 &r->cons_head, &old_ch, new_ch,
@@ -196,7 +230,10 @@ int pp_ring_dequeue_burst(pp_ring_t *r, void **elems, int n)
         old_ch = atomic_load_explicit(&r->cons_head, memory_order_relaxed);
         old_pt = atomic_load_explicit(&r->prod_tail, memory_order_acquire);
         size_t avail = old_pt - old_ch;
-        if (avail < 1) return 0;
+        if (avail < 1) {
+            atomic_fetch_add_explicit(&r->dequeue_empty, 1, memory_order_relaxed);
+            return 0;
+        }
         to_get = (size_t)n < avail ? (size_t)n : avail;
         new_ch = old_ch + to_get;
     } while (!atomic_compare_exchange_weak_explicit(

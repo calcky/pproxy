@@ -4,9 +4,10 @@
  * 模式（runtime.rings.ipc_mode，数据面 ring 统一）:
  *   polling  -- nanosleep(backoff)（默认）
  *   eventfd  -- enqueue 后 eventfd 唤醒；消费者 epoll_wait
+ *   adaptive -- 先短暂 spin/yield，仍未 ready 时退到 eventfd/epoll
  *
  * worker_ctrl_ring：ipc_mode=polling 时固定 eventfd（控制面需唤醒）；
- * ipc_mode=eventfd 时与数据面一致。
+ * ipc_mode=eventfd/adaptive 时与数据面一致。
  */
 #ifndef PPROXY_RING_IPC_H
 #define PPROXY_RING_IPC_H
@@ -24,12 +25,27 @@ typedef struct pp_ring pp_ring_t;
 typedef enum pp_ring_ipc_mode {
     PP_RING_IPC_POLLING = 0,
     PP_RING_IPC_EVENTFD,
+    PP_RING_IPC_ADAPTIVE,
 } pp_ring_ipc_mode_t;
 
 typedef struct pp_ring_ipc_cfg {
     pp_ring_ipc_mode_t mode;
     uint32_t           poll_backoff_us;   /* polling / 兜底；默认 50 */
+    uint32_t           adaptive_spin;     /* adaptive: pause/yield 前自旋次数；默认 64 */
+    uint32_t           adaptive_yield;    /* adaptive: sched_yield 次数；默认 8 */
 } pp_ring_ipc_cfg_t;
+
+typedef struct pp_ring_ipc_stats {
+    uint64_t notifies;
+    uint64_t waits;
+    uint64_t ready;
+    uint64_t wakes;
+    uint64_t timeouts;
+    uint64_t sleeps;
+    uint64_t epolls;
+    uint64_t adaptive_spins;
+    uint64_t adaptive_yields;
+} pp_ring_ipc_stats_t;
 
 struct pp_ring_ipc;
 typedef struct pp_ring_ipc pp_ring_ipc_t;
@@ -54,6 +70,8 @@ void                  pp_ring_ipc_waiter_destroy(pp_ring_ipc_waiter_t *w);
 
 const char *pp_ring_ipc_mode_name(pp_ring_ipc_mode_t mode);
 pp_ring_ipc_mode_t pp_ring_ipc_mode_parse(const char *s, bool *ok);
+pp_ring_ipc_mode_t pp_ring_ipc_mode(const pp_ring_ipc_t *ipc);
+void pp_ring_ipc_stats(const pp_ring_ipc_t *ipc, pp_ring_ipc_stats_t *out);
 
 #ifdef __cplusplus
 }

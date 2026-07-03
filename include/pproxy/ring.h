@@ -37,6 +37,12 @@ typedef struct pp_ring_cfg {
     const char    *name;            /* 调试用 */
 } pp_ring_cfg_t;
 
+typedef struct pp_ring_stats {
+    uint64_t enqueue_fail;
+    uint64_t dequeue_empty;
+    uint64_t high_watermark;
+} pp_ring_stats_t;
+
 pp_ring_t *pp_ring_create(const pp_ring_cfg_t *cfg);
 void       pp_ring_destroy(pp_ring_t *r);
 
@@ -44,6 +50,8 @@ size_t     pp_ring_capacity(const pp_ring_t *r);
 size_t     pp_ring_size(const pp_ring_t *r);
 bool       pp_ring_empty(const pp_ring_t *r);
 bool       pp_ring_full (const pp_ring_t *r);
+const char *pp_ring_name(const pp_ring_t *r);
+void       pp_ring_stats(const pp_ring_t *r, pp_ring_stats_t *out);
 
 /* ---------- 入队 / 出队（指针元素） ----------
  * 返回实际处理条数；0 表示空/满。

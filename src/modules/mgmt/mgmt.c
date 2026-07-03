@@ -27,6 +27,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include "pproxy/module.h"
+#include "pproxy/ring_ipc.h"
 #include "pproxy/log.h"
 #include "pproxy/drop.h"
 #include "../runtime.h"
@@ -122,6 +123,92 @@ static int stat_walk_prom(pp_module_t *m, void *user)
     if (s.cpu != UINT32_MAX)
         acc_printf(a, "pp_module_cpu{module=\"%s\"} %u\n", s.name, s.cpu);
     return PP_OK;
+}
+
+static void prom_ring_one(struct stat_acc *a, const char *name, int index, pp_ring_t *r)
+{
+    if (!r) return;
+    pp_ring_ipc_t *ipc = pp_ring_get_ipc(r);
+    pp_ring_stats_t rs;
+    pp_ring_ipc_stats_t is;
+    pp_ring_stats(r, &rs);
+    pp_ring_ipc_stats(ipc, &is);
+
+    const char *mode = pp_ring_ipc_mode_name(pp_ring_ipc_mode(ipc));
+    size_t size = pp_ring_size(r);
+    size_t cap = pp_ring_capacity(r);
+    acc_printf(a, "pp_ring_size{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)size);
+    acc_printf(a, "pp_ring_capacity{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)cap);
+    acc_printf(a, "pp_ring_high_watermark{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)rs.high_watermark);
+    acc_printf(a, "pp_ring_enqueue_fail{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)rs.enqueue_fail);
+    acc_printf(a, "pp_ring_dequeue_empty{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)rs.dequeue_empty);
+
+    acc_printf(a, "pp_ring_ipc_notifies{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.notifies);
+    acc_printf(a, "pp_ring_ipc_waits{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.waits);
+    acc_printf(a, "pp_ring_ipc_ready{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.ready);
+    acc_printf(a, "pp_ring_ipc_wakes{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.wakes);
+    acc_printf(a, "pp_ring_ipc_timeouts{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.timeouts);
+    acc_printf(a, "pp_ring_ipc_sleeps{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.sleeps);
+    acc_printf(a, "pp_ring_ipc_epolls{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.epolls);
+    acc_printf(a, "pp_ring_ipc_adaptive_spins{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.adaptive_spins);
+    acc_printf(a, "pp_ring_ipc_adaptive_yields{ring=\"%s\",index=\"%d\",mode=\"%s\"} %lu\n",
+               name, index, mode, (unsigned long)is.adaptive_yields);
+}
+
+static void prom_rings(struct stat_acc *a)
+{
+    if (!g_rt) return;
+
+    acc_printf(a, "# HELP pp_ring_size Current ring occupancy\n");
+    acc_printf(a, "# TYPE pp_ring_size gauge\n");
+    acc_printf(a, "# HELP pp_ring_capacity Ring capacity\n");
+    acc_printf(a, "# TYPE pp_ring_capacity gauge\n");
+    acc_printf(a, "# HELP pp_ring_high_watermark Highest observed ring occupancy\n");
+    acc_printf(a, "# TYPE pp_ring_high_watermark gauge\n");
+    acc_printf(a, "# HELP pp_ring_enqueue_fail Ring enqueue failures due to full ring\n");
+    acc_printf(a, "# TYPE pp_ring_enqueue_fail counter\n");
+    acc_printf(a, "# HELP pp_ring_dequeue_empty Ring dequeue attempts on empty ring\n");
+    acc_printf(a, "# TYPE pp_ring_dequeue_empty counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_notifies Ring IPC producer notifications\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_notifies counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_waits Ring IPC consumer waits\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_waits counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_ready Ring IPC waits that found data ready\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_ready counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_wakes Ring IPC eventfd wakeups\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_wakes counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_timeouts Ring IPC waits that timed out\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_timeouts counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_sleeps Ring IPC polling sleeps\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_sleeps counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_epolls Ring IPC epoll waits\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_epolls counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_adaptive_spins Ring IPC adaptive spin iterations\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_adaptive_spins counter\n");
+    acc_printf(a, "# HELP pp_ring_ipc_adaptive_yields Ring IPC adaptive sched_yield calls\n");
+    acc_printf(a, "# TYPE pp_ring_ipc_adaptive_yields counter\n");
+
+    for (int i = 0; i < g_rt->n_workers; i++) {
+        prom_ring_one(a, "worker_rx", i, g_rt->worker_rx_ring[i]);
+        prom_ring_one(a, "worker_back", i, g_rt->worker_back_ring[i]);
+        prom_ring_one(a, "worker_ctrl", i, g_rt->worker_ctrl_ring[i]);
+    }
+    for (int i = 0; i < g_rt->n_tunnels; i++)
+        prom_ring_one(a, "right_tx", i, g_rt->right_tx_ring[i]);
+    prom_ring_one(a, "left_tx", 0, g_rt->left_tx_ring);
 }
 
 /* ---------- unix socket 文本命令 ---------- */
@@ -343,6 +430,7 @@ static size_t build_metrics(char *body, size_t cap)
     acc_printf(&a, "# HELP pp_module_cpu CPU id the module is pinned to\n");
     acc_printf(&a, "# TYPE pp_module_cpu gauge\n");
     pp_module_walk(stat_walk_prom, &a);
+    prom_rings(&a);
 
     acc_printf(&a, "# HELP pp_sessions Active sessions across all shards (snapshot)\n");
     acc_printf(&a, "# TYPE pp_sessions gauge\n");
@@ -447,7 +535,7 @@ static void handle_http(int cfd)
     }
 
     if (strcmp(path, "/metrics") == 0) {
-        static char body[MG_RESP_BUF * 4];      /* 64KB 够放到 64 workers */
+        static char body[MG_RESP_BUF * 16];
         size_t blen = build_metrics(body, sizeof body);
         http_send(cfd, 200, "OK",
                   "text/plain; version=0.0.4; charset=utf-8", body, blen);

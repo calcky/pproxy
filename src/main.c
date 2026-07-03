@@ -84,6 +84,8 @@ static void apply_defaults(pp_runtime_t *rt)
 
     rt->ring_ipc.mode            = PP_RING_IPC_POLLING;
     rt->ring_ipc.poll_backoff_us = 50;
+    rt->ring_ipc.adaptive_spin   = 64;
+    rt->ring_ipc.adaptive_yield  = 8;
 
     /* 左手默认 tun pproxy0 */
     rt->left_kind             = PP_IO_TUN;
@@ -254,10 +256,12 @@ static int build_runtime_resources(pp_runtime_t *rt)
     if (!rt->left_tx_ring) return PP_ERR_NOMEM;
     if (attach_ring_ipc(rt, rt->left_tx_ring, false) != PP_OK) return PP_ERR_NOMEM;
 
-    PP_INFO("rings: ipc_mode=%s ctrl=%s poll_backoff_us=%u",
+    PP_INFO("rings: ipc_mode=%s ctrl=%s poll_backoff_us=%u adaptive_spin=%u adaptive_yield=%u",
             pp_ring_ipc_mode_name(rt->ring_ipc.mode),
             ctrl_ipc_mode_name(rt),
-            rt->ring_ipc.poll_backoff_us);
+            rt->ring_ipc.poll_backoff_us,
+            rt->ring_ipc.adaptive_spin,
+            rt->ring_ipc.adaptive_yield);
 
     return PP_OK;
 }

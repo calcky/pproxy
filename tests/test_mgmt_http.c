@@ -26,6 +26,8 @@
 #include "pproxy/log.h"
 #include "pproxy/module.h"
 #include "pproxy/dpi.h"
+#include "pproxy/ring.h"
+#include "pproxy/ring_ipc.h"
 #include "pproxy/session.h"
 #include "../src/modules/runtime.h"
 
@@ -94,6 +96,10 @@ int main(void)
     memset(&rt, 0, sizeof rt);
     rt.n_workers = 1;
     rt.n_tunnels = 1;
+    rt.ring_ipc.mode = PP_RING_IPC_ADAPTIVE;
+    rt.ring_ipc.poll_backoff_us = 50;
+    rt.ring_ipc.adaptive_spin = 8;
+    rt.ring_ipc.adaptive_yield = 2;
     /* 选一个不常占用的高端口；如果被占了测试会失败，属于可接受 */
     uint16_t port = 19091;
     rt.mgmt_unix_socket = "/tmp/pproxy_mgmt_http_test.sock";
@@ -115,6 +121,19 @@ int main(void)
     };
     rt.shards[0] = pp_session_shard_create(&scfg);
     assert(rt.shards[0]);
+
+    pp_ring_cfg_t rcfg = {
+        .kind = PP_RING_SPSC,
+        .capacity = 8,
+        .name = "worker_rx",
+        .numa_node = -1,
+    };
+    rt.worker_rx_ring[0] = pp_ring_create(&rcfg);
+    assert(rt.worker_rx_ring[0]);
+    pp_ring_ipc_t *ipc = pp_ring_ipc_create(&rt.ring_ipc);
+    assert(ipc);
+    pp_ring_attach_ipc(rt.worker_rx_ring[0], ipc);
+    assert(pp_ring_enqueue(rt.worker_rx_ring[0], (void *)(uintptr_t)1) == 1);
 
     g_rt = &rt;
 
@@ -154,6 +173,9 @@ int main(void)
     ASSERT_HAS(buf, "pp_sessions_by_app{app=\"unknown\"}");
     ASSERT_HAS(buf, "pp_session_drops_sum{dir=\"up\"}");
     ASSERT_HAS(buf, "pp_drop_orphan{kind=\"lrx_flow_key\"}");
+    ASSERT_HAS(buf, "pp_ring_size{ring=\"worker_rx\",index=\"0\",mode=\"adaptive\"}");
+    ASSERT_HAS(buf, "pp_ring_ipc_notifies{ring=\"worker_rx\",index=\"0\",mode=\"adaptive\"}");
+    ASSERT_HAS(buf, "pp_ring_high_watermark{ring=\"worker_rx\",index=\"0\",mode=\"adaptive\"}");
 
     /* ---- GET / ---- */
     memset(buf, 0, sizeof buf);
@@ -189,6 +211,7 @@ int main(void)
 
     pp_dpi_chain_destroy(rt.dpi);
     pp_session_shard_destroy(rt.shards[0]);
+    pp_ring_destroy(rt.worker_rx_ring[0]);
     unlink(rt.mgmt_unix_socket);
 
     printf("test_mgmt_http: OK\n");

@@ -18,7 +18,12 @@ static pp_ring_t *new_ring_with_ipc(pp_ring_ipc_mode_t mode)
     pp_ring_t *r = pp_ring_create(&rc);
     if (!r) return NULL;
 
-    pp_ring_ipc_cfg_t ic = { .mode = mode, .poll_backoff_us = 1000 };
+    pp_ring_ipc_cfg_t ic = {
+        .mode = mode,
+        .poll_backoff_us = 1000,
+        .adaptive_spin = 8,
+        .adaptive_yield = 2,
+    };
     pp_ring_ipc_t *ipc = pp_ring_ipc_create(&ic);
     if (!ipc) {
         pp_ring_destroy(r);
@@ -107,6 +112,43 @@ static int test_eventfd_wake_after_idle(void)
 #endif
 }
 
+static int test_adaptive_wake_after_idle(void)
+{
+#ifndef PP_LINUX
+    OK("  adaptive wake-after-idle (skip: non-Linux)");
+    return 0;
+#else
+    pp_ring_t *r = new_ring_with_ipc(PP_RING_IPC_ADAPTIVE);
+    if (!r) FAIL("create ring+adaptive");
+
+    pp_ring_ipc_t *ipc = pp_ring_get_ipc(r);
+    if (!ipc || pp_ring_ipc_mode(ipc) != PP_RING_IPC_ADAPTIVE)
+        FAIL("adaptive mode");
+
+    prod_arg_t pa = { .ring = r, .delay_ms = 5 };
+    pthread_t th;
+    if (pthread_create(&th, NULL, producer, &pa) != 0) FAIL("pthread_create");
+
+    waiter_idle_one(r, 50000);
+
+    pthread_join(th, NULL);
+    void *p = NULL;
+    if (pp_ring_dequeue(r, &p) != 1 || p != (void *)(uintptr_t)42)
+        FAIL("dequeue after adaptive wake");
+
+    pp_ring_ipc_stats_t st;
+    pp_ring_ipc_stats(ipc, &st);
+    if (st.waits < 1 || st.notifies < 1 || st.epolls < 1)
+        FAIL("adaptive stats waits=%lu notifies=%lu epolls=%lu",
+             (unsigned long)st.waits, (unsigned long)st.notifies,
+             (unsigned long)st.epolls);
+
+    pp_ring_destroy(r);
+    OK("  adaptive idle 后唤醒");
+    return 0;
+#endif
+}
+
 static int test_polling_idle(void)
 {
     pp_ring_t *r = new_ring_with_ipc(PP_RING_IPC_POLLING);
@@ -152,6 +194,35 @@ static int test_waiter_multi_eventfd(void)
 #endif
 }
 
+static int test_ring_stats(void)
+{
+    pp_ring_t *r = new_ring_with_ipc(PP_RING_IPC_POLLING);
+    if (!r) FAIL("create ring+polling");
+
+    void *p = NULL;
+    if (pp_ring_dequeue(r, &p) != 0)
+        FAIL("empty dequeue should fail");
+
+    for (uintptr_t i = 0; i < 8; i++) {
+        if (pp_ring_enqueue(r, (void *)(i + 1)) != 1)
+            FAIL("enqueue %lu", (unsigned long)i);
+    }
+    if (pp_ring_enqueue(r, (void *)(uintptr_t)99) != 0)
+        FAIL("full enqueue should fail");
+
+    pp_ring_stats_t rs;
+    pp_ring_stats(r, &rs);
+    if (rs.high_watermark != 8 || rs.enqueue_fail != 1 || rs.dequeue_empty != 1)
+        FAIL("ring stats high=%lu enq_fail=%lu deq_empty=%lu",
+             (unsigned long)rs.high_watermark,
+             (unsigned long)rs.enqueue_fail,
+             (unsigned long)rs.dequeue_empty);
+
+    pp_ring_destroy(r);
+    OK("  ring stats");
+    return 0;
+}
+
 static int test_ipc_mode_parse(void)
 {
     bool ok;
@@ -159,6 +230,8 @@ static int test_ipc_mode_parse(void)
         FAIL("futex 应解析失败并回退 polling");
     if (pp_ring_ipc_mode_parse("eventfd", &ok) != PP_RING_IPC_EVENTFD || !ok)
         FAIL("eventfd parse");
+    if (pp_ring_ipc_mode_parse("adaptive", &ok) != PP_RING_IPC_ADAPTIVE || !ok)
+        FAIL("adaptive parse");
     OK("  ipc_mode parse");
     return 0;
 }
@@ -169,7 +242,9 @@ int main(void)
     rc |= test_polling_idle();
     rc |= test_eventfd_no_lost_wakeup();
     rc |= test_eventfd_wake_after_idle();
+    rc |= test_adaptive_wake_after_idle();
     rc |= test_waiter_multi_eventfd();
+    rc |= test_ring_stats();
     rc |= test_ipc_mode_parse();
     return rc ? 1 : 0;
 }
